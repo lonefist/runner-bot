@@ -19,4 +19,5 @@ jobs:
           HEATING_ALERTS_ENABLED: "true"
           DEX_SCAN_INTERVAL_SECONDS: "15"
         run: |
- find . -name bot.py -print -quit | xargs -I {} timeout 270s python3 "{}" || true
+ run: |
+  timeout 270s python3 bot.py
