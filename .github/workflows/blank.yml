@@ -1,0 +1,22 @@
+name: Runner Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          HEATING_ALERTS_ENABLED: "true"
+          DEX_SCAN_INTERVAL_SECONDS: "15"
+        run: |
+          timeout 270s python3 bot.py || true
