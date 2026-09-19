@@ -10,8 +10,8 @@ from typing import Dict, List, Optional
 
 
 # ============================================================
-# RUNNER ENGINE
-# Persistent history + structure/acceleration detection
+# RUNNER ENGINE v3.3
+# Historical-first runner detection
 # ============================================================
 
 logging.basicConfig(
@@ -48,7 +48,12 @@ MIN_VOLUME_5M = 5_000
 
 STATE_FILE = "runner_state.json"
 
-MAX_HISTORY = 120
+MAX_HISTORY_PER_TOKEN = 120
+
+# Prevent the persistent file from growing forever.
+MAX_STORED_TOKENS = 500
+
+MIN_OBSERVATIONS = 6
 
 DEX_BASE = "https://api.dexscreener.com"
 
@@ -60,7 +65,7 @@ histories: Dict[str, "TokenHistory"] = {}
 
 
 # ============================================================
-# DATA MODEL
+# SNAPSHOT
 # ============================================================
 
 @dataclass
@@ -90,7 +95,7 @@ class Snapshot:
 
 
 # ============================================================
-# HISTORY
+# TOKEN HISTORY
 # ============================================================
 
 class TokenHistory:
@@ -103,8 +108,10 @@ class TokenHistory:
 
         self.snapshots.append(snapshot)
 
-        if len(self.snapshots) > MAX_HISTORY:
-            self.snapshots = self.snapshots[-MAX_HISTORY:]
+        if len(self.snapshots) > MAX_HISTORY_PER_TOKEN:
+            self.snapshots = self.snapshots[
+                -MAX_HISTORY_PER_TOKEN:
+            ]
 
     def previous(self, steps=1) -> Optional[Snapshot]:
 
@@ -121,7 +128,9 @@ class TokenHistory:
             return 0.0
 
         return (
-            self.snapshots[-1].market_cap / old.market_cap - 1
+            self.snapshots[-1].market_cap
+            / old.market_cap
+            - 1
         ) * 100
 
     def liquidity_change(self, steps=1):
@@ -132,7 +141,9 @@ class TokenHistory:
             return 0.0
 
         return (
-            self.snapshots[-1].liquidity / old.liquidity - 1
+            self.snapshots[-1].liquidity
+            / old.liquidity
+            - 1
         ) * 100
 
     def volume_change(self, steps=1):
@@ -154,15 +165,8 @@ class TokenHistory:
         if not old:
             return 1.0
 
-        current_tx = (
-            self.snapshots[-1].buys_5m
-            + self.snapshots[-1].sells_5m
-        )
-
-        old_tx = (
-            old.buys_5m
-            + old.sells_5m
-        )
+        current_tx = self.snapshots[-1].transactions
+        old_tx = old.transactions
 
         if old_tx <= 0:
             return 1.0
@@ -203,6 +207,25 @@ class TokenHistory:
             (high - low) / low
         ) * 100
 
+    def age_minutes(self):
+
+        if not self.snapshots:
+            return 0
+
+        created = self.snapshots[-1].pair_created_at
+
+        if created <= 0:
+            return 0
+
+        created_seconds = created / 1000
+
+        age = time.time() - created_seconds
+
+        return max(
+            0,
+            age / 60
+        )
+
 
 # ============================================================
 # HTTP
@@ -215,7 +238,7 @@ def get_json(url):
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "RunnerBot/3.1"
+                "User-Agent": "RunnerBot/3.3"
             },
         )
 
@@ -259,6 +282,7 @@ def telegram(method, payload=None):
         data = None
 
         if payload is not None:
+
             data = json.dumps(
                 payload
             ).encode()
@@ -345,8 +369,8 @@ def poll_telegram(offset):
                     "chat_id": chat_id,
                     "text":
                         "🔥 Runner Bot is online.\n\n"
-                        "Runner detection is active.\n"
-                        "Alerts are currently in testing mode."
+                        "Historical runner detection is active.\n"
+                        "Alerts remain in testing mode."
                 }
             )
 
@@ -375,41 +399,24 @@ def send_alert(message):
 # ============================================================
 # DEX SCREENER DISCOVERY
 # ============================================================
-#
-# IMPORTANT:
-# We deliberately DO NOT use:
-#
-#     /tokens/{address}
-#
-# because that was producing the 404 errors.
-#
-# Instead we collect Solana pairs directly from:
-#
-#     token profiles
-#     token boosts
-#     DEX Screener search
-#
-# ============================================================
 
 def discover_pairs():
 
     pairs = []
 
+    # These endpoints were part of the working discovery
+    # approach. We also use direct search below.
     endpoints = [
         "/token-profiles/latest/v1",
         "/token-boosts/latest/v1",
         "/token-boosts/top/v1",
     ]
 
-    # --------------------------------------------------------
-    # Profiles / boosts
-    # --------------------------------------------------------
-
     for endpoint in endpoints:
 
-        url = DEX_BASE + endpoint
-
-        data = get_json(url)
+        data = get_json(
+            DEX_BASE + endpoint
+        )
 
         if not data:
             continue
@@ -453,10 +460,7 @@ def discover_pairs():
 
             pairs.append(item)
 
-    # --------------------------------------------------------
-    # Direct DEX Screener searches
-    # --------------------------------------------------------
-
+    # Direct DEX Screener search
     searches = [
         "SOL",
         "USDC",
@@ -512,7 +516,7 @@ def discover_pairs():
 
 
 # ============================================================
-# BEST PAIR PER TOKEN
+# SELECT HIGHEST-LIQUIDITY PAIR PER TOKEN
 # ============================================================
 
 def choose_best_pairs(pairs):
@@ -563,7 +567,6 @@ def choose_best_pairs(pairs):
             liquidity = float(
                 liquidity
             )
-
         except Exception:
             liquidity = 0
 
@@ -590,7 +593,6 @@ def choose_best_pairs(pairs):
                 current_liquidity = float(
                     current_liquidity
                 )
-
             except Exception:
                 current_liquidity = 0
 
@@ -730,55 +732,37 @@ def make_snapshot(pair):
             or 0
         )
 
-        market_cap = float(
-            market_cap
-        )
-
-        liquidity = float(
-            liquidity
-        )
-
-        volume_5m = float(
-            volume_5m
-        )
-
-        price = float(
-            price
-        )
-
-        buys = int(
-            buys
-        )
-
-        sells = int(
-            sells
-        )
-
-        price_change_5m = float(
-            price_change_5m
-        )
-
-        price_change_1h = float(
-            price_change_1h
-        )
-
-        created = int(
-            created
-        )
-
         return Snapshot(
             timestamp=time.time(),
             address=address,
             symbol=symbol,
-            market_cap=market_cap,
-            liquidity=liquidity,
-            volume_5m=volume_5m,
-            buys_5m=buys,
-            sells_5m=sells,
-            price=price,
-            price_change_5m=price_change_5m,
-            price_change_1h=price_change_1h,
-            pair_created_at=created,
+            market_cap=float(
+                market_cap
+            ),
+            liquidity=float(
+                liquidity
+            ),
+            volume_5m=float(
+                volume_5m
+            ),
+            buys_5m=int(
+                buys
+            ),
+            sells_5m=int(
+                sells
+            ),
+            price=float(
+                price
+            ),
+            price_change_5m=float(
+                price_change_5m
+            ),
+            price_change_1h=float(
+                price_change_1h
+            ),
+            pair_created_at=int(
+                created
+            ),
         )
 
     except Exception as exc:
@@ -797,33 +781,22 @@ def make_snapshot(pair):
 
 def analyze(snapshot):
 
-    address = snapshot.address
-    symbol = snapshot.symbol
-
-    history = histories.setdefault(
-        address,
-        TokenHistory(address)
+    history = histories.get(
+        snapshot.address
     )
 
-    history.add(
-        snapshot
-    )
+    if not history:
+        return "NEW"
 
     observations = len(
         history.snapshots
     )
 
-    if observations < 4:
-
+    if observations < MIN_OBSERVATIONS:
         return "NEW"
 
-    # Compare with approximately
-    # 45 seconds ago when scanning every 15 sec.
-    #
-    # This gives us a short-term change
-    # without pretending that DEX Screener's
-    # rolling 5m volume is a new 15-second bar.
-
+    # Use approximately the previous
+    # 45-second observation.
     steps = min(
         3,
         observations - 1
@@ -833,11 +806,11 @@ def analyze(snapshot):
         steps
     )
 
-    vol_change = history.volume_change(
+    volume_change = history.volume_change(
         steps
     )
 
-    txn_change = history.transaction_change(
+    transaction_change = history.transaction_change(
         steps
     )
 
@@ -854,36 +827,29 @@ def analyze(snapshot):
         lookback
     )
 
-    recent_high = history.recent_high(
-        lookback
+    # Previous high excludes the current
+    # observation so the current candle can
+    # actually break the structure.
+    previous_data = (
+        history.snapshots[
+            -lookback:-1
+        ]
     )
 
     previous_high = 0
 
-    if observations > 1:
+    if previous_data:
 
-        previous_data = (
-            history.snapshots[
-                -lookback:-1
-            ]
+        previous_high = max(
+            x.market_cap
+            for x in previous_data
         )
-
-        if previous_data:
-
-            previous_high = max(
-                x.market_cap
-                for x in previous_data
-            )
 
     breakout = (
         previous_high > 0
         and snapshot.market_cap
         > previous_high * 1.03
     )
-
-    # --------------------------------------------------------
-    # BUY / SELL COUNT PRESSURE
-    # --------------------------------------------------------
 
     buys = snapshot.buys_5m
     sells = snapshot.sells_5m
@@ -894,41 +860,33 @@ def analyze(snapshot):
             buys / sells
         )
 
-    else:
+    elif buys > 0:
 
-        buy_sell_ratio = (
-            float(buys)
-            if buys > 0
-            else 0
+        buy_sell_ratio = float(
+            buys
         )
 
-    buy_pressure = (
+    else:
+
+        buy_sell_ratio = 0
+
+    buyer_pressure = (
         buys > sells
         and buy_sell_ratio >= 1.25
     )
 
-    # --------------------------------------------------------
-    # CONSOLIDATION
-    # --------------------------------------------------------
-
+    # Tight recent range = potential base.
     consolidated = (
         range_pct <= 20
     )
 
-    # --------------------------------------------------------
-    # ACTIVITY EXPANSION
-    # --------------------------------------------------------
-
+    # Activity is expanding.
     activity_expanding = (
-        vol_change >= 1.20
-        and txn_change >= 1.15
+        volume_change >= 1.20
+        and transaction_change >= 1.15
     )
 
-    # --------------------------------------------------------
-    # POSITIVE STRUCTURE
-    # --------------------------------------------------------
-
-    positive_move = (
+    positive_price_structure = (
         mc_move >= 3
     )
 
@@ -966,65 +924,74 @@ def analyze(snapshot):
     # --------------------------------------------------------
     # IGNITION
     # --------------------------------------------------------
+    #
+    # This is intentionally conservative for now.
+    #
+    # We want to collect real observations first,
+    # then tighten/loosen these conditions using
+    # actual runner vs failure data.
+    # --------------------------------------------------------
 
     ignition = (
-        observations >= 6
+        observations >= MIN_OBSERVATIONS
         and consolidated
         and activity_expanding
         and breakout
-        and positive_move
+        and positive_price_structure
         and liquidity_supported
-        and buy_pressure
+        and buyer_pressure
+    )
+
+    log.info(
+        "%s | state=%s | obs=%s | "
+        "MC=%.2fK | 5mVol=%.2fK | "
+        "buys/sells=%s/%s | "
+        "volChange=%.2fx | "
+        "txnChange=%.2fx | "
+        "MCmove=%.2f%% | "
+        "liqMove=%.2f%% | "
+        "range=%.2f%% | "
+        "breakout=%s",
+
+        snapshot.symbol,
+        state,
+        observations,
+
+        snapshot.market_cap / 1000,
+        snapshot.volume_5m / 1000,
+
+        buys,
+        sells,
+
+        volume_change,
+        transaction_change,
+
+        mc_move,
+        liquidity_change,
+        range_pct,
+
+        breakout
     )
 
     if ignition:
 
         log.info(
-            "🔥 IGNITION candidate: %s | "
-            "MC=$%.2fK | "
-            "5mVol=$%.2fK | "
-            "buys/sells=%s/%s | "
-            "buy/sell=%.2fx | "
-            "volAccel=%.2fx | "
-            "txnAccel=%.2fx | "
-            "MCmove=%.2f%% | "
-            "liqMove=%.2f%% | "
-            "range=%.2f%%",
-
-            symbol,
-
-            snapshot.market_cap / 1000,
-
-            snapshot.volume_5m / 1000,
-
-            buys,
-
-            sells,
-
-            buy_sell_ratio,
-
-            vol_change,
-
-            txn_change,
-
-            mc_move,
-
-            liquidity_change,
-
-            range_pct
+            "🔥 IGNITION CANDIDATE: %s",
+            snapshot.symbol
         )
 
         send_alert(
             f"🔥 IGNITION DETECTED\n\n"
-            f"${symbol}\n"
+            f"${snapshot.symbol}\n"
             f"MC: ${snapshot.market_cap:,.0f}\n"
             f"5m Volume: ${snapshot.volume_5m:,.0f}\n"
             f"Buys/Sells: {buys}/{sells}\n"
             f"Buy/Sell ratio: {buy_sell_ratio:.2f}x\n"
-            f"Volume acceleration: {vol_change:.2f}x\n"
-            f"Transaction acceleration: {txn_change:.2f}x\n"
-            f"MC movement: {mc_move:.2f}%\n\n"
-            f"CA:\n{address}\n\n"
+            f"Volume change: {volume_change:.2f}x\n"
+            f"Transaction change: {transaction_change:.2f}x\n"
+            f"MC movement: {mc_move:.2f}%\n"
+            f"Liquidity movement: {liquidity_change:.2f}%\n\n"
+            f"CA:\n{snapshot.address}\n\n"
             f"⚠️ Experimental runner detection."
         )
 
@@ -1039,9 +1006,30 @@ def analyze(snapshot):
 
 def save_state():
 
+    # Keep the most recently active tokens.
+    if len(histories) > MAX_STORED_TOKENS:
+
+        ranked = sorted(
+            histories.items(),
+            key=lambda item: (
+                item[1].snapshots[-1].timestamp
+                if item[1].snapshots
+                else 0
+            ),
+            reverse=True
+        )
+
+        histories_to_save = dict(
+            ranked[:MAX_STORED_TOKENS]
+        )
+
+    else:
+
+        histories_to_save = histories
+
     output = {}
 
-    for address, history in histories.items():
+    for address, history in histories_to_save.items():
 
         output[address] = {
             "snapshots": [
@@ -1088,8 +1076,6 @@ def save_state():
 
 def load_state():
 
-    global histories
-
     if not os.path.exists(
         STATE_FILE
     ):
@@ -1111,6 +1097,8 @@ def load_state():
             data = json.load(
                 file
             )
+
+        loaded = 0
 
         for address, value in data.items():
 
@@ -1136,13 +1124,12 @@ def load_state():
 
             if history.snapshots:
 
-                histories[
-                    address
-                ] = history
+                histories[address] = history
+                loaded += 1
 
         log.info(
             "Persistent state loaded: %s tokens",
-            len(histories)
+            loaded
         )
 
     except Exception as exc:
@@ -1173,7 +1160,9 @@ def scan():
         best_pairs
     )
 
-    evaluated = 0
+    history_recorded = 0
+    reached_filter = 0
+
     rejected_mc = 0
     rejected_liquidity = 0
     rejected_volume = 0
@@ -1191,20 +1180,30 @@ def scan():
             missing_data += 1
             continue
 
-        if snapshot.market_cap <= 0:
+        # ====================================================
+        # IMPORTANT:
+        #
+        # RECORD HISTORY BEFORE FILTERING.
+        #
+        # This is the main v3.3 fix.
+        # ====================================================
 
-            missing_data += 1
-            continue
+        history = histories.setdefault(
+            snapshot.address,
+            TokenHistory(
+                snapshot.address
+            )
+        )
 
-        # ----------------------------------------------------
-        # Count token before filters
-        # ----------------------------------------------------
+        history.add(
+            snapshot
+        )
 
-        evaluated += 1
+        history_recorded += 1
 
-        # ----------------------------------------------------
-        # MARKET CAP
-        # ----------------------------------------------------
+        # ====================================================
+        # FILTERS
+        # ====================================================
 
         if not (
             MIN_MC
@@ -1215,10 +1214,6 @@ def scan():
             rejected_mc += 1
             continue
 
-        # ----------------------------------------------------
-        # LIQUIDITY
-        # ----------------------------------------------------
-
         if (
             snapshot.liquidity
             < MIN_LIQUIDITY
@@ -1226,10 +1221,6 @@ def scan():
 
             rejected_liquidity += 1
             continue
-
-        # ----------------------------------------------------
-        # VOLUME
-        # ----------------------------------------------------
 
         if (
             snapshot.volume_5m
@@ -1239,9 +1230,7 @@ def scan():
             rejected_volume += 1
             continue
 
-        # ----------------------------------------------------
-        # RUNNER ENGINE
-        # ----------------------------------------------------
+        reached_filter += 1
 
         state = analyze(
             snapshot
@@ -1255,6 +1244,7 @@ def scan():
         "DEX scan complete: "
         "%s Solana pairs discovered | "
         "%s unique tokens | "
+        "%s histories recorded | "
         "%s reached filter | "
         "MC reject=%s | "
         "liquidity reject=%s | "
@@ -1264,7 +1254,9 @@ def scan():
 
         discovered,
         unique,
-        evaluated,
+        history_recorded,
+        reached_filter,
+
         rejected_mc,
         rejected_liquidity,
         rejected_volume,
@@ -1311,7 +1303,7 @@ signal.signal(
 def main():
 
     log.info(
-        "Runner Engine v3.2 is online"
+        "Runner Engine v3.3 is online"
     )
 
     log.info(
@@ -1363,7 +1355,7 @@ def main():
     save_state()
 
     log.info(
-        "Runner Engine stopped"
+        "Runner Engine v3.3 stopped"
     )
 
 
