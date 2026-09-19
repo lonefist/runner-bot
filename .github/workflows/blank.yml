@@ -16,6 +16,6 @@ jobs:
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          HEATING_ALERTS_ENABLED: "true"
+          HEATING_ALERTS_ENABLED: "false"
           DEX_SCAN_INTERVAL_SECONDS: "15"
         run: timeout 270s python3 bot.py || true
