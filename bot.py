@@ -10,8 +10,8 @@ from typing import Dict, List, Optional
 
 
 # ============================================================
-# RUNNER ENGINE v3.3
-# Historical-first runner detection
+# RUNNER ENGINE v3.4
+# Broad discovery + historical progression tracking
 # ============================================================
 
 logging.basicConfig(
@@ -43,15 +43,19 @@ MAX_TOKENS_PER_SCAN = int(
 
 MIN_MC = 20_000
 MAX_MC = 200_000
+
 MIN_LIQUIDITY = 10_000
 MIN_VOLUME_5M = 5_000
+
+# We begin observing tokens before they enter
+# the official runner zone.
+OBSERVE_MIN_MC = 10_000
+OBSERVE_MAX_MC = 250_000
 
 STATE_FILE = "runner_state.json"
 
 MAX_HISTORY_PER_TOKEN = 120
-
-# Prevent the persistent file from growing forever.
-MAX_STORED_TOKENS = 500
+MAX_STORED_TOKENS = 750
 
 MIN_OBSERVATIONS = 6
 
@@ -95,7 +99,7 @@ class Snapshot:
 
 
 # ============================================================
-# TOKEN HISTORY
+# HISTORY
 # ============================================================
 
 class TokenHistory:
@@ -217,13 +221,14 @@ class TokenHistory:
         if created <= 0:
             return 0
 
-        created_seconds = created / 1000
-
-        age = time.time() - created_seconds
+        age_seconds = (
+            time.time()
+            - created / 1000
+        )
 
         return max(
             0,
-            age / 60
+            age_seconds / 60
         )
 
 
@@ -238,7 +243,7 @@ def get_json(url):
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "RunnerBot/3.3"
+                "User-Agent": "RunnerBot/3.4"
             },
         )
 
@@ -282,7 +287,6 @@ def telegram(method, payload=None):
         data = None
 
         if payload is not None:
-
             data = json.dumps(
                 payload
             ).encode()
@@ -369,8 +373,8 @@ def poll_telegram(offset):
                     "chat_id": chat_id,
                     "text":
                         "🔥 Runner Bot is online.\n\n"
-                        "Historical runner detection is active.\n"
-                        "Alerts remain in testing mode."
+                        "Historical runner tracking is active.\n"
+                        "Alerts remain disabled during testing."
                 }
             )
 
@@ -397,15 +401,14 @@ def send_alert(message):
 
 
 # ============================================================
-# DEX SCREENER DISCOVERY
+# DISCOVERY
 # ============================================================
 
 def discover_pairs():
 
     pairs = []
 
-    # These endpoints were part of the working discovery
-    # approach. We also use direct search below.
+    # Existing working discovery sources.
     endpoints = [
         "/token-profiles/latest/v1",
         "/token-boosts/latest/v1",
@@ -460,12 +463,30 @@ def discover_pairs():
 
             pairs.append(item)
 
-    # Direct DEX Screener search
+    # --------------------------------------------------------
+    # Broader direct searches.
+    #
+    # These are discovery queries, NOT trading criteria.
+    # --------------------------------------------------------
+
     searches = [
         "SOL",
         "USDC",
         "USDT",
         "WSOL",
+        "pump",
+        "meme",
+        "cat",
+        "dog",
+        "ai",
+        "inu",
+        "pepe",
+        "coin",
+        "doge",
+        "frog",
+        "trump",
+        "elon",
+        "baby",
     ]
 
     for query in searches:
@@ -516,7 +537,7 @@ def discover_pairs():
 
 
 # ============================================================
-# SELECT HIGHEST-LIQUIDITY PAIR PER TOKEN
+# BEST PAIR PER TOKEN
 # ============================================================
 
 def choose_best_pairs(pairs):
@@ -549,19 +570,14 @@ def choose_best_pairs(pairs):
         if not address:
             continue
 
-        liquidity_data = (
+        liquidity = (
             pair.get(
                 "liquidity"
             )
             or {}
-        )
-
-        liquidity = (
-            liquidity_data.get(
-                "usd"
-            )
-            or 0
-        )
+        ).get(
+            "usd"
+        ) or 0
 
         try:
             liquidity = float(
@@ -776,7 +792,7 @@ def make_snapshot(pair):
 
 
 # ============================================================
-# RUNNER ANALYSIS
+# PROGRESSION ANALYSIS
 # ============================================================
 
 def analyze(snapshot):
@@ -795,8 +811,6 @@ def analyze(snapshot):
     if observations < MIN_OBSERVATIONS:
         return "NEW"
 
-    # Use approximately the previous
-    # 45-second observation.
     steps = min(
         3,
         observations - 1
@@ -827,9 +841,6 @@ def analyze(snapshot):
         lookback
     )
 
-    # Previous high excludes the current
-    # observation so the current candle can
-    # actually break the structure.
     previous_data = (
         history.snapshots[
             -lookback:-1
@@ -875,18 +886,16 @@ def analyze(snapshot):
         and buy_sell_ratio >= 1.25
     )
 
-    # Tight recent range = potential base.
     consolidated = (
         range_pct <= 20
     )
 
-    # Activity is expanding.
     activity_expanding = (
         volume_change >= 1.20
         and transaction_change >= 1.15
     )
 
-    positive_price_structure = (
+    positive_structure = (
         mc_move >= 3
     )
 
@@ -922,55 +931,63 @@ def analyze(snapshot):
         state = "OBSERVING"
 
     # --------------------------------------------------------
-    # IGNITION
+    # APPROACHING RUNNER ZONE
     # --------------------------------------------------------
-    #
-    # This is intentionally conservative for now.
-    #
-    # We want to collect real observations first,
-    # then tighten/loosen these conditions using
-    # actual runner vs failure data.
+
+    in_runner_zone = (
+        MIN_MC
+        <= snapshot.market_cap
+        <= MAX_MC
+    )
+
+    if in_runner_zone:
+
+        log.info(
+            "TRACKING %s | state=%s | obs=%s | "
+            "MC=%.2fK | 5mVol=%.2fK | "
+            "buys/sells=%s/%s | "
+            "volChange=%.2fx | "
+            "txnChange=%.2fx | "
+            "MCmove=%.2f%% | "
+            "liqMove=%.2f%% | "
+            "range=%.2f%% | "
+            "breakout=%s",
+
+            snapshot.symbol,
+            state,
+            observations,
+
+            snapshot.market_cap / 1000,
+            snapshot.volume_5m / 1000,
+
+            buys,
+            sells,
+
+            volume_change,
+            transaction_change,
+
+            mc_move,
+            liquidity_change,
+            range_pct,
+
+            breakout
+        )
+
+    # --------------------------------------------------------
+    # IGNITION
     # --------------------------------------------------------
 
     ignition = (
         observations >= MIN_OBSERVATIONS
+        and in_runner_zone
         and consolidated
         and activity_expanding
         and breakout
-        and positive_price_structure
+        and positive_structure
         and liquidity_supported
         and buyer_pressure
-    )
-
-    log.info(
-        "%s | state=%s | obs=%s | "
-        "MC=%.2fK | 5mVol=%.2fK | "
-        "buys/sells=%s/%s | "
-        "volChange=%.2fx | "
-        "txnChange=%.2fx | "
-        "MCmove=%.2f%% | "
-        "liqMove=%.2f%% | "
-        "range=%.2f%% | "
-        "breakout=%s",
-
-        snapshot.symbol,
-        state,
-        observations,
-
-        snapshot.market_cap / 1000,
-        snapshot.volume_5m / 1000,
-
-        buys,
-        sells,
-
-        volume_change,
-        transaction_change,
-
-        mc_move,
-        liquidity_change,
-        range_pct,
-
-        breakout
+        and snapshot.volume_5m >= MIN_VOLUME_5M
+        and snapshot.liquidity >= MIN_LIQUIDITY
     )
 
     if ignition:
@@ -1006,7 +1023,6 @@ def analyze(snapshot):
 
 def save_state():
 
-    # Keep the most recently active tokens.
     if len(histories) > MAX_STORED_TOKENS:
 
         ranked = sorted(
@@ -1161,6 +1177,7 @@ def scan():
     )
 
     history_recorded = 0
+    approaching = 0
     reached_filter = 0
 
     rejected_mc = 0
@@ -1181,12 +1198,16 @@ def scan():
             continue
 
         # ====================================================
-        # IMPORTANT:
-        #
-        # RECORD HISTORY BEFORE FILTERING.
-        #
-        # This is the main v3.3 fix.
+        # RECORD EVERYTHING IN THE OBSERVATION BAND
         # ====================================================
+
+        if not (
+            OBSERVE_MIN_MC
+            <= snapshot.market_cap
+            <= OBSERVE_MAX_MC
+        ):
+
+            continue
 
         history = histories.setdefault(
             snapshot.address,
@@ -1202,7 +1223,19 @@ def scan():
         history_recorded += 1
 
         # ====================================================
-        # FILTERS
+        # APPROACHING / RUNNER RANGE
+        # ====================================================
+
+        if (
+            MIN_MC
+            <= snapshot.market_cap
+            <= MAX_MC
+        ):
+
+            approaching += 1
+
+        # ====================================================
+        # ORIGINAL RUNNER FILTER
         # ====================================================
 
         if not (
@@ -1245,7 +1278,8 @@ def scan():
         "%s Solana pairs discovered | "
         "%s unique tokens | "
         "%s histories recorded | "
-        "%s reached filter | "
+        "%s in runner range | "
+        "%s reached full filter | "
         "MC reject=%s | "
         "liquidity reject=%s | "
         "volume reject=%s | "
@@ -1255,6 +1289,7 @@ def scan():
         discovered,
         unique,
         history_recorded,
+        approaching,
         reached_filter,
 
         rejected_mc,
@@ -1303,17 +1338,20 @@ signal.signal(
 def main():
 
     log.info(
-        "Runner Engine v3.3 is online"
+        "Runner Engine v3.4 is online"
     )
 
     log.info(
         "Runner range: MC=$%.2fK-$%.2fK | "
+        "observation band=$%.2fK-$%.2fK | "
         "minimum liquidity=$%.2fK | "
         "minimum 5m volume=$%.2fK | "
         "scan interval=%.1fs",
 
         MIN_MC / 1000,
         MAX_MC / 1000,
+        OBSERVE_MIN_MC / 1000,
+        OBSERVE_MAX_MC / 1000,
         MIN_LIQUIDITY / 1000,
         MIN_VOLUME_5M / 1000,
         SCAN_INTERVAL
@@ -1355,7 +1393,7 @@ def main():
     save_state()
 
     log.info(
-        "Runner Engine v3.3 stopped"
+        "Runner Engine v3.4 stopped"
     )
 
 
