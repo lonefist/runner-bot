@@ -2054,7 +2054,11 @@ def analyze(
     # We require actual structural/activity confirmation.
     # --------------------------------------------------------
 
-    if score >= 70 and breakout and activity_expansion:
+        if score >= 70 and breakout and activity_expansion:
+
+        setup_state = (
+            "IGNITION"
+        )
     ):
 
         setup_state = (
