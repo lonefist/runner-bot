@@ -1,93 +1,178 @@
 import json
 import os
 import time
-import shutil
-import subprocess
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# RUNNER BOT V4.7.2
-# GMGN-FIRST SECOND-WAVE
+# RUNNER BOT V5.0
+# DEXSCREENER RECOVERY RUNNER
 # ============================================================
 
-BOT_VERSION = "V4.7.2-SECOND-WAVE-GMGN"
+BOT_VERSION = "V5.0-DEXSCREENER-RECOVERY"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-STATE_FILE = "runner_state_v472.json"
-
-SCAN_INTERVAL = 15
+STATE_FILE = "runner_state_v50.json"
 
 # ============================================================
 # STRATEGY
 # ============================================================
 
-MIN_AGE_HOURS = 10
-MAX_AGE_HOURS = 72
+MIN_AGE_HOURS = 3.0
+MAX_AGE_HOURS = None
 
 MIN_MC = 30_000
 MAX_MC = 400_000
 
 MIN_LIQUIDITY = 25_000
+PREFERRED_LIQUIDITY = 40_000
 
-MIN_HOLDERS = 300
+MIN_VOLUME_MC_RATIO = 0.05
 
-MAX_DEV_RATE = 0.04
-MAX_TOP10_RATE = 0.25
+MIN_BUY_SELL_RATIO = 1.20
 
-MIN_VOLUME_MC_PCT = 0.05
+# Avoid tokens that have already gone vertical in 5 minutes.
+MAX_5M_PRICE_CHANGE = 50.0
+
+# Minimum 5m price activity.
+MIN_5M_PRICE_CHANGE = 0.0
+
+# A 5m volume share above this means the current 5m period
+# is unusually active relative to the preceding 1h.
+VOLUME_EXPANSION_RATIO = 0.10
+
+# Tracking
+OBSERVATION_WINDOW_HOURS = 12
+MAX_TRACKED_TOKENS = 150
+
+# Discovery / validation
+DISCOVERY_INTERVAL_SECONDS = 300
+VALIDATION_INTERVAL_SECONDS = 300
+
+MAX_VALIDATIONS_PER_CYCLE = 20
+
+# Telegram
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv("SCAN_INTERVAL_SECONDS", "15")
+)
+
+ALERTS_ENABLED = (
+    os.getenv("HEATING_ALERTS_ENABLED", "true").lower()
+    == "true"
+)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
 
 # ============================================================
-# GMGN
+# HTTP
 # ============================================================
 
-GMGN_DISCOVERY_INTERVAL = 300
-GMGN_VALIDATION_INTERVAL = 300
+def http_get(
+    url: str,
+    timeout: int = 20
+) -> Optional[Any]:
 
-MAX_GMGN_CANDIDATES = 30
-MAX_VALIDATIONS_PER_CYCLE = 5
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "RunnerBot/5.0 "
+                    "(DexScreener Recovery Scanner)"
+                )
+            }
+        )
 
-# ============================================================
-# HOLDER TRACKING
-# ============================================================
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout
+        ) as response:
 
-HOLDER_WINDOW = 3 * 60 * 60
+            raw = response.read().decode("utf-8")
 
-# ============================================================
-# ALERTS
-# ============================================================
+            if not raw:
+                return None
 
-GLOBAL_ALERT_COOLDOWN = 60
-TOKEN_ALERT_COOLDOWN = 30 * 60
+            return json.loads(raw)
 
-MAX_HISTORY = 5000
+    except urllib.error.HTTPError as e:
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = ""
+
+        print(
+            f"HTTP error {e.code}: "
+            f"{body[:300]}"
+        )
+
+        return None
+
+    except Exception as e:
+
+        print(
+            f"HTTP request error: {e}"
+        )
+
+        return None
 
 
 # ============================================================
 # TIME
 # ============================================================
 
-def now() -> int:
-    return int(time.time())
+def now_ts() -> float:
+    return time.time()
 
 
-def iso_now() -> str:
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+def age_hours(
+    pair_created_at: Optional[int]
+) -> Optional[float]:
+
+    if not pair_created_at:
+        return None
+
+    try:
+
+        # DexScreener timestamps are milliseconds.
+        created = (
+            pair_created_at / 1000
+        )
+
+        age = (
+            now_ts() - created
+        ) / 3600
+
+        return age
+
+    except Exception:
+        return None
 
 
-def safe_float(
+def fmt_age(hours: Optional[float]) -> str:
+
+    if hours is None:
+        return "?"
+
+    if hours < 24:
+        return f"{hours:.1f}h"
+
+    return f"{hours / 24:.1f}d"
+
+
+# ============================================================
+# NUMBERS
+# ============================================================
+
+def num(
     value: Any,
     default: float = 0.0
 ) -> float:
@@ -97,103 +182,51 @@ def safe_float(
         if value is None:
             return default
 
-        return float(
-            str(value)
-            .replace(",", "")
-            .replace("$", "")
-            .strip()
-        )
+        return float(value)
 
     except Exception:
         return default
 
 
-def safe_int(
-    value: Any,
-    default: int = 0
-) -> int:
+def money(
+    value: float
+) -> str:
 
-    try:
-        return int(float(value))
-    except Exception:
-        return default
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
 
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
 
-def age_hours(timestamp: int) -> float:
-
-    if not timestamp:
-        return 999999
-
-    return max(
-        0,
-        (now() - timestamp) / 3600
-    )
+    return f"${value:.0f}"
 
 
-def money(value: float) -> str:
+def pct(
+    value: float
+) -> str:
 
-    return f"${value:,.0f}"
-
-
-def percentage(value: float) -> str:
-
-    return f"{value * 100:.2f}%"
+    return f"{value:.1f}%"
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-def default_state():
+def default_state() -> Dict[str, Any]:
 
     return {
-
-        "started_at": iso_now(),
-
-        "telegram_chats": {},
-
-        "candidates": {},
-
-        "holder_history": {},
-
-        "observations": {},
-
-        "cooldowns": {},
-
+        "subscribers": [],
+        "tracked": {},
         "last_discovery": 0,
-
-        "stats": {
-
-            "scans": 0,
-
-            "gmgn_discovered": 0,
-
-            "gmgn_validated": 0,
-
-            "dex_verified": 0,
-
-            "qualified": 0,
-
-            "alerts": 0,
-
-            "rejected": 0,
-
-            "rejections": {},
-        },
-
-        "recent_rejections": [],
-
-        "recent_qualified": [],
-
-        "recent_alerts": [],
+        "last_validation": 0,
+        "total_scans": 0,
+        "total_alerts": 0
     }
 
 
-def load_state():
+def load_state() -> Dict[str, Any]:
 
-    if not os.path.exists(
-        STATE_FILE
-    ):
+    if not os.path.exists(STATE_FILE):
         return default_state()
 
     try:
@@ -206,38 +239,57 @@ def load_state():
 
             state = json.load(f)
 
-        base = default_state()
+        if not isinstance(state, dict):
+            return default_state()
 
-        for key, value in base.items():
+        state.setdefault(
+            "subscribers",
+            []
+        )
 
-            if key not in state:
-                state[key] = value
+        state.setdefault(
+            "tracked",
+            {}
+        )
 
-        for key, value in base["stats"].items():
+        state.setdefault(
+            "last_discovery",
+            0
+        )
 
-            if key not in state["stats"]:
-                state["stats"][key] = value
+        state.setdefault(
+            "last_validation",
+            0
+        )
+
+        state.setdefault(
+            "total_scans",
+            0
+        )
+
+        state.setdefault(
+            "total_alerts",
+            0
+        )
 
         return state
 
     except Exception as e:
 
         print(
-            "State error:",
-            e
+            f"State load error: {e}"
         )
 
         return default_state()
 
 
-STATE = load_state()
+def save_state(
+    state: Dict[str, Any]
+):
 
-
-def save_state():
+    tmp = STATE_FILE + ".tmp"
 
     try:
-
-        tmp = STATE_FILE + ".tmp"
 
         with open(
             tmp,
@@ -246,7 +298,7 @@ def save_state():
         ) as f:
 
             json.dump(
-                STATE,
+                state,
                 f,
                 indent=2
             )
@@ -259,245 +311,45 @@ def save_state():
     except Exception as e:
 
         print(
-            "State save error:",
-            e
+            f"State save error: {e}"
         )
-
-
-# ============================================================
-# GMGN CLI LOCATOR
-# ============================================================
-
-def locate_gmgn():
-
-    candidates = []
-
-    # PATH
-    path = shutil.which(
-        "gmgn-cli"
-    )
-
-    if path:
-        candidates.append(
-            ["gmgn-cli"]
-        )
-
-    # Common npm locations
-    candidates.extend([
-        ["/usr/local/bin/gmgn-cli"],
-        ["/usr/bin/gmgn-cli"],
-        ["/root/.npm-global/bin/gmgn-cli"],
-        ["/home/runner/.npm-global/bin/gmgn-cli"],
-    ])
-
-    # Check candidates
-    for candidate in candidates:
-
-        executable = candidate[0]
-
-        if os.path.isfile(
-            executable
-        ) and os.access(
-            executable,
-            os.X_OK
-        ):
-
-            return candidate
-
-    # npx fallback
-    npx = shutil.which(
-        "npx"
-    )
-
-    if npx:
-
-        return [
-            npx,
-            "--yes",
-            "gmgn-cli@latest"
-        ]
-
-    return None
-
-
-GMGN_COMMAND = locate_gmgn()
-
-
-def print_gmgn_status():
-
-    global GMGN_COMMAND
-
-    GMGN_COMMAND = locate_gmgn()
-
-    if GMGN_COMMAND:
-
-        print(
-            "GMGN executable:",
-            " ".join(GMGN_COMMAND)
-        )
-
-    else:
-
-        print(
-            "GMGN executable not found."
-        )
-
-        print(
-            "The bot will attempt npx "
-            "fallback when available."
-        )
-
-
-# ============================================================
-# GMGN COMMAND
-# ============================================================
-
-def gmgn_run(
-    args: List[str],
-    raw: bool = True,
-    timeout: int = 60
-):
-
-    global GMGN_COMMAND
-
-    if not GMGN_COMMAND:
-
-        GMGN_COMMAND = locate_gmgn()
-
-    if not GMGN_COMMAND:
-
-        return None
-
-    command = list(
-        GMGN_COMMAND
-    )
-
-    command.extend(args)
-
-    if raw:
-        command.append(
-            "--raw"
-        )
-
-    try:
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-
-        if result.returncode != 0:
-
-            print(
-                "GMGN error:",
-                result.stderr.strip()[:500]
-            )
-
-            return None
-
-        output = result.stdout.strip()
-
-        if not output:
-            return None
-
-        return output
-
-    except Exception as e:
-
-        print(
-            "GMGN execution error:",
-            e
-        )
-
-        return None
-
-
-def gmgn_json(
-    args: List[str]
-):
-
-    output = gmgn_run(
-        args,
-        raw=True
-    )
-
-    if not output:
-        return None
-
-    try:
-
-        return json.loads(
-            output
-        )
-
-    except Exception:
-
-        # Some CLIs may put additional
-        # text around JSON.
-        start = output.find("{")
-        end = output.rfind("}")
-
-        if (
-            start >= 0
-            and end > start
-        ):
-
-            try:
-
-                return json.loads(
-                    output[
-                        start:end + 1
-                    ]
-                )
-
-            except Exception:
-                pass
-
-        return None
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram(
+def telegram_call(
     method: str,
-    payload: Optional[
-        Dict[str, Any]
-    ] = None
-):
+    data: Dict[str, Any]
+) -> Optional[Any]:
 
-    if not TELEGRAM_TOKEN:
+    if not TELEGRAM_BOT_TOKEN:
         return None
 
     url = (
         f"{TELEGRAM_BASE}/bot"
-        f"{TELEGRAM_TOKEN}/{method}"
+        f"{TELEGRAM_BOT_TOKEN}/"
+        f"{method}"
     )
 
     try:
 
-        data = None
+        encoded = urllib.parse.urlencode(
+            data
+        ).encode()
 
-        if payload:
-
-            data = urllib.parse.urlencode(
-                payload
-            ).encode()
-
-        request = urllib.request.Request(
+        req = urllib.request.Request(
             url,
-            data=data,
+            data=encoded,
             headers={
                 "Content-Type":
-                "application/x-www-form-urlencoded"
+                    "application/x-www-form-urlencoded"
             }
         )
 
         with urllib.request.urlopen(
-            request,
+            req,
             timeout=20
         ) as response:
 
@@ -508,8 +360,7 @@ def telegram(
     except Exception as e:
 
         print(
-            "Telegram error:",
-            e
+            f"Telegram error: {e}"
         )
 
         return None
@@ -520,214 +371,349 @@ def send_message(
     text: str
 ):
 
-    result = telegram(
+    telegram_call(
         "sendMessage",
         {
             "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview":
-                "true"
+            "disable_web_page_preview": True
         }
-    )
-
-    return bool(
-        result
-        and result.get("ok")
     )
 
 
 def broadcast(
+    state: Dict[str, Any],
     text: str
 ):
 
-    count = 0
+    if not ALERTS_ENABLED:
+        return
 
-    for chat_id, enabled in list(
-        STATE[
-            "telegram_chats"
-        ].items()
+    for chat_id in list(
+        state.get("subscribers", [])
     ):
 
-        if not enabled:
-            continue
-
-        if send_message(
+        send_message(
             chat_id,
             text
-        ):
-
-            count += 1
-
-    return count
-
-
-# ============================================================
-# GMGN DISCOVERY
-# ============================================================
-
-def gmgn_discover():
-
-    print(
-        "GMGN discovery: "
-        "searching second-wave tokens..."
-    )
-
-    # We intentionally use broad discovery
-    # and perform the exact hard filters locally.
-    #
-    # This avoids depending on optional
-    # server-side filter names.
-
-    data = gmgn_json(
-        [
-            "market",
-            "trending",
-
-            "--chain",
-            "sol",
-
-            "--interval",
-            "1h",
-
-            "--max-created",
-            "72h",
-
-            "--min-liquidity",
-            str(MIN_LIQUIDITY),
-
-            "--order-by",
-            "volume",
-
-            "--limit",
-            str(MAX_GMGN_CANDIDATES),
-        ]
-    )
-
-    if data is None:
-        return []
-
-    rows = []
-
-    if isinstance(
-        data,
-        list
-    ):
-
-        rows = data
-
-    elif isinstance(
-        data,
-        dict
-    ):
-
-        nested = data.get(
-            "data"
         )
 
-        if isinstance(
-            nested,
-            list
-        ):
 
-            rows = nested
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
 
-        elif isinstance(
-            nested,
-            dict
-        ):
+def process_telegram_updates(
+    state: Dict[str, Any]
+):
 
-            for key in [
-                "rank",
-                "tokens",
-                "list",
-                "data"
-            ]:
+    result = telegram_call(
+        "getUpdates",
+        {
+            "timeout": 1,
+            "allowed_updates":
+                json.dumps(["message"])
+        }
+    )
 
-                if isinstance(
-                    nested.get(key),
-                    list
-                ):
+    if not result:
+        return
 
-                    rows = nested[key]
-                    break
+    if not result.get("ok"):
+        return
 
-        if not rows:
+    updates = result.get(
+        "result",
+        []
+    )
 
-            for key in [
-                "rank",
-                "tokens",
-                "list"
-            ]:
+    if not updates:
+        return
 
-                if isinstance(
-                    data.get(key),
-                    list
-                ):
+    last_update = None
 
-                    rows = data[key]
-                    break
+    for update in updates:
 
-    output = []
+        last_update = update.get(
+            "update_id"
+        )
 
-    for row in rows:
+        message = update.get(
+            "message",
+            {}
+        )
 
-        if not isinstance(
-            row,
-            dict
-        ):
-            continue
+        chat = message.get(
+            "chat",
+            {}
+        )
 
-        address = str(
-            row.get(
-                "address",
+        chat_id = chat.get(
+            "id"
+        )
+
+        text = (
+            message.get(
+                "text",
                 ""
             )
-        ).strip()
-
-        if not address:
-            continue
-
-        output.append(
-            row
+            .strip()
+            .lower()
         )
 
-    return output
+        if not chat_id:
+            continue
+
+        chat_id = str(chat_id)
+
+        if text == "/start":
+
+            if chat_id not in state[
+                "subscribers"
+            ]:
+
+                state[
+                    "subscribers"
+                ].append(chat_id)
+
+                save_state(state)
+
+            send_message(
+                chat_id,
+                (
+                    "Runner Bot V5.0 is online.\n\n"
+                    "DexScreener-only recovery scanner.\n"
+                    "Age: 3h+ with no maximum age.\n"
+                    "Use /status to view the scanner."
+                )
+            )
+
+        elif text == "/stop":
+
+            if chat_id in state[
+                "subscribers"
+            ]:
+
+                state[
+                    "subscribers"
+                ].remove(chat_id)
+
+                save_state(state)
+
+            send_message(
+                chat_id,
+                "Alerts stopped."
+            )
+
+        elif text == "/alerts":
+
+            enabled = (
+                chat_id in state[
+                    "subscribers"
+                ]
+            )
+
+            send_message(
+                chat_id,
+                (
+                    "Alerts: "
+                    + (
+                        "ON"
+                        if enabled
+                        else "OFF"
+                    )
+                )
+            )
+
+        elif text == "/status":
+
+            tracked = len(
+                state.get(
+                    "tracked",
+                    {}
+                )
+            )
+
+            send_message(
+                chat_id,
+                (
+                    f"Runner Bot {BOT_VERSION}\n\n"
+                    f"Tracked: {tracked}\n"
+                    f"Subscribers: "
+                    f"{len(state['subscribers'])}\n"
+                    f"Scans: "
+                    f"{state['total_scans']}\n"
+                    f"Alerts: "
+                    f"{state['total_alerts']}\n\n"
+                    "Age: 3h+\n"
+                    "MC: $30K-$400K\n"
+                    "Liquidity: >= $25K\n"
+                    "Volume/MC: >= 5%\n"
+                    "Buy/Sell: >= 1.20"
+                )
+            )
+
+        elif text == "/tracking":
+
+            tracked = state.get(
+                "tracked",
+                {}
+            )
+
+            if not tracked:
+
+                send_message(
+                    chat_id,
+                    "No tokens are currently tracked."
+                )
+
+                continue
+
+            lines = [
+                "TRACKING\n"
+            ]
+
+            for address, item in list(
+                tracked.items()
+            )[:20]:
+
+                lines.append(
+                    f"{item.get('symbol', '?')} "
+                    f"| obs="
+                    f"{item.get('observations', 0)} "
+                    f"| MC="
+                    f"{money(num(item.get('mc')))}"
+                )
+
+            send_message(
+                chat_id,
+                "\n".join(lines)
+            )
+
+    if last_update is not None:
+
+        telegram_call(
+            "getUpdates",
+            {
+                "offset":
+                    last_update + 1,
+                "timeout": 1
+            }
+        )
 
 
 # ============================================================
-# TOKEN INFO
+# DEXSCREENER DISCOVERY
 # ============================================================
 
-def gmgn_info(
-    address: str
-):
+def discover_sources() -> List[str]:
 
-    return gmgn_json(
-        [
-            "token",
-            "info",
-            "--chain",
-            "sol",
-            "--address",
-            address
-        ]
+    addresses = set()
+
+    # Latest token profiles
+    profiles = http_get(
+        f"{DEX_BASE}/token-profiles/latest/v1"
     )
 
+    if isinstance(profiles, list):
 
-def gmgn_security(
-    address: str
-):
+        for item in profiles:
 
-    return gmgn_json(
-        [
-            "token",
-            "security",
-            "--chain",
-            "sol",
-            "--address",
-            address
-        ]
+            if (
+                item.get("chainId")
+                == "solana"
+            ):
+
+                address = item.get(
+                    "tokenAddress"
+                )
+
+                if address:
+                    addresses.add(address)
+
+    # Latest boosts
+    boosts = http_get(
+        f"{DEX_BASE}/token-boosts/latest/v1"
     )
+
+    if isinstance(boosts, list):
+
+        for item in boosts:
+
+            if (
+                item.get("chainId")
+                == "solana"
+            ):
+
+                address = item.get(
+                    "tokenAddress"
+                )
+
+                if address:
+                    addresses.add(address)
+
+    return list(addresses)
+
+
+def fetch_token_pairs(
+    address: str
+) -> List[Dict[str, Any]]:
+
+    url = (
+        f"{DEX_BASE}/tokens/v1/solana/"
+        f"{urllib.parse.quote(address)}"
+    )
+
+    data = http_get(url)
+
+    if not isinstance(data, list):
+        return []
+
+    return [
+        p for p in data
+        if p.get("chainId") == "solana"
+    ]
+
+
+def select_best_pair(
+    pairs: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+
+    if not pairs:
+        return None
+
+    valid = []
+
+    for pair in pairs:
+
+        liquidity = num(
+            pair.get(
+                "liquidity",
+                {}
+            ).get("usd")
+        )
+
+        if liquidity <= 0:
+            continue
+
+        valid.append(
+            pair
+        )
+
+    if not valid:
+        return None
+
+    valid.sort(
+        key=lambda p: num(
+            p.get(
+                "liquidity",
+                {}
+            ).get("usd")
+        ),
+        reverse=True
+    )
+
+    return valid[0]
 
 
 # ============================================================
@@ -735,886 +721,484 @@ def gmgn_security(
 # ============================================================
 
 def extract_metrics(
-    info: Dict[str, Any],
-    security: Dict[str, Any]
-):
+    pair: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
 
-    price_data = (
-        info.get("price")
-        or {}
-    )
+    if not pair:
+        return None
 
-    stat = (
-        info.get("stat")
-        or {}
-    )
-
-    dev = (
-        info.get("dev")
-        or {}
-    )
-
-    links = (
-        info.get("link")
-        or {}
-    )
-
-    wallet_tags = (
-        info.get(
-            "wallet_tags_stat"
-        )
-        or {}
-    )
-
-    price = safe_float(
-        price_data.get(
-            "price"
-        )
-    )
-
-    supply = safe_float(
-        info.get(
-            "circulating_supply"
-        )
-    )
-
-    market_cap = (
-        price * supply
-    )
-
-    if market_cap <= 0:
-
-        market_cap = safe_float(
-            info.get(
-                "market_cap"
-            )
-        )
-
-    top10 = safe_float(
-        stat.get(
-            "top_10_holder_rate"
-        )
-    )
-
-    dev_rate = safe_float(
-        stat.get(
-            "dev_team_hold_rate"
-        )
-    )
-
-    # Some responses may expose the
-    # creator separately.
-    if dev_rate == 0:
-
-        dev_rate = safe_float(
-            dev.get(
-                "dev_team_hold_rate"
-            )
-        )
-
-    socials = []
-
-    for field in [
-        "twitter_username",
-        "telegram",
-        "website",
-        "discord"
-    ]:
-
-        if links.get(field):
-            socials.append(
-                field
-            )
-
-    return {
-
-        "address": info.get(
-            "address"
-        ),
-
-        "symbol": info.get(
-            "symbol",
-            "UNKNOWN"
-        ),
-
-        "name": info.get(
-            "name",
-            ""
-        ),
-
-        "price": price,
-
-        "market_cap": market_cap,
-
-        "liquidity":
-            safe_float(
-                info.get(
-                    "liquidity"
-                )
-            ),
-
-        "holders":
-            safe_int(
-                info.get(
-                    "holder_count"
-                )
-            ),
-
-        "created":
-            safe_int(
-                info.get(
-                    "creation_timestamp"
-                )
-            ),
-
-        "top10_rate":
-            top10,
-
-        "dev_rate":
-            dev_rate,
-
-        "volume_5m":
-            safe_float(
-                price_data.get(
-                    "volume_5m"
-                )
-            ),
-
-        "volume_1h":
-            safe_float(
-                price_data.get(
-                    "volume_1h"
-                )
-            ),
-
-        "volume_6h":
-            safe_float(
-                price_data.get(
-                    "volume_6h"
-                )
-            ),
-
-        "buy_5m":
-            safe_float(
-                price_data.get(
-                    "buy_volume_5m"
-                )
-            ),
-
-        "sell_5m":
-            safe_float(
-                price_data.get(
-                    "sell_volume_5m"
-                )
-            ),
-
-        "buy_1h":
-            safe_float(
-                price_data.get(
-                    "buy_volume_1h"
-                )
-            ),
-
-        "sell_1h":
-            safe_float(
-                price_data.get(
-                    "sell_volume_1h"
-                )
-            ),
-
-        "buy_6h":
-            safe_float(
-                price_data.get(
-                    "buy_volume_6h"
-                )
-            ),
-
-        "sell_6h":
-            safe_float(
-                price_data.get(
-                    "sell_volume_6h"
-                )
-            ),
-
-        "smart_money":
-            safe_int(
-                wallet_tags.get(
-                    "smart_wallets"
-                )
-            ),
-
-        "kol":
-            safe_int(
-                wallet_tags.get(
-                    "renowned_wallets"
-                )
-            ),
-
-        "snipers":
-            safe_int(
-                wallet_tags.get(
-                    "sniper_wallets"
-                )
-            ),
-
-        "bundlers":
-            safe_int(
-                wallet_tags.get(
-                    "bundler_wallets"
-                )
-            ),
-
-        "socials":
-            socials,
-
-        "twitter":
-            links.get(
-                "twitter_username"
-            ),
-
-        "telegram":
-            links.get(
-                "telegram"
-            ),
-
-        "website":
-            links.get(
-                "website"
-            ),
-
-        "mint_revoked":
-            security.get(
-                "renounced_mint"
-            ),
-
-        "freeze_revoked":
-            security.get(
-                "renounced_freeze_account"
-            ),
-
-        "rug_ratio":
-            safe_float(
-                security.get(
-                    "rug_ratio"
-                )
-            ),
-    }
-
-
-# ============================================================
-# HOLDER TRACKING
-# ============================================================
-
-def holder_growth(
-    address: str,
-    holders: int
-):
-
-    history = STATE[
-        "holder_history"
-    ].setdefault(
-        address,
-        []
-    )
-
-    current = now()
-
-    history.append(
-        {
-            "time": current,
-            "holders": holders
-        }
-    )
-
-    cutoff = (
-        current
-        - HOLDER_WINDOW
-    )
-
-    history[:] = [
-        x for x in history
-        if safe_int(
-            x.get("time")
-        ) >= cutoff
-    ]
-
-    if len(history) > 100:
-
-        del history[:-100]
-
-    if len(history) < 2:
-
-        return {
-            "growing": False,
-            "change": 0,
-            "samples": len(history)
-        }
-
-    oldest = safe_int(
-        history[0].get(
-            "holders"
-        )
-    )
-
-    latest = safe_int(
-        history[-1].get(
-            "holders"
-        )
-    )
-
-    return {
-        "growing":
-            latest > oldest,
-
-        "change":
-            latest - oldest,
-
-        "samples":
-            len(history)
-    }
-
-
-# ============================================================
-# BUY PRESSURE
-# ============================================================
-
-def buy_pressure(
-    metrics
-):
-
-    return {
-
-        "p5":
-            metrics["buy_5m"]
-            - metrics["sell_5m"],
-
-        "p1":
-            metrics["buy_1h"]
-            - metrics["sell_1h"],
-
-        "p6":
-            metrics["buy_6h"]
-            - metrics["sell_6h"],
-    }
-
-
-def pressure_ok(
-    address: str,
-    metrics
-):
-
-    pressure = buy_pressure(
-        metrics
-    )
-
-    # Positive current pressure
-    if pressure["p5"] > 0:
-        return True
-
-    # Positive 1h pressure
-    if pressure["p1"] > 0:
-        return True
-
-    # Recovering 5m pressure
-    candidate = STATE[
-        "candidates"
-    ].get(
-        address,
+    base = pair.get(
+        "baseToken",
         {}
     )
 
-    history = candidate.get(
-        "pressure_history",
-        []
-    )
-
-    if len(history) < 2:
-        return False
-
-    previous = safe_float(
-        history[-2].get(
-            "p5"
-        )
-    )
-
-    current = pressure["p5"]
-
-    return (
-        current > previous
-        and current >= 0
-    )
-
-
-def save_pressure(
-    address: str,
-    metrics
-):
-
-    candidate = STATE[
-        "candidates"
-    ].setdefault(
-        address,
-        {}
-    )
-
-    history = candidate.setdefault(
-        "pressure_history",
-        []
-    )
-
-    p = buy_pressure(
-        metrics
-    )
-
-    history.append(
-        {
-            "time": now(),
-            "p5": p["p5"],
-            "p1": p["p1"]
-        }
-    )
-
-    cutoff = (
-        now()
-        - 6 * 60 * 60
-    )
-
-    history[:] = [
-        x for x in history
-        if safe_int(
-            x.get("time")
-        ) >= cutoff
-    ]
-
-    if len(history) > 100:
-        del history[:-100]
-
-
-# ============================================================
-# DEXSCREENER
-# ============================================================
-
-def http_json(
-    url: str
-):
-
-    try:
-
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent":
-                "RunnerBot/4.7.2"
-            }
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=20
-        ) as response:
-
-            return json.loads(
-                response.read().decode()
-            )
-
-    except Exception as e:
-
-        print(
-            "DEX error:",
-            e
-        )
-
-        return None
-
-
-def dex_verify(
-    address: str
-):
-
-    url = (
-        f"{DEX_BASE}/latest/dex/tokens/"
-        f"{urllib.parse.quote(address)}"
-    )
-
-    data = http_json(
-        url
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-        return None
-
-    pairs = data.get(
-        "pairs"
-    ) or []
-
-    pairs = [
-        p for p in pairs
-        if p.get(
-            "chainId"
-        ) == "solana"
-    ]
-
-    if not pairs:
-        return None
-
-    pairs.sort(
-        key=lambda p:
-        safe_float(
-            (
-                p.get(
-                    "liquidity"
-                )
-                or {}
-            ).get(
-                "usd"
-            )
-        ),
-        reverse=True
-    )
-
-    pair = pairs[0]
-
-    return {
-
-        "dex":
-            pair.get(
-                "dexId"
-            ),
-
-        "liquidity":
-            safe_float(
-                (
-                    pair.get(
-                        "liquidity"
-                    )
-                    or {}
-                ).get(
-                    "usd"
-                )
-            ),
-
-        "volume_5m":
-            safe_float(
-                (
-                    pair.get(
-                        "volume"
-                    )
-                    or {}
-                ).get(
-                    "m5"
-                )
-            ),
-
-        "volume_1h":
-            safe_float(
-                (
-                    pair.get(
-                        "volume"
-                    )
-                    or {}
-                ).get(
-                    "h1"
-                )
-            ),
-
-        "price_change_5m":
-            safe_float(
-                (
-                    pair.get(
-                        "priceChange"
-                    )
-                    or {}
-                ).get(
-                    "m5"
-                )
-            ),
-
-        "price_change_1h":
-            safe_float(
-                (
-                    pair.get(
-                        "priceChange"
-                    )
-                    or {}
-                ).get(
-                    "h1"
-                )
-            ),
-    }
-
-
-# ============================================================
-# REJECTION
-# ============================================================
-
-def reject(
-    address: str,
-    reason: str
-):
-
-    STATE[
-        "stats"
-    ]["rejected"] += 1
-
-    r = STATE[
-        "stats"
-    ]["rejections"]
-
-    r[reason] = (
-        r.get(
-            reason,
-            0
-        ) + 1
-    )
-
-    STATE[
-        "recent_rejections"
-    ].append(
-        {
-            "time":
-                iso_now(),
-
-            "address":
-                address,
-
-            "reason":
-                reason
-        }
-    )
-
-    STATE[
-        "recent_rejections"
-    ] = STATE[
-        "recent_rejections"
-    ][-MAX_HISTORY:]
-
-
-# ============================================================
-# HARD FILTER
-# ============================================================
-
-def validate(
-    metrics
-):
-
-    address = metrics[
+    address = base.get(
         "address"
-    ]
-
-    age = age_hours(
-        metrics["created"]
     )
 
-    if age < MIN_AGE_HOURS:
-
-        reject(
-            address,
-            "AGE_BELOW_10H"
-        )
-
+    if not address:
         return None
 
-    if age > MAX_AGE_HOURS:
+    symbol = base.get(
+        "symbol",
+        "UNKNOWN"
+    )
 
-        reject(
-            address,
-            "AGE_OVER_72H"
+    name = base.get(
+        "name",
+        symbol
+    )
+
+    liquidity = num(
+        pair.get(
+            "liquidity",
+            {}
+        ).get("usd")
+    )
+
+    mc = num(
+        pair.get(
+            "marketCap"
         )
-
-        return None
-
-    mc = metrics[
-        "market_cap"
-    ]
-
-    if mc < MIN_MC:
-
-        reject(
-            address,
-            "MC_BELOW_30K"
-        )
-
-        return None
-
-    if mc > MAX_MC:
-
-        reject(
-            address,
-            "MC_ABOVE_400K"
-        )
-
-        return None
-
-    if metrics[
-        "liquidity"
-    ] < MIN_LIQUIDITY:
-
-        reject(
-            address,
-            "LIQUIDITY_BELOW_25K"
-        )
-
-        return None
-
-    if metrics[
-        "holders"
-    ] < MIN_HOLDERS:
-
-        reject(
-            address,
-            "HOLDERS_BELOW_300"
-        )
-
-        return None
-
-    if metrics[
-        "dev_rate"
-    ] > MAX_DEV_RATE:
-
-        reject(
-            address,
-            "DEV_OVER_4PCT"
-        )
-
-        return None
-
-    if metrics[
-        "top10_rate"
-    ] > MAX_TOP10_RATE:
-
-        reject(
-            address,
-            "TOP10_OVER_25PCT"
-        )
-
-        return None
-
-    if metrics[
-        "mint_revoked"
-    ] is not True:
-
-        reject(
-            address,
-            "MINT_NOT_REVOKED"
-        )
-
-        return None
-
-    if metrics[
-        "freeze_revoked"
-    ] is not True:
-
-        reject(
-            address,
-            "FREEZE_NOT_REVOKED"
-        )
-
-        return None
-
-    if not metrics[
-        "socials"
-    ]:
-
-        reject(
-            address,
-            "NO_SOCIAL_PRESENCE"
-        )
-
-        return None
+    )
 
     if mc <= 0:
 
-        reject(
-            address,
-            "INVALID_MC"
+        mc = num(
+            pair.get(
+                "fdv"
+            )
         )
 
-        return None
-
-    volume_ratio = (
-        metrics["volume_5m"]
-        / mc
+    volume = pair.get(
+        "volume",
+        {}
     )
 
-    if volume_ratio < MIN_VOLUME_MC_PCT:
-
-        reject(
-            address,
-            "VOLUME_MC_BELOW_5PCT"
-        )
-
-        return None
-
-    growth = holder_growth(
-        address,
-        metrics["holders"]
+    price_change = pair.get(
+        "priceChange",
+        {}
     )
 
-    if not growth[
-        "growing"
-    ]:
+    txns = pair.get(
+        "txns",
+        {}
+    )
 
-        reject(
-            address,
-            "HOLDERS_NOT_GROWING"
+    m5 = txns.get(
+        "m5",
+        {}
+    )
+
+    h1 = txns.get(
+        "h1",
+        {}
+    )
+
+    volume_5m = num(
+        volume.get("m5")
+    )
+
+    volume_1h = num(
+        volume.get("h1")
+    )
+
+    volume_6h = num(
+        volume.get("h6")
+    )
+
+    price_5m = num(
+        price_change.get("m5")
+    )
+
+    price_1h = num(
+        price_change.get("h1")
+    )
+
+    price_6h = num(
+        price_change.get("h6")
+    )
+
+    price_24h = num(
+        price_change.get("h24")
+    )
+
+    buys_5m = num(
+        m5.get("buys")
+    )
+
+    sells_5m = num(
+        m5.get("sells")
+    )
+
+    buys_1h = num(
+        h1.get("buys")
+    )
+
+    sells_1h = num(
+        h1.get("sells")
+    )
+
+    if sells_5m > 0:
+
+        buy_sell_ratio = (
+            buys_5m / sells_5m
         )
 
-        return None
+    elif buys_5m > 0:
 
-    if not pressure_ok(
-        address,
-        metrics
-    ):
+        buy_sell_ratio = 99.0
 
-        reject(
-            address,
-            "BUY_PRESSURE_NOT_POSITIVE"
+    else:
+
+        buy_sell_ratio = 0.0
+
+    if volume_1h > 0:
+
+        five_min_share = (
+            volume_5m /
+            volume_1h
         )
 
-        return None
+    else:
+
+        five_min_share = 0.0
+
+    if mc > 0:
+
+        volume_mc_ratio = (
+            volume_5m / mc
+        )
+
+    else:
+
+        volume_mc_ratio = 0.0
+
+    age = age_hours(
+        pair.get(
+            "pairCreatedAt"
+        )
+    )
 
     return {
-        "growth":
-            growth,
-
-        "volume_ratio":
-            volume_ratio
+        "address": address,
+        "symbol": symbol,
+        "name": name,
+        "pair_address": pair.get(
+            "pairAddress",
+            ""
+        ),
+        "dex": pair.get(
+            "dexId",
+            ""
+        ),
+        "url": pair.get(
+            "url",
+            ""
+        ),
+        "mc": mc,
+        "liquidity": liquidity,
+        "age_hours": age,
+        "volume_5m": volume_5m,
+        "volume_1h": volume_1h,
+        "volume_6h": volume_6h,
+        "price_5m": price_5m,
+        "price_1h": price_1h,
+        "price_6h": price_6h,
+        "price_24h": price_24h,
+        "buys_5m": buys_5m,
+        "sells_5m": sells_5m,
+        "buys_1h": buys_1h,
+        "sells_1h": sells_1h,
+        "buy_sell_ratio": buy_sell_ratio,
+        "five_min_share": five_min_share,
+        "volume_mc_ratio": volume_mc_ratio
     }
 
 
 # ============================================================
-# OBSERVATIONS
+# HARD FILTERS
 # ============================================================
 
-def add_observation(
-    address: str
-):
+def hard_filters(
+    m: Dict[str, Any]
+) -> List[str]:
 
-    current = safe_int(
-        STATE[
-            "observations"
-        ].get(
-            address
+    failures = []
+
+    age = m.get(
+        "age_hours"
+    )
+
+    if age is None:
+        failures.append(
+            "age unavailable"
+        )
+
+    elif age < MIN_AGE_HOURS:
+        failures.append(
+            "too young"
+        )
+
+    # No maximum age.
+
+    mc = num(
+        m.get("mc")
+    )
+
+    if mc < MIN_MC:
+        failures.append(
+            "MC below $30K"
+        )
+
+    if mc > MAX_MC:
+        failures.append(
+            "MC above $400K"
+        )
+
+    liquidity = num(
+        m.get("liquidity")
+    )
+
+    if liquidity < MIN_LIQUIDITY:
+        failures.append(
+            "liquidity below $25K"
+        )
+
+    volume_mc = num(
+        m.get(
+            "volume_mc_ratio"
         )
     )
 
-    current += 1
+    if volume_mc < MIN_VOLUME_MC_RATIO:
+        failures.append(
+            "5m volume/MC below 5%"
+        )
 
-    STATE[
-        "observations"
-    ][address] = current
+    buys = num(
+        m.get("buys_5m")
+    )
 
-    return current
+    sells = num(
+        m.get("sells_5m")
+    )
+
+    if buys <= sells:
+        failures.append(
+            "5m buys not greater than sells"
+        )
+
+    ratio = num(
+        m.get("buy_sell_ratio")
+    )
+
+    if ratio < MIN_BUY_SELL_RATIO:
+        failures.append(
+            "buy/sell ratio below 1.20"
+        )
+
+    price_5m = num(
+        m.get("price_5m")
+    )
+
+    if price_5m < MIN_5M_PRICE_CHANGE:
+        failures.append(
+            "5m price not positive"
+        )
+
+    if price_5m > MAX_5M_PRICE_CHANGE:
+        failures.append(
+            "5m move already too extended"
+        )
+
+    return failures
 
 
-def observation_name(
+# ============================================================
+# RECOVERY / MOMENTUM
+# ============================================================
+
+def recovery_signals(
+    m: Dict[str, Any],
+    previous: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+
+    signals = []
+
+    price_5m = num(
+        m.get("price_5m")
+    )
+
+    price_1h = num(
+        m.get("price_1h")
+    )
+
+    price_6h = num(
+        m.get("price_6h")
+    )
+
+    volume_5m = num(
+        m.get("volume_5m")
+    )
+
+    volume_1h = num(
+        m.get("volume_1h")
+    )
+
+    ratio = num(
+        m.get("buy_sell_ratio")
+    )
+
+    five_min_share = num(
+        m.get("five_min_share")
+    )
+
+    # --------------------------------------------------------
+    # SIGNAL 1: Short-term recovery
+    # --------------------------------------------------------
+
+    if price_5m > 0 and price_1h >= 0:
+
+        signals.append(
+            "5m + 1h price recovery"
+        )
+
+    # --------------------------------------------------------
+    # SIGNAL 2: Bounce after weakness
+    # --------------------------------------------------------
+
+    if (
+        price_5m > 0
+        and price_6h < 0
+    ):
+
+        signals.append(
+            "5m bounce after 6h weakness"
+        )
+
+    # --------------------------------------------------------
+    # SIGNAL 3: Volume expansion
+    # --------------------------------------------------------
+
+    if (
+        volume_1h > 0
+        and five_min_share
+        >= VOLUME_EXPANSION_RATIO
+    ):
+
+        signals.append(
+            "5m volume expansion"
+        )
+
+    # --------------------------------------------------------
+    # SIGNAL 4: Current volume increasing
+    # --------------------------------------------------------
+
+    if previous:
+
+        previous_volume = num(
+            previous.get(
+                "volume_5m"
+            )
+        )
+
+        if (
+            previous_volume > 0
+            and volume_5m
+            > previous_volume * 1.10
+        ):
+
+            signals.append(
+                "5m volume accelerating"
+            )
+
+        previous_ratio = num(
+            previous.get(
+                "buy_sell_ratio"
+            )
+        )
+
+        if ratio > previous_ratio:
+
+            signals.append(
+                "buy pressure improving"
+            )
+
+    # --------------------------------------------------------
+    # SIGNAL 5: Strong current buy pressure
+    # --------------------------------------------------------
+
+    if ratio >= 1.50:
+
+        signals.append(
+            "strong buy pressure"
+        )
+
+    # --------------------------------------------------------
+    # Signal strength
+    # --------------------------------------------------------
+
+    return {
+        "signals": signals,
+        "signal_count": len(signals),
+        "qualified":
+            len(signals) >= 1
+    }
+
+
+# ============================================================
+# QUALIFICATION
+# ============================================================
+
+def qualify(
+    m: Dict[str, Any],
+    previous: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+
+    failures = hard_filters(m)
+
+    if failures:
+
+        return {
+            "qualified": False,
+            "reason": failures,
+            "signals": []
+        }
+
+    recovery = recovery_signals(
+        m,
+        previous
+    )
+
+    if not recovery["qualified"]:
+
+        return {
+            "qualified": False,
+            "reason": [
+                "no recovery/momentum signal"
+            ],
+            "signals": []
+        }
+
+    return {
+        "qualified": True,
+        "reason": [],
+        "signals": recovery[
+            "signals"
+        ]
+    }
+
+
+# ============================================================
+# TRACKING
+# ============================================================
+
+def observation_label(
     count: int
-):
+) -> str:
 
-    if count <= 1:
+    if count == 1:
         return "ULTRA"
 
     if count == 2:
@@ -1623,89 +1207,192 @@ def observation_name(
     return "NORMAL"
 
 
-# ============================================================
-# CONFIRMATIONS
-# ============================================================
-
-def confirmations(
-    metrics,
-    growth
+def add_observation(
+    state: Dict[str, Any],
+    m: Dict[str, Any],
+    signals: List[str]
 ):
 
-    result = []
+    address = m[
+        "address"
+    ]
 
-    if metrics[
-        "smart_money"
-    ] > 0:
+    tracked = state[
+        "tracked"
+    ]
 
-        result.append(
-            f"Smart Money: "
-            f"{metrics['smart_money']}"
-        )
+    current_time = now_ts()
 
-    if metrics[
-        "kol"
-    ] > 0:
+    if address not in tracked:
 
-        result.append(
-            f"KOL: "
-            f"{metrics['kol']}"
-        )
+        tracked[address] = {
+            "address": address,
+            "symbol": m["symbol"],
+            "name": m["name"],
+            "first_seen": current_time,
+            "last_seen": current_time,
+            "observations": 0,
+            "snapshots": [],
+            "signals": []
+        }
 
-    if growth[
-        "change"
-    ] > 0:
+    item = tracked[
+        address
+    ]
 
-        result.append(
-            f"Holders +"
-            f"{growth['change']}"
-        )
+    item[
+        "last_seen"
+    ] = current_time
 
-    if metrics[
-        "bundlers"
-    ] == 0:
+    item[
+        "observations"
+    ] += 1
 
-        result.append(
-            "No bundler signal"
-        )
+    snapshot = {
+        "timestamp": current_time,
+        "mc": m["mc"],
+        "liquidity": m["liquidity"],
+        "volume_5m": m["volume_5m"],
+        "volume_1h": m["volume_1h"],
+        "price_5m": m["price_5m"],
+        "price_1h": m["price_1h"],
+        "price_6h": m["price_6h"],
+        "buys_5m": m["buys_5m"],
+        "sells_5m": m["sells_5m"],
+        "buy_sell_ratio":
+            m["buy_sell_ratio"],
+        "volume_mc_ratio":
+            m["volume_mc_ratio"]
+    }
 
-    if len(
-        metrics["socials"]
-    ) >= 2:
+    item[
+        "snapshots"
+    ].append(snapshot)
 
-        result.append(
-            "Multiple socials"
-        )
+    for signal in signals:
 
-    p = buy_pressure(
-        metrics
+        if signal not in item[
+            "signals"
+        ]:
+
+            item[
+                "signals"
+            ].append(signal)
+
+    # Keep last 12 hours of observations.
+    cutoff = (
+        current_time
+        - OBSERVATION_WINDOW_HOURS * 3600
     )
 
-    if p["p5"] > 0:
+    item[
+        "snapshots"
+    ] = [
+        s for s in item[
+            "snapshots"
+        ]
+        if s["timestamp"] >= cutoff
+    ]
 
-        result.append(
-            "5m buy pressure"
+    # Keep token data current.
+    item[
+        "latest"
+    ] = m
+
+    item[
+        "signals"
+    ] = item[
+        "signals"
+    ][-15:]
+
+
+def get_previous_snapshot(
+    state: Dict[str, Any],
+    address: str
+) -> Optional[Dict[str, Any]]:
+
+    item = state.get(
+        "tracked",
+        {}
+    ).get(address)
+
+    if not item:
+        return None
+
+    snapshots = item.get(
+        "snapshots",
+        []
+    )
+
+    if not snapshots:
+        return None
+
+    return snapshots[-1]
+
+
+def cleanup_tracking(
+    state: Dict[str, Any]
+):
+
+    tracked = state.get(
+        "tracked",
+        {}
+    )
+
+    now = now_ts()
+
+    remove = []
+
+    for address, item in tracked.items():
+
+        last_seen = num(
+            item.get(
+                "last_seen"
+            )
         )
 
-    elif p["p1"] > 0:
+        if (
+            now - last_seen
+            > OBSERVATION_WINDOW_HOURS * 3600
+        ):
 
-        result.append(
-            "1h buy pressure"
+            remove.append(
+                address
+            )
+
+    for address in remove:
+
+        tracked.pop(
+            address,
+            None
         )
 
-    if (
-        metrics["market_cap"] > 0
-        and
-        metrics["volume_5m"]
-        / metrics["market_cap"]
-        >= 0.10
-    ):
+    # Hard cap
+    if len(tracked) > MAX_TRACKED_TOKENS:
 
-        result.append(
-            "Strong volume/MC"
+        ordered = sorted(
+            tracked.items(),
+            key=lambda x:
+                num(
+                    x[1].get(
+                        "last_seen"
+                    )
+                )
         )
 
-    return result
+        excess = (
+            len(tracked)
+            - MAX_TRACKED_TOKENS
+        )
+
+        for address, _ in ordered[
+            :excess
+        ]:
+
+            tracked.pop(
+                address,
+                None
+            )
 
 
 # ============================================================
@@ -1713,930 +1400,531 @@ def confirmations(
 # ============================================================
 
 def build_alert(
-    metrics,
-    dex,
-    growth,
-    obs,
-    confirms
-):
+    m: Dict[str, Any],
+    item: Dict[str, Any],
+    signals: List[str]
+) -> str:
 
-    label = observation_name(
-        obs
+    observations = int(
+        item.get(
+            "observations",
+            1
+        )
     )
 
-    volume_ratio = (
-        metrics["volume_5m"]
-        / metrics["market_cap"]
-        if metrics["market_cap"] > 0
-        else 0
+    label = observation_label(
+        observations
     )
 
-    text = (
-        "🔥 SECOND-WAVE RUNNER\n\n"
+    liquidity_status = (
+        "PREFERRED"
+        if m["liquidity"]
+        >= PREFERRED_LIQUIDITY
+        else "PASS"
+    )
 
-        f"{metrics['symbol']} — "
-        f"{label}\n"
+    return (
+        "🚨 RUNNER BOT V5.0\n\n"
 
-        f"Observation: {obs}\n"
+        f"🔥 {label} | "
+        f"{m['symbol']}\n"
 
-        f"Age: "
-        f"{age_hours(metrics['created']):.1f}h\n"
+        f"{m['name']}\n\n"
 
-        f"MC: "
-        f"{money(metrics['market_cap'])}\n"
-
+        "RECOVERY SETUP\n"
+        f"MC: {money(m['mc'])}\n"
         f"Liquidity: "
-        f"{money(metrics['liquidity'])}\n"
+        f"{money(m['liquidity'])} "
+        f"({liquidity_status})\n"
+        f"Age: "
+        f"{fmt_age(m['age_hours'])}\n\n"
 
-        f"Holders: "
-        f"{metrics['holders']} "
-        f"(+{growth['change']})\n"
-
-        f"Dev: "
-        f"{percentage(metrics['dev_rate'])}\n"
-
-        f"Top 10: "
-        f"{percentage(metrics['top10_rate'])}\n\n"
-
-        "📊 MOMENTUM\n"
-
+        "FLOW\n"
         f"5m Volume: "
-        f"{money(metrics['volume_5m'])}\n"
-
+        f"{money(m['volume_5m'])}\n"
         f"Volume/MC: "
-        f"{percentage(volume_ratio)}\n"
+        f"{pct(m['volume_mc_ratio'] * 100)}\n"
+        f"5m Buys: "
+        f"{int(m['buys_5m'])}\n"
+        f"5m Sells: "
+        f"{int(m['sells_5m'])}\n"
+        f"Buy/Sell: "
+        f"{m['buy_sell_ratio']:.2f}\n\n"
 
-        f"5m Buy: "
-        f"{money(metrics['buy_5m'])}\n"
+        "PRICE\n"
+        f"5m: "
+        f"{m['price_5m']:+.1f}%\n"
+        f"1h: "
+        f"{m['price_1h']:+.1f}%\n"
+        f"6h: "
+        f"{m['price_6h']:+.1f}%\n"
+        f"24h: "
+        f"{m['price_24h']:+.1f}%\n\n"
 
-        f"5m Sell: "
-        f"{money(metrics['sell_5m'])}\n"
-
-        f"1h Buy: "
-        f"{money(metrics['buy_1h'])}\n"
-
-        f"1h Sell: "
-        f"{money(metrics['sell_1h'])}\n\n"
-
-        "🛡 GMGN SECURITY\n"
-
-        "Mint: REVOKED\n"
-        "Freeze: REVOKED\n\n"
-
-        "👛 WALLET DATA\n"
-
-        f"Smart Money: "
-        f"{metrics['smart_money']}\n"
-
-        f"KOL: "
-        f"{metrics['kol']}\n"
-
-        f"Snipers: "
-        f"{metrics['snipers']}\n"
-
-        f"Bundlers: "
-        f"{metrics['bundlers']}\n\n"
-
-        "⚡ CONFIRMATIONS\n"
-    )
-
-    if confirms:
-
-        for item in confirms[:8]:
-
-            text += (
-                f"• {item}\n"
-            )
-
-    else:
-
-        text += (
-            "• Core second-wave "
-            "conditions met\n"
+        "CONFIRMATIONS\n"
+        + "\n".join(
+            f"✓ {signal}"
+            for signal in signals
         )
+        + "\n\n"
 
-    text += (
-        "\n🔎 DEX CHECK\n"
+        f"Observations: "
+        f"{observations}\n"
 
-        f"DEX: "
-        f"{dex.get('dex', 'unknown')}\n"
+        f"Dex: {m['dex']}\n\n"
 
-        f"DEX Liquidity: "
-        f"{money(dex.get('liquidity', 0))}\n"
+        f"Chart:\n"
+        f"{m['url']}\n\n"
 
-        f"DEX 5m Volume: "
-        f"{money(dex.get('volume_5m', 0))}\n"
+        f"Contract:\n"
+        f"{m['address']}\n\n"
 
-        f"DEX 1h Change: "
-        f"{dex.get('price_change_1h', 0):.2f}%\n\n"
-
-        "Contract:\n"
-
-        f"{metrics['address']}\n\n"
-
-        "⚠️ Research signal only."
+        "⚠️ Scanner signal only. "
+        "Always verify the contract and "
+        "liquidity before trading."
     )
 
-    return text
-
 
 # ============================================================
-# PROCESS TOKEN
+# DISCOVERY + VALIDATION
 # ============================================================
 
-def process(
-    address: str
+def discover_candidates(
+    state: Dict[str, Any]
 ):
 
-    info = gmgn_info(
-        address
+    print(
+        "DexScreener discovery: "
+        "searching recovery candidates..."
     )
 
-    if not info:
+    addresses = discover_sources()
 
-        reject(
-            address,
-            "GMGN_INFO_FAILED"
-        )
-
-        return None
-
-    security = gmgn_security(
-        address
+    print(
+        f"DexScreener source tokens: "
+        f"{len(addresses)}"
     )
 
-    if not security:
+    candidates = []
 
-        reject(
-            address,
-            "GMGN_SECURITY_FAILED"
-        )
+    for address in addresses:
 
-        return None
-
-    metrics = extract_metrics(
-        info,
-        security
-    )
-
-    save_pressure(
-        address,
-        metrics
-    )
-
-    validation = validate(
-        metrics
-    )
-
-    if not validation:
-        return None
-
-    dex = dex_verify(
-        address
-    )
-
-    if not dex:
-
-        reject(
-            address,
-            "DEX_VERIFICATION_FAILED"
-        )
-
-        return None
-
-    if (
-        dex["liquidity"] > 0
-        and
-        dex["liquidity"]
-        < MIN_LIQUIDITY
-    ):
-
-        reject(
-            address,
-            "DEX_LIQUIDITY_BELOW_25K"
-        )
-
-        return None
-
-    STATE[
-        "stats"
-    ]["dex_verified"] += 1
-
-    obs = add_observation(
-        address
-    )
-
-    conf = confirmations(
-        metrics,
-        validation["growth"]
-    )
-
-    STATE[
-        "stats"
-    ]["qualified"] += 1
-
-    STATE[
-        "recent_qualified"
-    ].append(
-        {
-            "time":
-                iso_now(),
-
-            "address":
-                address,
-
-            "symbol":
-                metrics["symbol"],
-
-            "mc":
-                metrics["market_cap"],
-
-            "holders":
-                metrics["holders"],
-
-            "observations":
-                obs
-        }
-    )
-
-    STATE[
-        "recent_qualified"
-    ] = STATE[
-        "recent_qualified"
-    ][-MAX_HISTORY:]
-
-    candidate = STATE[
-        "candidates"
-    ].setdefault(
-        address,
-        {}
-    )
-
-    candidate.update(
-        {
-            "symbol":
-                metrics["symbol"],
-
-            "last_validated":
-                now(),
-
-            "last_qualified":
-                now(),
-
-            "market_cap":
-                metrics["market_cap"],
-
-            "holders":
-                metrics["holders"]
-        }
-    )
-
-    # --------------------------------------------------------
-    # ALERT COOLDOWN
-    # --------------------------------------------------------
-
-    cooldown = safe_int(
-        STATE[
-            "cooldowns"
-        ].get(
+        pairs = fetch_token_pairs(
             address
         )
-    )
 
-    if cooldown > now():
-
-        return {
-            "metrics":
-                metrics,
-
-            "dex":
-                dex,
-
-            "growth":
-                validation["growth"],
-
-            "observations":
-                obs,
-
-            "confirmations":
-                conf
-        }
-
-    alert = build_alert(
-        metrics,
-        dex,
-        validation["growth"],
-        obs,
-        conf
-    )
-
-    sent = broadcast(
-        alert
-    )
-
-    if sent > 0:
-
-        STATE[
-            "stats"
-        ]["alerts"] += sent
-
-        STATE[
-            "cooldowns"
-        ][address] = (
-            now()
-            + TOKEN_ALERT_COOLDOWN
+        pair = select_best_pair(
+            pairs
         )
 
-        STATE[
-            "recent_alerts"
-        ].append(
-            {
-                "time":
-                    iso_now(),
+        if not pair:
+            continue
 
-                "address":
-                    address,
-
-                "symbol":
-                    metrics["symbol"],
-
-                "observations":
-                    obs,
-
-                "sent":
-                    sent
-            }
+        m = extract_metrics(
+            pair
         )
 
-        STATE[
-            "recent_alerts"
-        ] = STATE[
-            "recent_alerts"
-        ][-MAX_HISTORY:]
+        if not m:
+            continue
 
-        print(
-            "🚨 ALERT:",
-            metrics["symbol"],
-            observation_name(obs),
-            "sent:",
-            sent
+        failures = hard_filters(
+            m
         )
 
-    return {
-        "metrics":
-            metrics,
+        if failures:
+            continue
 
-        "dex":
-            dex,
-
-        "growth":
-            validation["growth"],
-
-        "observations":
-            obs,
-
-        "confirmations":
-            conf
-    }
-
-
-# ============================================================
-# TELEGRAM COMMANDS
-# ============================================================
-
-def command(
-    chat_id: str,
-    text: str
-):
-
-    cmd = text.lower().strip()
-
-    if cmd.startswith(
-        "/start"
-    ):
-
-        STATE[
-            "telegram_chats"
-        ][str(chat_id)] = True
-
-        save_state()
-
-        return (
-            "🔥 Runner Bot V4.7.2 online.\n\n"
-
-            "GMGN-first second-wave scanner.\n\n"
-
-            "Age: 10h–72h\n"
-            "MC: $30k–$400k\n"
-            "Liquidity: >= $25k\n"
-            "Holders: >=300 + growing\n"
-            "Dev: <=4%\n"
-            "Top 10: <=25%\n"
-            "Mint + Freeze: revoked\n\n"
-
-            "Alerts: ON"
+        candidates.append(
+            m
         )
 
-    if cmd.startswith(
-        "/stop"
-    ):
-
-        STATE[
-            "telegram_chats"
-        ][str(chat_id)] = False
-
-        save_state()
-
-        return (
-            "Alerts stopped."
-        )
-
-    if cmd.startswith(
-        "/alerts"
-    ):
-
-        active = STATE[
-            "telegram_chats"
-        ].get(
-            str(chat_id),
-            False
-        )
-
-        return (
-            "Alerts: "
-            + (
-                "ON"
-                if active
-                else
-                "OFF"
-            )
-        )
-
-    if cmd.startswith(
-        "/status"
-    ):
-
-        s = STATE[
-            "stats"
-        ]
-
-        return (
-            "🔥 RUNNER BOT V4.7.2\n\n"
-
-            f"Scans: "
-            f"{s['scans']}\n"
-
-            f"GMGN discovered: "
-            f"{s['gmgn_discovered']}\n"
-
-            f"GMGN validated: "
-            f"{s['gmgn_validated']}\n"
-
-            f"DEX verified: "
-            f"{s['dex_verified']}\n"
-
-            f"Qualified: "
-            f"{s['qualified']}\n"
-
-            f"Alerts: "
-            f"{s['alerts']}\n\n"
-
-            f"Tracked: "
-            f"{len(STATE['candidates'])}\n"
-
-            f"Holder histories: "
-            f"{len(STATE['holder_history'])}"
-        )
-
-    if cmd.startswith(
-        "/tracking"
-    ):
-
-        observations = STATE[
-            "observations"
-        ]
-
-        if not observations:
-
-            return (
-                "No qualified tokens "
-                "tracked yet."
-            )
-
-        rows = []
-
-        for address, count in sorted(
-            observations.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:15]:
-
-            candidate = STATE[
-                "candidates"
-            ].get(
-                address,
-                {}
-            )
-
-            symbol = candidate.get(
-                "symbol",
-                address[:6]
-            )
-
-            rows.append(
-                f"{symbol}: "
-                f"{observation_name(count)} "
-                f"({count})"
-            )
-
-        return (
-            "📡 TRACKING\n\n"
-            + "\n".join(rows)
-        )
-
-    return None
-
-
-def telegram_poll(
-    offset
-):
-
-    if not TELEGRAM_TOKEN:
-        return offset
-
-    params = {
-        "timeout": 1
-    }
-
-    if offset is not None:
-        params["offset"] = offset
-
-    url = (
-        f"{TELEGRAM_BASE}/bot"
-        f"{TELEGRAM_TOKEN}/getUpdates?"
-        f"{urllib.parse.urlencode(params)}"
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            url,
-            timeout=5
-        ) as response:
-
-            data = json.loads(
-                response.read().decode()
-            )
-
-        if not data.get(
-            "ok"
-        ):
-            return offset
-
-        for update in data.get(
-            "result",
-            []
-        ):
-
-            offset = (
-                update[
-                    "update_id"
-                ] + 1
-            )
-
-            message = update.get(
-                "message"
-            )
-
-            if not message:
-                continue
-
-            chat = message.get(
-                "chat",
-                {}
-            )
-
-            chat_id = str(
-                chat.get(
-                    "id"
-                )
-            )
-
-            text = message.get(
-                "text",
-                ""
-            )
-
-            if not text.startswith(
-                "/"
-            ):
-                continue
-
-            response = command(
-                chat_id,
-                text
-            )
-
-            if response:
-
-                send_message(
-                    chat_id,
-                    response
-                )
-
-        return offset
-
-    except Exception:
-
-        return offset
-
-
-# ============================================================
-# SCANNER
-# ============================================================
-
-def scan():
-
-    STATE[
-        "stats"
-    ]["scans"] += 1
-
-    current = now()
-
-    # --------------------------------------------------------
-    # Discovery
-    # --------------------------------------------------------
-
-    if (
-        current
-        - STATE["last_discovery"]
-        >= GMGN_DISCOVERY_INTERVAL
-    ):
-
-        rows = gmgn_discover()
-
-        STATE[
-            "last_discovery"
-        ] = current
-
-        STATE[
-            "stats"
-        ]["gmgn_discovered"] += len(
-            rows
-        )
-
-        print(
-            f"GMGN Discovery: "
-            f"{len(rows)} candidates"
-        )
-
-        for row in rows:
-
-            address = str(
-                row.get(
-                    "address",
-                    ""
-                )
-            ).strip()
-
-            if not address:
-                continue
-
-            candidate = STATE[
-                "candidates"
-            ].setdefault(
-                address,
-                {}
-            )
-
-            candidate.update(
-                {
-                    "symbol":
-                        row.get(
-                            "symbol",
-                            candidate.get(
-                                "symbol",
-                                "UNKNOWN"
-                            )
-                        ),
-
-                    "name":
-                        row.get(
-                            "name",
-                            candidate.get(
-                                "name",
-                                ""
-                            )
-                        ),
-
-                    "last_discovered":
-                        current
-                }
-            )
-
-    # --------------------------------------------------------
-    # Validation queue
-    # --------------------------------------------------------
-
-    queue = []
-
-    for address, candidate in STATE[
-        "candidates"
-    ].items():
-
-        last = safe_int(
-            candidate.get(
-                "last_validated"
-            )
-        )
-
-        if (
-            current - last
-            >= GMGN_VALIDATION_INTERVAL
-        ):
-
-            queue.append(
-                address
-            )
-
-    queue.sort(
-        key=lambda address:
-        safe_int(
-            STATE[
-                "candidates"
-            ].get(
-                address,
-                {}
-            ).get(
-                "last_discovered",
-                0
-            )
+        # Keep discovery from hammering
+        # the API unnecessarily.
+        time.sleep(0.05)
+
+    # Highest current activity first.
+    candidates.sort(
+        key=lambda m: (
+            m["volume_mc_ratio"],
+            m["buy_sell_ratio"],
+            m["liquidity"]
         ),
         reverse=True
     )
 
-    queue = queue[
-        :MAX_VALIDATIONS_PER_CYCLE
-    ]
+    return candidates
 
-    # --------------------------------------------------------
-    # Process
-    # --------------------------------------------------------
 
-    for address in queue:
+def validate_candidates(
+    state: Dict[str, Any]
+):
 
-        candidate = STATE[
-            "candidates"
-        ].get(
-            address,
-            {}
-        )
+    tracked = state.get(
+        "tracked",
+        {}
+    )
 
-        print(
-            "GMGN validating:",
-            candidate.get(
-                "symbol",
-                address[:8]
-            )
-        )
+    if not tracked:
+        return
 
-        result = process(
+    addresses = list(
+        tracked.keys()
+    )[:MAX_VALIDATIONS_PER_CYCLE]
+
+    print(
+        f"Validating {len(addresses)} "
+        "tracked tokens..."
+    )
+
+    for address in addresses:
+
+        pairs = fetch_token_pairs(
             address
         )
 
-        candidate[
-            "last_validated"
-        ] = current
+        pair = select_best_pair(
+            pairs
+        )
 
-        if result:
+        if not pair:
+            continue
 
-            STATE[
-                "stats"
-            ]["gmgn_validated"] += 1
+        m = extract_metrics(
+            pair
+        )
 
-    save_state()
+        if not m:
+            continue
+
+        previous = get_previous_snapshot(
+            state,
+            address
+        )
+
+        result = qualify(
+            m,
+            previous
+        )
+
+        if result["qualified"]:
+
+            add_observation(
+                state,
+                m,
+                result["signals"]
+            )
+
+            item = state[
+                "tracked"
+            ][address]
+
+            # Alert on every new qualifying
+            # observation.
+            alert = build_alert(
+                m,
+                item,
+                result["signals"]
+            )
+
+            broadcast(
+                state,
+                alert
+            )
+
+            state[
+                "total_alerts"
+            ] += 1
+
+            print(
+                f"ALERT {m['symbol']} | "
+                f"obs={item['observations']}"
+            )
+
+        else:
+
+            # Keep a snapshot only when
+            # token remains in the broad
+            # tracking area.
+            if (
+                m["mc"] >= MIN_MC
+                and m["mc"] <= MAX_MC
+                and m["liquidity"]
+                >= MIN_LIQUIDITY
+            ):
+
+                if previous:
+
+                    previous_volume = num(
+                        previous.get(
+                            "volume_5m"
+                        )
+                    )
+
+                    if (
+                        m["volume_5m"]
+                        > previous_volume
+                    ):
+
+                        add_observation(
+                            state,
+                            m,
+                            []
+                        )
+
+        time.sleep(0.10)
+
+    cleanup_tracking(
+        state
+    )
+
+    save_state(
+        state
+    )
+
+
+def add_new_candidates(
+    state: Dict[str, Any],
+    candidates: List[Dict[str, Any]]
+):
+
+    for m in candidates:
+
+        address = m[
+            "address"
+        ]
+
+        previous = get_previous_snapshot(
+            state,
+            address
+        )
+
+        result = qualify(
+            m,
+            previous
+        )
+
+        if not result["qualified"]:
+            continue
+
+        add_observation(
+            state,
+            m,
+            result["signals"]
+        )
+
+        item = state[
+            "tracked"
+        ][address]
+
+        alert = build_alert(
+            m,
+            item,
+            result["signals"]
+        )
+
+        broadcast(
+            state,
+            alert
+        )
+
+        state[
+            "total_alerts"
+        ] += 1
+
+        print(
+            f"NEW ALERT {m['symbol']} | "
+            f"obs={item['observations']}"
+        )
+
+    save_state(
+        state
+    )
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+def print_banner():
 
-    print(
-        "=" * 60
-    )
-
+    print("=" * 60)
     print(
         f"RUNNER BOT {BOT_VERSION}"
     )
+    print(
+        "DEXSCREENER RECOVERY RUNNER"
+    )
+    print("=" * 60)
 
     print(
-        "GMGN-FIRST SECOND-WAVE 5–100X TRACKER"
+        "Source: DexScreener only"
     )
 
     print(
-        "=" * 60
+        "Chain: Solana"
     )
 
     print(
-        f"Age: {MIN_AGE_HOURS}h–"
-        f"{MAX_AGE_HOURS}h"
+        "Age: 3h+ | No maximum"
     )
 
     print(
-        f"MC: ${MIN_MC:,}–"
-        f"${MAX_MC:,}"
+        "MC: $30,000-$400,000"
     )
 
     print(
-        f"Liquidity: >= ${MIN_LIQUIDITY:,}"
+        "Liquidity: >= $25,000"
     )
 
     print(
-        f"Holders: >= {MIN_HOLDERS} + growing"
+        "Preferred liquidity: >= $40,000"
     )
 
     print(
-        f"Dev: <= "
-        f"{MAX_DEV_RATE * 100:.1f}%"
+        "5m Volume/MC: >= 5%"
     )
 
     print(
-        f"Top 10: <= "
-        f"{MAX_TOP10_RATE * 100:.1f}%"
+        "Buy/Sell: >= 1.20"
     )
 
     print(
-        f"Volume/MC: >= "
-        f"{MIN_VOLUME_MC_PCT * 100:.1f}%"
+        "5m Price: 0% to +50%"
     )
 
     print(
-        "Mint + Freeze: revoked"
+        "Recovery + volume expansion"
     )
 
     print(
-        "GMGN: PRIMARY"
+        "Tracking: 12h"
     )
 
     print(
-        "DexScreener: SECONDARY"
+        "GMGN: DISABLED"
     )
 
-    print()
+    print("=" * 60)
 
-    print(
-        "Checking GMGN..."
-    )
 
-    print_gmgn_status()
+def main():
 
-    if not TELEGRAM_TOKEN:
+    print_banner()
+
+    if not TELEGRAM_BOT_TOKEN:
 
         print(
             "WARNING: "
-            "TELEGRAM_BOT_TOKEN is missing."
+            "TELEGRAM_BOT_TOKEN is not set."
         )
 
+    state = load_state()
+
     print(
-        "\nBot loop started."
+        "Bot loop started."
     )
 
-    offset = None
+    last_discovery = num(
+        state.get(
+            "last_discovery"
+        )
+    )
 
-    last_scan = 0
+    last_validation = num(
+        state.get(
+            "last_validation"
+        )
+    )
 
     while True:
 
         try:
 
-            offset = telegram_poll(
-                offset
+            process_telegram_updates(
+                state
             )
 
-            current = now()
+            state[
+                "total_scans"
+            ] += 1
+
+            current = now_ts()
+
+            # ------------------------------------------------
+            # Discovery
+            # ------------------------------------------------
 
             if (
-                current - last_scan
-                >= SCAN_INTERVAL
+                current - last_discovery
+                >= DISCOVERY_INTERVAL_SECONDS
             ):
 
-                last_scan = current
-
-                scan()
-
-                print(
-                    "Scan complete | "
-                    f"tracked="
-                    f"{len(STATE['candidates'])} | "
-                    f"qualified="
-                    f"{STATE['stats']['qualified']} | "
-                    f"alerts="
-                    f"{STATE['stats']['alerts']}"
+                candidates = (
+                    discover_candidates(
+                        state
+                    )
                 )
 
-            time.sleep(1)
+                print(
+                    "DexScreener candidates: "
+                    f"{len(candidates)}"
+                )
+
+                add_new_candidates(
+                    state,
+                    candidates
+                )
+
+                last_discovery = current
+
+                state[
+                    "last_discovery"
+                ] = current
+
+                save_state(
+                    state
+                )
+
+            # ------------------------------------------------
+            # Validation
+            # ------------------------------------------------
+
+            if (
+                current - last_validation
+                >= VALIDATION_INTERVAL_SECONDS
+            ):
+
+                validate_candidates(
+                    state
+                )
+
+                last_validation = current
+
+                state[
+                    "last_validation"
+                ] = current
+
+                save_state(
+                    state
+                )
+
+            tracked_count = len(
+                state.get(
+                    "tracked",
+                    {}
+                )
+            )
+
+            print(
+                "Scan complete | "
+                f"tracked={tracked_count} | "
+                f"alerts="
+                f"{state['total_alerts']}"
+            )
+
+            time.sleep(
+                SCAN_INTERVAL_SECONDS
+            )
 
         except KeyboardInterrupt:
 
@@ -2644,18 +1932,21 @@ def main():
                 "Bot stopped."
             )
 
-            save_state()
+            save_state(
+                state
+            )
 
             break
 
         except Exception as e:
 
             print(
-                "Main loop error:",
-                e
+                f"MAIN LOOP ERROR: {e}"
             )
 
-            save_state()
+            save_state(
+                state
+            )
 
             time.sleep(5)
 
