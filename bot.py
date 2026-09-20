@@ -7,138 +7,215 @@ from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# RUNNER BOT V3.9
-# BROAD SOLANA MARKET DISCOVERY
+# RUNNER BOT V4
+# DEX SCREENER FIRST
+#
+# Architecture:
+#
+# DEX Screener discovery
+#        ↓
+# token addresses
+#        ↓
+# DEX Screener token-pairs
+#        ↓
+# strongest Solana pool
+#        ↓
+# $20K-$300K / liquidity / age
+#        ↓
+# structure + activity + buy pressure
+#        ↓
+# runner score
+#        ↓
+# IGNITION
+#        ↓
+# Telegram + outcome tracking
 # ============================================================
 
-BOT_VERSION = "v3.9"
+BOT_VERSION = "V4.0"
 
-# ------------------------------------------------------------
+
+# ============================================================
 # API
-# ------------------------------------------------------------
+# ============================================================
 
 DEX_BASE = "https://api.dexscreener.com"
-GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-GECKO_NETWORK = "solana"
+SOLANA = "solana"
 
-# ------------------------------------------------------------
+
+# ============================================================
 # FILES
-# ------------------------------------------------------------
+# ============================================================
 
-STATE_FILE = "runner_state_v39.json"
+STATE_FILE = "runner_state_v40.json"
 
-# ------------------------------------------------------------
+
+# ============================================================
 # RUNNER RANGE
-# ------------------------------------------------------------
+# ============================================================
 
 MIN_MC = 20_000
-MAX_MC = 200_000
+MAX_MC = 300_000
 
 MIN_LIQUIDITY = 10_000
 
-# 5m volume is a FEATURE, not a hard gate.
-REFERENCE_VOLUME_5M = 5_000
 
-# ------------------------------------------------------------
+# ============================================================
 # OBSERVATION RANGE
-# ------------------------------------------------------------
+# ============================================================
 
 OBSERVE_MIN_MC = 10_000
-OBSERVE_MAX_MC = 250_000
+OBSERVE_MAX_MC = 350_000
 
-# ------------------------------------------------------------
-# HISTORY
-# ------------------------------------------------------------
 
-MAX_STORED_TOKENS = 750
-MAX_HISTORY_PER_TOKEN = 240
+# ============================================================
+# AGE
+# ============================================================
 
-MIN_OBSERVATIONS = 6
+# We allow up to 24 hours into the observation universe.
+#
+# Age is NOT the only signal.
+# It contributes to the score.
+#
+# 0-3h  = strongest early window
+# 3-6h  = still very early
+# 6-24h = older but still trackable
 
-# ------------------------------------------------------------
+MAX_PAIR_AGE_HOURS = 24
+
+
+# ============================================================
+# VOLUME
+# ============================================================
+
+# IMPORTANT:
+#
+# 5m volume is NOT a hard gate.
+#
+# It is a scoring feature.
+#
+REFERENCE_VOLUME_5M = 5_000
+
+
+# ============================================================
 # CONSOLIDATION
-# ------------------------------------------------------------
+# ============================================================
 
 MIN_CONSOLIDATION_VOLUME_5M = 500
-MIN_CONSOLIDATION_TX = 5
+MIN_CONSOLIDATION_TX_5M = 5
+
 MIN_CONSOLIDATION_ACTIVE_OBS = 3
 
-# ------------------------------------------------------------
-# ACTIVITY ACCELERATION
-# ------------------------------------------------------------
+MAX_CONSOLIDATION_RANGE_PCT = 18.0
 
-ACTIVITY_LOOKBACK_1M = 4
-ACTIVITY_LOOKBACK_2M = 8
+
+# ============================================================
+# ACTIVITY
+# ============================================================
+
+ACTIVITY_LOOKBACK_SECONDS = 60
 
 ACTIVITY_EXPANSION_PCT = 20.0
 
-# ------------------------------------------------------------
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+MAX_STORED_TOKENS = 1_500
+MAX_HISTORY_PER_TOKEN = 300
+
+MIN_OBSERVATIONS = 6
+
+
+# ============================================================
 # DISCOVERY
-# ------------------------------------------------------------
+# ============================================================
+
+# DEX Screener's documented latest profile/boost endpoints
+# are rate-limited to 60 requests/minute.
+#
+# We therefore refresh discovery once per minute.
 
 DISCOVERY_INTERVAL_SECONDS = 60
 
-# Number of Gecko pages used for each source.
-# 3 sources x 2 pages = 6 Gecko requests per discovery cycle.
-GECKO_PAGES = 2
+# Number of tokens taken from each discovery source.
+MAX_DISCOVERY_TOKENS = 500
 
-# Number of tokens sent to DEX Screener per request.
-DEX_BATCH_SIZE = 30
 
-# Maximum number of discovered tokens processed.
-MAX_DISCOVERY_TOKENS = 300
+# ============================================================
+# TOKEN POOL LOOKUPS
+# ============================================================
 
-# ------------------------------------------------------------
+# token-pairs is 300 rpm according to DEX Screener docs.
+#
+# We deliberately stay far below the limit.
+
+MAX_TOKEN_LOOKUPS_PER_CYCLE = 120
+
+TOKEN_LOOKUP_SLEEP = 0.10
+
+
+# ============================================================
 # SCANNING
-# ------------------------------------------------------------
+# ============================================================
 
 SCAN_INTERVAL_SECONDS = float(
-    os.getenv("SCAN_INTERVAL_SECONDS", "15")
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "15",
+    )
 )
 
-# ------------------------------------------------------------
+
+# ============================================================
 # HTTP
-# ------------------------------------------------------------
+# ============================================================
 
 HTTP_TIMEOUT = 12
 HTTP_RETRIES = 3
-HTTP_BACKOFF_SECONDS = 2
+HTTP_BACKOFF_SECONDS = 1.5
 
-# ------------------------------------------------------------
+
+# ============================================================
 # TELEGRAM
-# ------------------------------------------------------------
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
-    ""
+    "",
 )
 
 HEATING_ALERTS_ENABLED = (
     os.getenv(
         "HEATING_ALERTS_ENABLED",
-        "true"
+        "true",
     ).lower()
     == "true"
 )
 
-# ------------------------------------------------------------
-# GLOBAL CACHES
-# ------------------------------------------------------------
 
-discovery_cache: List[Dict[str, Any]] = []
+# ============================================================
+# GLOBAL DISCOVERY CACHE
+# ============================================================
+
+discovery_cache: List[str] = []
 discovery_cache_ts = 0.0
 
-# ------------------------------------------------------------
+
+# ============================================================
 # STATE
-# ------------------------------------------------------------
+# ============================================================
 
 state: Dict[str, Any] = {
     "histories": {},
     "ignitions": {},
     "subscribers": [],
 }
+
+
+telegram_offset = 0
 
 
 # ============================================================
@@ -149,8 +226,13 @@ def now_ts() -> float:
     return time.time()
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+def safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
     try:
+
         if value is None:
             return default
 
@@ -160,11 +242,17 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         TypeError,
         ValueError,
     ):
+
         return default
 
 
-def safe_int(value: Any, default: int = 0) -> int:
+def safe_int(
+    value: Any,
+    default: int = 0,
+) -> int:
+
     try:
+
         if value is None:
             return default
 
@@ -174,6 +262,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         TypeError,
         ValueError,
     ):
+
         return default
 
 
@@ -181,6 +270,7 @@ def pct_change(
     old: float,
     new: float,
 ) -> float:
+
     if old <= 0:
         return 0.0
 
@@ -191,35 +281,57 @@ def pct_change(
     )
 
 
-def clamp(
+def format_money(
     value: float,
-    minimum: float,
-    maximum: float,
-) -> float:
-    return max(
-        minimum,
-        min(
-            maximum,
-            value,
-        ),
-    )
+) -> str:
 
-
-def format_money(value: float) -> str:
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+
+        return (
+            f"${value / 1_000_000:.2f}M"
+        )
 
     if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
 
-    return f"${value:.2f}"
+        return (
+            f"${value / 1_000:.2f}K"
+        )
+
+    return f"${value:.0f}"
 
 
-def format_pct(value: float) -> str:
+def format_pct(
+    value: float,
+) -> str:
+
     if value >= 0:
+
         return f"+{value:.1f}%"
 
     return f"{value:.1f}%"
+
+
+def pair_age_hours(
+    pair_created_at: int,
+) -> float:
+
+    if pair_created_at <= 0:
+        return 9999.0
+
+    # DexScreener pairCreatedAt is milliseconds.
+    created_seconds = (
+        pair_created_at / 1000.0
+    )
+
+    age_seconds = (
+        now_ts()
+        - created_seconds
+    )
+
+    if age_seconds < 0:
+        return 0.0
+
+    return age_seconds / 3600.0
 
 
 # ============================================================
@@ -228,7 +340,9 @@ def format_pct(value: float) -> str:
 
 def http_json(
     url: str,
-    headers: Optional[Dict[str, str]] = None,
+    headers: Optional[
+        Dict[str, str]
+    ] = None,
 ) -> Any:
 
     headers = headers or {}
@@ -236,12 +350,15 @@ def http_json(
     for attempt in range(
         HTTP_RETRIES
     ):
+
         try:
 
-            request = urllib.request.Request(
-                url,
-                headers=headers,
-                method="GET",
+            request = (
+                urllib.request.Request(
+                    url,
+                    headers=headers,
+                    method="GET",
+                )
             )
 
             with urllib.request.urlopen(
@@ -249,25 +366,26 @@ def http_json(
                 timeout=HTTP_TIMEOUT,
             ) as response:
 
-                raw = response.read().decode(
-                    "utf-8"
+                raw = (
+                    response
+                    .read()
+                    .decode("utf-8")
                 )
 
             return json.loads(raw)
 
-        except (
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-            TimeoutError,
-            json.JSONDecodeError,
-            Exception,
-        ) as exc:
+        except Exception as exc:
 
-            if attempt == HTTP_RETRIES - 1:
+            if (
+                attempt
+                == HTTP_RETRIES - 1
+            ):
 
                 print(
-                    f"[HTTP ERROR] "
-                    f"{url} -> {exc}"
+                    "[HTTP ERROR]",
+                    url,
+                    "->",
+                    exc,
                 )
 
                 return None
@@ -278,28 +396,6 @@ def http_json(
             )
 
     return None
-
-
-def gecko_json(
-    path: str,
-) -> Any:
-
-    url = (
-        f"{GECKO_BASE}"
-        f"{path}"
-    )
-
-    headers = {
-        "Accept":
-            "application/json;version=20230203",
-        "User-Agent":
-            "RunnerBot/3.9",
-    }
-
-    return http_json(
-        url,
-        headers,
-    )
 
 
 # ============================================================
@@ -315,7 +411,7 @@ def load_state():
     ):
 
         print(
-            "No previous state found."
+            "No previous V4 state found."
         )
 
         return
@@ -328,7 +424,9 @@ def load_state():
             encoding="utf-8",
         ) as file:
 
-            loaded = json.load(file)
+            loaded = json.load(
+                file
+            )
 
         if isinstance(
             loaded,
@@ -361,15 +459,22 @@ def load_state():
             state["subscribers"] = []
 
         print(
-            "Persistent state loaded: "
-            f"{len(state['histories'])} tokens | "
-            f"{len(state['ignitions'])} ignition events"
+            "Persistent state loaded:",
+            len(
+                state["histories"]
+            ),
+            "tokens |",
+            len(
+                state["ignitions"]
+            ),
+            "ignitions",
         )
 
     except Exception as exc:
 
         print(
-            f"State load failed: {exc}"
+            "State load failed:",
+            exc,
         )
 
 
@@ -382,8 +487,9 @@ def save_state():
             {},
         )
 
-        # Keep only the newest tokens.
-        if len(histories) > MAX_STORED_TOKENS:
+        if len(histories) > (
+            MAX_STORED_TOKENS
+        ):
 
             ranked = sorted(
                 histories.items(),
@@ -395,22 +501,28 @@ def save_state():
                 reverse=True,
             )
 
-            state["histories"] = dict(
+            state[
+                "histories"
+            ] = dict(
                 ranked[
                     :MAX_STORED_TOKENS
                 ]
             )
 
-        # Trim individual histories.
-        for address, history in (
-            state["histories"].items()
-        ):
+        for (
+            address,
+            history,
+        ) in state[
+            "histories"
+        ].items():
 
-            if len(history) > MAX_HISTORY_PER_TOKEN:
+            if len(history) > (
+                MAX_HISTORY_PER_TOKEN
+            ):
 
-                state["histories"][
-                    address
-                ] = history[
+                state[
+                    "histories"
+                ][address] = history[
                     -MAX_HISTORY_PER_TOKEN:
                 ]
 
@@ -429,15 +541,16 @@ def save_state():
     except Exception as exc:
 
         print(
-            f"State save failed: {exc}"
+            "State save failed:",
+            exc,
         )
 
 
 # ============================================================
-# GECKO TERMINAL DISCOVERY
+# DEX SCREENER DISCOVERY
 # ============================================================
 
-def extract_gecko_token_addresses(
+def extract_token_addresses(
     data: Any,
 ) -> List[str]:
 
@@ -445,71 +558,58 @@ def extract_gecko_token_addresses(
 
     if not isinstance(
         data,
-        dict,
-    ):
-        return addresses
-
-    items = data.get(
-        "data",
-        [],
-    )
-
-    if not isinstance(
-        items,
         list,
     ):
+
         return addresses
 
-    for item in items:
+    for item in data:
 
         if not isinstance(
             item,
             dict,
         ):
+
             continue
 
-        relationships = (
-            item.get(
-                "relationships"
-            )
-            or {}
+        chain = item.get(
+            "chainId"
         )
 
-        base_token = (
-            relationships.get(
-                "base_token"
-            )
-            or {}
+        address = item.get(
+            "tokenAddress"
         )
 
-        token_data = (
-            base_token.get(
-                "data"
-            )
-            or {}
-        )
-
-        token_id = token_data.get(
-            "id"
-        )
-
-        if not token_id:
-            continue
-
-        if token_id.startswith(
-            "solana_"
+        if (
+            chain == SOLANA
+            and address
         ):
 
-            address = token_id[
-                len("solana_"):
-            ]
-
-            if address:
-                addresses.append(
-                    address
-                )
+            addresses.append(
+                address
+            )
 
     return addresses
+
+
+def dex_discovery_request(
+    path: str,
+) -> Any:
+
+    url = (
+        f"{DEX_BASE}"
+        f"{path}"
+    )
+
+    return http_json(
+        url,
+        {
+            "Accept":
+                "application/json",
+            "User-Agent":
+                "RunnerBot/4.0",
+        },
+    )
 
 
 def discover_token_addresses(
@@ -531,117 +631,160 @@ def discover_token_addresses(
         )
     ):
 
-        return [
-            item["address"]
-            for item in discovery_cache
-        ]
+        return discovery_cache
 
     found = set()
 
-    sources = [
-        (
-            "TOP",
-            (
-                f"/networks/"
-                f"{GECKO_NETWORK}"
-                f"/pools"
-            ),
-        ),
-        (
-            "NEW",
-            (
-                f"/networks/"
-                f"{GECKO_NETWORK}"
-                f"/new_pools"
-            ),
-        ),
-        (
-            "TRENDING",
-            (
-                f"/networks/"
-                f"{GECKO_NETWORK}"
-                f"/trending_pools"
-            ),
-        ),
-    ]
-
     print(
-        "\n--- MARKET DISCOVERY ---"
+        "\n"
+        "=========================================="
     )
 
-    for source_name, base_path in sources:
+    print(
+        "DEX SCREENER DISCOVERY"
+    )
 
-        for page in range(
-            1,
-            GECKO_PAGES + 1,
-        ):
+    print(
+        "=========================================="
+    )
 
-            separator = (
-                "&"
-                if "?" in base_path
-                else "?"
-            )
+    # --------------------------------------------------------
+    # 1. Latest token profiles
+    #
+    # These are DEX Screener's latest token-profile
+    # records. They give us token addresses without
+    # hardcoding names such as PEPE/CAT/DOG.
+    # --------------------------------------------------------
 
-            endpoint = (
-                f"{base_path}"
-                f"{separator}"
-                f"page={page}"
-            )
+    profiles = dex_discovery_request(
+        "/token-profiles/latest/v1"
+    )
 
-            data = gecko_json(
-                endpoint
-            )
+    profile_addresses = (
+        extract_token_addresses(
+            profiles
+        )
+    )
 
-            addresses = (
-                extract_gecko_token_addresses(
-                    data
-                )
-            )
+    before = len(found)
 
-            before = len(found)
+    found.update(
+        profile_addresses
+    )
 
-            found.update(
-                addresses
-            )
+    print(
+        "Latest profiles:",
+        len(profile_addresses),
+        "| new:",
+        len(found) - before,
+    )
 
-            added = (
-                len(found)
-                - before
-            )
+    # --------------------------------------------------------
+    # 2. Latest boosts
+    #
+    # Boosts are NOT treated as a quality signal.
+    # They are simply another DEX Screener discovery
+    # source.
+    # --------------------------------------------------------
 
-            print(
-                f"Gecko {source_name} "
-                f"page {page}: "
-                f"{len(addresses)} tokens "
-                f"| +{added} new"
-            )
+    boosts = dex_discovery_request(
+        "/token-boosts/latest/v1"
+    )
 
-    result = list(found)
+    boost_addresses = (
+        extract_token_addresses(
+            boosts
+        )
+    )
 
-    # Do not let discovery explode.
+    before = len(found)
+
+    found.update(
+        boost_addresses
+    )
+
+    print(
+        "Latest boosts:",
+        len(boost_addresses),
+        "| new:",
+        len(found) - before,
+    )
+
+    # --------------------------------------------------------
+    # 3. Top boosts
+    #
+    # Again, discovery only.
+    # We do NOT give a token extra runner score merely
+    # because it is boosted.
+    # --------------------------------------------------------
+
+    top_boosts = dex_discovery_request(
+        "/token-boosts/top/v1"
+    )
+
+    top_boost_addresses = (
+        extract_token_addresses(
+            top_boosts
+        )
+    )
+
+    before = len(found)
+
+    found.update(
+        top_boost_addresses
+    )
+
+    print(
+        "Top boosts:",
+        len(top_boost_addresses),
+        "| new:",
+        len(found) - before,
+    )
+
+    # --------------------------------------------------------
+    # Preserve previously discovered tokens.
+    #
+    # This is important:
+    #
+    # Once the bot discovers a token, it continues tracking
+    # it even if it disappears from a DEX Screener discovery
+    # feed on the next refresh.
+    # --------------------------------------------------------
+
+    existing_histories = state.get(
+        "histories",
+        {}
+    )
+
+    for address in (
+        existing_histories.keys()
+    ):
+
+        found.add(
+            address
+        )
+
+    result = list(
+        found
+    )
+
     result = result[
         :MAX_DISCOVERY_TOKENS
     ]
 
-    discovery_cache = [
-        {
-            "address": address
-        }
-        for address in result
-    ]
-
+    discovery_cache = result
     discovery_cache_ts = current
 
     print(
-        f"Unique Solana tokens discovered: "
-        f"{len(result)}"
+        "Total DEX-discovered/retained tokens:",
+        len(result),
     )
 
     return result
 
 
 # ============================================================
-# DEX SCREENER
+# DEX SCREENER TOKEN PAIRS
 # ============================================================
 
 def extract_pairs(
@@ -652,12 +795,14 @@ def extract_pairs(
         data,
         list,
     ):
+
         return data
 
     if not isinstance(
         data,
         dict,
     ):
+
         return []
 
     pairs = data.get(
@@ -668,158 +813,58 @@ def extract_pairs(
         pairs,
         list,
     ):
+
         return pairs
 
     return []
 
 
-def discover_pairs(
-    force: bool = False,
+def get_token_pairs(
+    token_address: str,
 ) -> List[Dict[str, Any]]:
 
-    global discovery_cache
-    global discovery_cache_ts
-
-    current = now_ts()
-
-    if (
-        not force
-        and discovery_cache
-        and (
-            current
-            - discovery_cache_ts
-            < DISCOVERY_INTERVAL_SECONDS
-        )
-    ):
-
-        # Discovery cache contains
-        # addresses only.
-        addresses = [
-            item["address"]
-            for item in discovery_cache
-        ]
-
-    else:
-
-        addresses = (
-            discover_token_addresses(
-                force=force
-            )
-        )
-
-    if not addresses:
-
-        return []
-
-    pairs_by_token = {}
-
-    print(
-        f"Fetching detailed data for "
-        f"{len(addresses)} tokens..."
+    url = (
+        f"{DEX_BASE}"
+        f"/token-pairs/v1/"
+        f"{SOLANA}/"
+        f"{token_address}"
     )
 
-    requests_made = 0
-
-    for i in range(
-        0,
-        len(addresses),
-        DEX_BATCH_SIZE,
-    ):
-
-        batch = addresses[
-            i:
-            i + DEX_BATCH_SIZE
-        ]
-
-        joined = ",".join(
-            batch
-        )
-
-        url = (
-            f"{DEX_BASE}"
-            f"/tokens/v1/"
-            f"solana/"
-            f"{joined}"
-        )
-
-        data = http_json(
-            url
-        )
-
-        requests_made += 1
-
-        for pair in extract_pairs(
-            data
-        ):
-
-            if pair.get(
-                "chainId"
-            ) != "solana":
-
-                continue
-
-            base = (
-                pair.get(
-                    "baseToken"
-                )
-                or {}
-            )
-
-            address = base.get(
-                "address"
-            )
-
-            if not address:
-                continue
-
-            liquidity = safe_float(
-                (
-                    pair.get(
-                        "liquidity"
-                    )
-                    or {}
-                ).get(
-                    "usd"
-                )
-            )
-
-            existing = (
-                pairs_by_token.get(
-                    address
-                )
-            )
-
-            if existing is None:
-
-                pairs_by_token[
-                    address
-                ] = pair
-
-                continue
-
-            old_liquidity = safe_float(
-                (
-                    existing.get(
-                        "liquidity"
-                    )
-                    or {}
-                ).get(
-                    "usd"
-                )
-            )
-
-            if liquidity > old_liquidity:
-
-                pairs_by_token[
-                    address
-                ] = pair
-
-    result = list(
-        pairs_by_token.values()
+    data = http_json(
+        url,
+        {
+            "Accept":
+                "application/json",
+            "User-Agent":
+                "RunnerBot/4.0",
+        },
     )
 
-    result.sort(
-        key=lambda pair: safe_float(
+    pairs = extract_pairs(
+        data
+    )
+
+    return [
+        pair
+        for pair in pairs
+        if pair.get(
+            "chainId"
+        ) == SOLANA
+    ]
+
+
+def choose_best_pair(
+    pairs: List[Dict[str, Any]],
+) -> Optional[
+    Dict[str, Any]
+]:
+
+    best = None
+    best_liquidity = 0.0
+
+    for pair in pairs:
+
+        liquidity = safe_float(
             (
                 pair.get(
                     "liquidity"
@@ -828,14 +873,95 @@ def discover_pairs(
             ).get(
                 "usd"
             )
-        ),
-        reverse=True,
+        )
+
+        if (
+            best is None
+            or liquidity
+            > best_liquidity
+        ):
+
+            best = pair
+            best_liquidity = liquidity
+
+    return best
+
+
+def discover_pairs(
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+
+    addresses = (
+        discover_token_addresses(
+            force=force
+        )
+    )
+
+    if not addresses:
+
+        return []
+
+    pairs_by_token = {}
+
+    lookups = min(
+        len(addresses),
+        MAX_TOKEN_LOOKUPS_PER_CYCLE,
     )
 
     print(
-        f"{len(result)} unique Solana "
-        f"pairs received | "
-        f"DEX requests={requests_made}"
+        f"Fetching DEX Screener pools "
+        f"for {lookups} tokens..."
+    )
+
+    for index in range(
+        lookups
+    ):
+
+        address = addresses[
+            index
+        ]
+
+        pairs = get_token_pairs(
+            address
+        )
+
+        if pairs:
+
+            best = choose_best_pair(
+                pairs
+            )
+
+            if best:
+
+                base = (
+                    best.get(
+                        "baseToken"
+                    )
+                    or {}
+                )
+
+                token_address = (
+                    base.get(
+                        "address"
+                    )
+                    or address
+                )
+
+                pairs_by_token[
+                    token_address
+                ] = best
+
+        time.sleep(
+            TOKEN_LOOKUP_SLEEP
+        )
+
+    result = list(
+        pairs_by_token.values()
+    )
+
+    print(
+        f"DEX Screener returned "
+        f"{len(result)} unique Solana pools."
     )
 
     return result
@@ -847,7 +973,9 @@ def discover_pairs(
 
 def pair_to_snapshot(
     pair: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Optional[
+    Dict[str, Any]
+]:
 
     base = (
         pair.get(
@@ -861,6 +989,7 @@ def pair_to_snapshot(
     )
 
     if not address:
+
         return None
 
     symbol = (
@@ -931,72 +1060,164 @@ def pair_to_snapshot(
         "h1"
     ) or {}
 
+    pair_created_at = safe_int(
+        pair.get(
+            "pairCreatedAt"
+        )
+    )
+
     snapshot = {
-        "ts": now_ts(),
-        "address": address,
-        "symbol": symbol,
-        "name": name,
-        "market_cap": market_cap,
-        "liquidity_usd": liquidity,
-        "volume_5m": safe_float(
-            volume.get(
-                "m5"
-            )
-        ),
-        "volume_1h": safe_float(
-            volume.get(
-                "h1"
-            )
-        ),
-        "buys_5m": safe_int(
-            m5.get(
-                "buys"
-            )
-        ),
-        "sells_5m": safe_int(
-            m5.get(
-                "sells"
-            )
-        ),
-        "buys_1h": safe_int(
-            h1.get(
-                "buys"
-            )
-        ),
-        "sells_1h": safe_int(
-            h1.get(
-                "sells"
-            )
-        ),
-        "price_usd": safe_float(
+        "ts":
+            now_ts(),
+
+        "address":
+            address,
+
+        "symbol":
+            symbol,
+
+        "name":
+            name,
+
+        "market_cap":
+            market_cap,
+
+        "liquidity_usd":
+            liquidity,
+
+        "volume_5m":
+            safe_float(
+                volume.get(
+                    "m5"
+                )
+            ),
+
+        "volume_1h":
+            safe_float(
+                volume.get(
+                    "h1"
+                )
+            ),
+
+        "buys_5m":
+            safe_int(
+                m5.get(
+                    "buys"
+                )
+            ),
+
+        "sells_5m":
+            safe_int(
+                m5.get(
+                    "sells"
+                )
+            ),
+
+        "buys_1h":
+            safe_int(
+                h1.get(
+                    "buys"
+                )
+            ),
+
+        "sells_1h":
+            safe_int(
+                h1.get(
+                    "sells"
+                )
+            ),
+
+        "tx_5m":
+            (
+                safe_int(
+                    m5.get(
+                        "buys"
+                    )
+                )
+                +
+                safe_int(
+                    m5.get(
+                        "sells"
+                    )
+                )
+            ),
+
+        "tx_1h":
+            (
+                safe_int(
+                    h1.get(
+                        "buys"
+                    )
+                )
+                +
+                safe_int(
+                    h1.get(
+                        "sells"
+                    )
+                )
+            ),
+
+        "price_usd":
+            safe_float(
+                pair.get(
+                    "priceUsd"
+                )
+            ),
+
+        "price_change_5m":
+            safe_float(
+                price_change.get(
+                    "m5"
+                )
+            ),
+
+        "price_change_1h":
+            safe_float(
+                price_change.get(
+                    "h1"
+                )
+            ),
+
+        "pair_created_at":
+            pair_created_at,
+
+        "age_hours":
+            pair_age_hours(
+                pair_created_at
+            ),
+
+        "pair_address":
             pair.get(
-                "priceUsd"
-            )
-        ),
-        "price_change_5m": safe_float(
-            price_change.get(
-                "m5"
-            )
-        ),
-        "price_change_1h": safe_float(
-            price_change.get(
-                "h1"
-            )
-        ),
-        "pair_created_at": safe_int(
+                "pairAddress"
+            ),
+
+        "dex_id":
             pair.get(
-                "pairCreatedAt"
+                "dexId"
+            ),
+
+        "url":
+            pair.get(
+                "url"
+            ),
+
+        "labels":
+            pair.get(
+                "labels"
             )
-        ),
-        "pair_address": pair.get(
-            "pairAddress"
-        ),
-        "dex_id": pair.get(
-            "dexId"
-        ),
-        "url": pair.get(
-            "url"
-        ),
+            or [],
+
+        "boost_active":
+            safe_float(
+                (
+                    pair.get(
+                        "boosts"
+                    )
+                    or {}
+                ).get(
+                    "active"
+                )
+            ),
     }
 
     return snapshot
@@ -1005,6 +1226,18 @@ def pair_to_snapshot(
 # ============================================================
 # HISTORY
 # ============================================================
+
+def recent_history(
+    address: str,
+) -> List[Dict[str, Any]]:
+
+    return state[
+        "histories"
+    ].get(
+        address,
+        [],
+    )
+
 
 def record_snapshot(
     snapshot: Dict[str, Any],
@@ -1026,27 +1259,11 @@ def record_snapshot(
 
         return
 
-    activity = (
-        snapshot[
-            "volume_5m"
-        ] > 0
-        or snapshot[
-            "buys_5m"
-        ] > 0
-        or snapshot[
-            "sells_5m"
-        ] > 0
-    )
-
-    if not activity:
-
-        return
-
     history = state[
         "histories"
     ].setdefault(
         address,
-        []
+        [],
     )
 
     history.append(
@@ -1063,205 +1280,178 @@ def record_snapshot(
 
 
 # ============================================================
-# ANALYSIS
+# FIND SNAPSHOT NEAR TIME
 # ============================================================
 
-def recent_history(
-    address: str,
-) -> List[Dict[str, Any]]:
+def snapshot_about_seconds_ago(
+    history: List[Dict[str, Any]],
+    seconds: float,
+) -> Optional[
+    Dict[str, Any]
+]:
 
-    return state[
-        "histories"
-    ].get(
-        address,
-        []
+    if not history:
+        return None
+
+    target = (
+        now_ts()
+        - seconds
     )
 
+    best = None
+    best_distance = float(
+        "inf"
+    )
+
+    for item in history:
+
+        ts = safe_float(
+            item.get(
+                "ts"
+            )
+        )
+
+        distance = abs(
+            ts - target
+        )
+
+        if distance < best_distance:
+
+            best_distance = distance
+            best = item
+
+    return best
+
+
+# ============================================================
+# ACTIVITY MODEL
+# ============================================================
 
 def calculate_activity(
     history: List[Dict[str, Any]],
 ) -> Dict[str, float]:
 
     result = {
-        "vol_1m": 0.0,
-        "vol_2m": 0.0,
-        "tx_1m": 0,
-        "tx_2m": 0,
-        "accel_1m": 0.0,
-        "accel_2m": 0.0,
+        "vol_now":
+            0.0,
+
+        "vol_1m":
+            0.0,
+
+        "tx_now":
+            0,
+
+        "tx_1m":
+            0,
+
+        "volume_acceleration":
+            0.0,
+
+        "tx_acceleration":
+            0.0,
+
+        "activity_acceleration":
+            0.0,
     }
 
-    if len(history) < 2:
+    if not history:
+
         return result
 
     latest = history[-1]
 
-    # --------------------------------------------------------
-    # Approximate rolling activity using scan snapshots.
-    # Each scan is approximately 15 seconds.
-    # --------------------------------------------------------
-
-    one_m_start = max(
-        0,
-        len(history)
-        - ACTIVITY_LOOKBACK_1M,
+    result[
+        "vol_now"
+    ] = safe_float(
+        latest.get(
+            "volume_5m"
+        )
     )
 
-    two_m_start = max(
-        0,
-        len(history)
-        - ACTIVITY_LOOKBACK_2M,
+    result[
+        "tx_now"
+    ] = safe_int(
+        latest.get(
+            "tx_5m"
+        )
     )
 
-    one_m = history[
-        one_m_start:
-    ]
+    previous = (
+        snapshot_about_seconds_ago(
+            history,
+            ACTIVITY_LOOKBACK_SECONDS,
+        )
+    )
 
-    two_m = history[
-        two_m_start:
-    ]
+    if not previous:
+
+        return result
+
+    previous_volume = safe_float(
+        previous.get(
+            "volume_5m"
+        )
+    )
+
+    previous_tx = safe_int(
+        previous.get(
+            "tx_5m"
+        )
+    )
 
     result[
         "vol_1m"
-    ] = sum(
-        safe_float(
-            x.get(
-                "volume_5m"
-            )
-        )
-        for x in one_m
-    )
-
-    result[
-        "vol_2m"
-    ] = sum(
-        safe_float(
-            x.get(
-                "volume_5m"
-            )
-        )
-        for x in two_m
-    )
+    ] = previous_volume
 
     result[
         "tx_1m"
-    ] = sum(
-        safe_int(
-            x.get(
-                "buys_5m"
-            )
+    ] = previous_tx
+
+    if previous_volume > 0:
+
+        result[
+            "volume_acceleration"
+        ] = pct_change(
+            previous_volume,
+            result[
+                "vol_now"
+            ],
         )
-        + safe_int(
-            x.get(
-                "sells_5m"
-            )
+
+    if previous_tx > 0:
+
+        result[
+            "tx_acceleration"
+        ] = pct_change(
+            previous_tx,
+            result[
+                "tx_now"
+            ],
         )
-        for x in one_m
-    )
 
     result[
-        "tx_2m"
-    ] = sum(
-        safe_int(
-            x.get(
-                "buys_5m"
-            )
-        )
-        + safe_int(
-            x.get(
-                "sells_5m"
-            )
-        )
-        for x in two_m
-    )
-
-    # Compare recent activity against
-    # the earlier half of the same history.
-
-    if len(history) >= 8:
-
-        previous = history[
-            -8:-4
+        "activity_acceleration"
+    ] = (
+        result[
+            "volume_acceleration"
         ]
-
-        previous_vol = sum(
-            safe_float(
-                x.get(
-                    "volume_5m"
-                )
-            )
-            for x in previous
-        )
-
-        current_vol = sum(
-            safe_float(
-                x.get(
-                    "volume_5m"
-                )
-            )
-            for x in history[
-                -4:
-            ]
-        )
-
-        if previous_vol > 0:
-
-            result[
-                "accel_1m"
-            ] = (
-                (
-                    current_vol
-                    - previous_vol
-                )
-                / previous_vol
-                * 100
-            )
-
-    if len(history) >= 16:
-
-        previous = history[
-            -16:-8
+        + result[
+            "tx_acceleration"
         ]
-
-        previous_vol = sum(
-            safe_float(
-                x.get(
-                    "volume_5m"
-                )
-            )
-            for x in previous
-        )
-
-        current_vol = sum(
-            safe_float(
-                x.get(
-                    "volume_5m"
-                )
-            )
-            for x in history[
-                -8:
-            ]
-        )
-
-        if previous_vol > 0:
-
-            result[
-                "accel_2m"
-            ] = (
-                (
-                    current_vol
-                    - previous_vol
-                )
-                / previous_vol
-                * 100
-            )
+    ) / 2.0
 
     return result
 
 
+# ============================================================
+# ANALYSIS
+# ============================================================
+
 def analyze(
     snapshot: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Optional[
+    Dict[str, Any]
+]:
 
     address = snapshot[
         "address"
@@ -1283,19 +1473,20 @@ def analyze(
 
     mcs = [
         safe_float(
-            x.get(
+            item.get(
                 "market_cap"
             )
         )
-        for x in recent
+        for item in recent
         if safe_float(
-            x.get(
+            item.get(
                 "market_cap"
             )
         ) > 0
     ]
 
     if len(mcs) < 2:
+
         return None
 
     oldest_mc = mcs[0]
@@ -1306,6 +1497,25 @@ def analyze(
         latest_mc,
     )
 
+    previous_mcs = mcs[
+        :-1
+    ]
+
+    previous_high = max(
+        previous_mcs
+    )
+
+    current_mc = safe_float(
+        snapshot.get(
+            "market_cap"
+        )
+    )
+
+    breakout = (
+        current_mc
+        > previous_high * 1.01
+    )
+
     highest_mc = max(
         mcs
     )
@@ -1313,6 +1523,8 @@ def analyze(
     lowest_mc = min(
         mcs
     )
+
+    range_pct = 0.0
 
     if lowest_mc > 0:
 
@@ -1322,101 +1534,85 @@ def analyze(
                 - lowest_mc
             )
             / lowest_mc
-            * 100
+            * 100.0
         )
 
-    else:
+    # --------------------------------------------------------
+    # Instant MC movement
+    # --------------------------------------------------------
 
-        range_pct = 0.0
-
-    previous = recent[
-        -2
-    ]
-
-    previous_mc = safe_float(
-        previous.get(
-            "market_cap"
-        )
-    )
-
-    current_mc = safe_float(
-        snapshot.get(
-            "market_cap"
-        )
-    )
+    previous = recent[-2]
 
     instant_mc_move = pct_change(
-        previous_mc,
+        safe_float(
+            previous.get(
+                "market_cap"
+            )
+        ),
         current_mc,
     )
+
+    # --------------------------------------------------------
+    # Activity
+    # --------------------------------------------------------
 
     activity = calculate_activity(
         history
     )
 
-    current_buys = safe_int(
+    activity_expansion = (
+        activity[
+            "volume_acceleration"
+        ]
+        >= ACTIVITY_EXPANSION_PCT
+        or
+        activity[
+            "tx_acceleration"
+        ]
+        >= ACTIVITY_EXPANSION_PCT
+    )
+
+    # --------------------------------------------------------
+    # Buy pressure
+    # --------------------------------------------------------
+
+    buys = safe_int(
         snapshot.get(
             "buys_5m"
         )
     )
 
-    current_sells = safe_int(
+    sells = safe_int(
         snapshot.get(
             "sells_5m"
         )
     )
 
     total_tx = (
-        current_buys
-        + current_sells
+        buys
+        + sells
     )
 
-    if current_sells > 0:
+    if sells > 0:
 
         buy_ratio = (
-            current_buys
-            / current_sells
+            buys / sells
         )
 
-    elif current_buys > 0:
+    elif buys > 0:
 
         buy_ratio = float(
-            current_buys
+            buys
         )
 
     else:
 
         buy_ratio = 0.0
 
-    breakout = (
-        current_mc
-        > highest_mc * 1.01
-    )
-
-    # If the latest value is already the
-    # highest point, compare it against
-    # previous observations.
-    if len(mcs) >= 3:
-
-        previous_high = max(
-            mcs[:-1]
-        )
-
-        breakout = (
-            current_mc
-            > previous_high * 1.01
-        )
-
-    activity_expansion = (
-        activity[
-            "accel_1m"
-        ]
-        >= ACTIVITY_EXPANSION_PCT
-        or
-        activity[
-            "accel_2m"
-        ]
-        >= ACTIVITY_EXPANSION_PCT
+    buy_percentage = (
+        buys / total_tx * 100.0
+        if total_tx > 0
+        else 0.0
     )
 
     # --------------------------------------------------------
@@ -1427,34 +1623,23 @@ def analyze(
 
     for item in recent:
 
-        vol = safe_float(
+        volume = safe_float(
             item.get(
                 "volume_5m"
             )
         )
 
-        buys = safe_int(
+        tx = safe_int(
             item.get(
-                "buys_5m"
+                "tx_5m"
             )
-        )
-
-        sells = safe_int(
-            item.get(
-                "sells_5m"
-            )
-        )
-
-        tx = (
-            buys
-            + sells
         )
 
         if (
-            vol
+            volume
             >= MIN_CONSOLIDATION_VOLUME_5M
             and tx
-            >= MIN_CONSOLIDATION_TX
+            >= MIN_CONSOLIDATION_TX_5M
         ):
 
             active_consolidation += 1
@@ -1463,7 +1648,7 @@ def analyze(
         active_consolidation
         >= MIN_CONSOLIDATION_ACTIVE_OBS
         and range_pct
-        <= 18.0
+        <= MAX_CONSOLIDATION_RANGE_PCT
     )
 
     # --------------------------------------------------------
@@ -1472,13 +1657,13 @@ def analyze(
 
     liquidities = [
         safe_float(
-            x.get(
+            item.get(
                 "liquidity_usd"
             )
         )
-        for x in recent
+        for item in recent
         if safe_float(
-            x.get(
+            item.get(
                 "liquidity_usd"
             )
         ) > 0
@@ -1498,110 +1683,392 @@ def analyze(
     )
 
     # --------------------------------------------------------
-    # SCORE
+    # AGE SCORE
     # --------------------------------------------------------
 
-    score = 0
-    reasons = []
+    age = safe_float(
+        snapshot.get(
+            "age_hours"
+        )
+    )
 
-    # Structure
+    age_points = 0
+
+    if age <= 3:
+
+        age_points = 15
+
+    elif age <= 6:
+
+        age_points = 12
+
+    elif age <= 12:
+
+        age_points = 9
+
+    elif age <= 24:
+
+        age_points = 6
+
+    # --------------------------------------------------------
+    # MC ASYMMETRY SCORE
+    # --------------------------------------------------------
+
+    mc_points = 0
+
     if (
-        len(recent) >= 5
-        and range_pct <= 18.0
-        and abs(mc_move) <= 18.0
+        20_000
+        <= current_mc
+        <= 75_000
     ):
 
-        score += 2
+        mc_points = 15
 
-        reasons.append(
-            "tight structure"
+    elif (
+        current_mc
+        <= 150_000
+    ):
+
+        mc_points = 11
+
+    elif (
+        current_mc
+        <= 225_000
+    ):
+
+        mc_points = 8
+
+    else:
+
+        mc_points = 5
+
+    # --------------------------------------------------------
+    # LIQUIDITY SCORE
+    # --------------------------------------------------------
+
+    liquidity = safe_float(
+        snapshot.get(
+            "liquidity_usd"
         )
+    )
 
-    if activity_expansion:
+    liquidity_points = 0
 
-        score += 2
+    if liquidity >= 50_000:
 
-        reasons.append(
-            "activity expansion"
-        )
+        liquidity_points = 10
 
-    if mc_move >= 5.0:
+    elif liquidity >= 25_000:
 
-        score += 2
+        liquidity_points = 9
 
-        reasons.append(
-            "MC expansion"
-        )
+    elif liquidity >= 15_000:
 
-    if breakout:
+        liquidity_points = 8
 
-        score += 3
+    elif liquidity >= 10_000:
 
-        reasons.append(
-            "breakout"
-        )
+        liquidity_points = 6
 
-    if buy_ratio >= 1.2:
+    # --------------------------------------------------------
+    # VOLUME SCORE
+    # --------------------------------------------------------
 
-        score += 1
-
-        reasons.append(
-            "buy pressure"
-        )
-
-    if buy_ratio >= 1.5:
-
-        score += 2
-
-        reasons.append(
-            "strong buy pressure"
-        )
-
-    if liquidity_stable:
-
-        score += 1
-
-        reasons.append(
-            "liquidity stable"
-        )
-
-    if safe_float(
+    volume_5m = safe_float(
         snapshot.get(
             "volume_5m"
         )
-    ) >= REFERENCE_VOLUME_5M:
+    )
 
-        score += 1
+    volume_points = 0
+
+    if volume_5m >= 20_000:
+
+        volume_points = 10
+
+    elif volume_5m >= 10_000:
+
+        volume_points = 8
+
+    elif volume_5m >= 5_000:
+
+        volume_points = 6
+
+    elif volume_5m >= 2_000:
+
+        volume_points = 4
+
+    elif volume_5m >= 500:
+
+        volume_points = 2
+
+    # --------------------------------------------------------
+    # BUY PRESSURE SCORE
+    # --------------------------------------------------------
+
+    buy_points = 0
+
+    if buy_percentage >= 70:
+
+        buy_points = 10
+
+    elif buy_percentage >= 60:
+
+        buy_points = 8
+
+    elif buy_percentage >= 55:
+
+        buy_points = 6
+
+    elif buy_percentage >= 50:
+
+        buy_points = 3
+
+    # --------------------------------------------------------
+    # TRANSACTION PARTICIPATION SCORE
+    # --------------------------------------------------------
+
+    tx_points = 0
+
+    if total_tx >= 200:
+
+        tx_points = 10
+
+    elif total_tx >= 100:
+
+        tx_points = 8
+
+    elif total_tx >= 50:
+
+        tx_points = 6
+
+    elif total_tx >= 25:
+
+        tx_points = 4
+
+    elif total_tx >= 10:
+
+        tx_points = 2
+
+    # --------------------------------------------------------
+    # STRUCTURE SCORE
+    # --------------------------------------------------------
+
+    structure_points = 0
+
+    if consolidation:
+
+        structure_points += 7
+
+    if breakout:
+
+        structure_points += 8
+
+    if (
+        current_mc
+        > oldest_mc
+    ):
+
+        structure_points = min(
+            15,
+            structure_points + 2,
+        )
+
+    # --------------------------------------------------------
+    # ACTIVITY SCORE
+    # --------------------------------------------------------
+
+    activity_points = 0
+
+    if (
+        activity[
+            "activity_acceleration"
+        ] >= 20
+    ):
+
+        activity_points = 8
+
+    if (
+        activity[
+            "activity_acceleration"
+        ] >= 40
+    ):
+
+        activity_points = 12
+
+    if (
+        activity[
+            "activity_acceleration"
+        ] >= 75
+    ):
+
+        activity_points = 15
+
+    # --------------------------------------------------------
+    # EXTREME VERTICAL MOVE PENALTY
+    #
+    # We don't want to chase a candle that has already
+    # gone vertical.
+    # --------------------------------------------------------
+
+    vertical_penalty = 0
+
+    price_change_5m = safe_float(
+        snapshot.get(
+            "price_change_5m"
+        )
+    )
+
+    if price_change_5m > 100:
+
+        vertical_penalty = 15
+
+    elif price_change_5m > 75:
+
+        vertical_penalty = 10
+
+    elif price_change_5m > 50:
+
+        vertical_penalty = 5
+
+    # --------------------------------------------------------
+    # TOTAL SCORE
+    #
+    # Maximum base:
+    #
+    # Age             15
+    # MC              15
+    # Liquidity       10
+    # Volume          10
+    # Buy pressure    10
+    # Transactions    10
+    # Structure       15
+    # Activity        15
+    #
+    # TOTAL            100
+    # --------------------------------------------------------
+
+    raw_score = (
+        age_points
+        + mc_points
+        + liquidity_points
+        + volume_points
+        + buy_points
+        + tx_points
+        + structure_points
+        + activity_points
+    )
+
+    score = max(
+        0,
+        raw_score
+        - vertical_penalty,
+    )
+
+    # --------------------------------------------------------
+    # Reasons
+    # --------------------------------------------------------
+
+    reasons = []
+
+    if age <= 3:
+
+        reasons.append(
+            "very early pair"
+        )
+
+    elif age <= 6:
+
+        reasons.append(
+            "early pair"
+        )
+
+    if current_mc <= 75_000:
+
+        reasons.append(
+            "low MC"
+        )
+
+    if liquidity >= 15_000:
+
+        reasons.append(
+            "healthy liquidity"
+        )
+
+    if volume_5m >= REFERENCE_VOLUME_5M:
 
         reasons.append(
             "5m volume >= $5K"
         )
 
-    if (
-        current_sells
-        > current_buys
-        and total_tx > 0
-    ):
+    if buy_percentage >= 60:
 
         reasons.append(
-            "sell pressure"
+            "buy participation"
+        )
+
+    if total_tx >= 50:
+
+        reasons.append(
+            "active transactions"
+        )
+
+    if consolidation:
+
+        reasons.append(
+            "consolidation"
+        )
+
+    if breakout:
+
+        reasons.append(
+            "structure breakout"
+        )
+
+    if activity_expansion:
+
+        reasons.append(
+            "activity expansion"
+        )
+
+    if liquidity_stable:
+
+        reasons.append(
+            "liquidity stable"
+        )
+
+    if vertical_penalty > 0:
+
+        reasons.append(
+            "vertical-move penalty"
         )
 
     # --------------------------------------------------------
     # State
     # --------------------------------------------------------
 
+    # Important:
+    #
+    # Score alone does NOT create ignition.
+    #
+    # We require actual structural/activity confirmation.
+    # --------------------------------------------------------
+
     if (
-        breakout
+        score >= 70
+        and breakout
         and activity_expansion
-        and score >= 7
+        and buy_percentage >= 50
     ):
 
         setup_state = (
             "IGNITION"
         )
 
-    elif breakout:
+    elif (
+        breakout
+        and activity_expansion
+    ):
 
         setup_state = (
             "STRUCTURE BREAK"
@@ -1626,37 +2093,91 @@ def analyze(
         )
 
     return {
-        "state": setup_state,
-        "score": score,
-        "reasons": reasons,
-        "history_count": len(history),
-        "mc_move": mc_move,
-        "instant_mc_move": instant_mc_move,
-        "range_pct": range_pct,
-        "activity_expansion": activity_expansion,
-        "accel_1m": activity[
-            "accel_1m"
-        ],
-        "accel_2m": activity[
-            "accel_2m"
-        ],
-        "vol_1m": activity[
-            "vol_1m"
-        ],
-        "vol_2m": activity[
-            "vol_2m"
-        ],
-        "tx_1m": activity[
-            "tx_1m"
-        ],
-        "tx_2m": activity[
-            "tx_2m"
-        ],
-        "buy_ratio": buy_ratio,
-        "breakout": breakout,
-        "liquidity_move": liquidity_move,
-        "liquidity_stable": liquidity_stable,
-        "consolidation": consolidation,
+        "state":
+            setup_state,
+
+        "score":
+            score,
+
+        "raw_score":
+            raw_score,
+
+        "reasons":
+            reasons,
+
+        "history_count":
+            len(history),
+
+        "age_hours":
+            age,
+
+        "mc_move":
+            mc_move,
+
+        "instant_mc_move":
+            instant_mc_move,
+
+        "range_pct":
+            range_pct,
+
+        "volume_acceleration":
+            activity[
+                "volume_acceleration"
+            ],
+
+        "tx_acceleration":
+            activity[
+                "tx_acceleration"
+            ],
+
+        "activity_acceleration":
+            activity[
+                "activity_acceleration"
+            ],
+
+        "vol_now":
+            activity[
+                "vol_now"
+            ],
+
+        "vol_1m":
+            activity[
+                "vol_1m"
+            ],
+
+        "tx_now":
+            activity[
+                "tx_now"
+            ],
+
+        "tx_1m":
+            activity[
+                "tx_1m"
+            ],
+
+        "buy_ratio":
+            buy_ratio,
+
+        "buy_percentage":
+            buy_percentage,
+
+        "total_tx":
+            total_tx,
+
+        "breakout":
+            breakout,
+
+        "liquidity_move":
+            liquidity_move,
+
+        "liquidity_stable":
+            liquidity_stable,
+
+        "consolidation":
+            consolidation,
+
+        "vertical_penalty":
+            vertical_penalty,
     }
 
 
@@ -1667,14 +2188,12 @@ def analyze(
 def create_ignition(
     snapshot: Dict[str, Any],
     analysis: Dict[str, Any],
-):
+) -> bool:
 
     address = snapshot[
         "address"
     ]
 
-    # Don't repeatedly create ignition
-    # events for the same token.
     existing = state[
         "ignitions"
     ].get(
@@ -1686,43 +2205,76 @@ def create_ignition(
         return False
 
     event = {
-        "address": address,
-        "symbol": snapshot[
-            "symbol"
-        ],
-        "name": snapshot[
-            "name"
-        ],
-        "pair_address": snapshot.get(
-            "pair_address"
-        ),
-        "url": snapshot.get(
-            "url"
-        ),
-        "start_ts": now_ts(),
-        "start_mc": snapshot[
-            "market_cap"
-        ],
-        "peak_mc": snapshot[
-            "market_cap"
-        ],
-        "lowest_mc": snapshot[
-            "market_cap"
-        ],
-        "max_drawdown": 0.0,
-        "score": analysis[
-            "score"
-        ],
-        "reasons": analysis[
-            "reasons"
-        ],
-        "outcomes": {},
-        "final_label": None,
-        "last_mc": snapshot[
-            "market_cap"
-        ],
-        "continuing": False,
-        "failed": False,
+        "address":
+            address,
+
+        "symbol":
+            snapshot[
+                "symbol"
+            ],
+
+        "name":
+            snapshot[
+                "name"
+            ],
+
+        "pair_address":
+            snapshot.get(
+                "pair_address"
+            ),
+
+        "url":
+            snapshot.get(
+                "url"
+            ),
+
+        "start_ts":
+            now_ts(),
+
+        "start_mc":
+            snapshot[
+                "market_cap"
+            ],
+
+        "peak_mc":
+            snapshot[
+                "market_cap"
+            ],
+
+        "lowest_mc":
+            snapshot[
+                "market_cap"
+            ],
+
+        "max_drawdown":
+            0.0,
+
+        "score":
+            analysis[
+                "score"
+            ],
+
+        "reasons":
+            analysis[
+                "reasons"
+            ],
+
+        "outcomes":
+            {},
+
+        "final_label":
+            None,
+
+        "last_mc":
+            snapshot[
+                "market_cap"
+            ],
+
+        "continuing":
+            False,
+
+        "failed":
+            False,
     }
 
     state[
@@ -1749,6 +2301,7 @@ def update_ignition(
     )
 
     if not event:
+
         return None
 
     start_mc = safe_float(
@@ -1764,6 +2317,7 @@ def update_ignition(
     )
 
     if current_mc <= 0:
+
         return None
 
     event[
@@ -1788,158 +2342,156 @@ def update_ignition(
         current_mc,
     )
 
-    if start_mc > 0:
+    if start_mc <= 0:
 
-        current_return = pct_change(
-            start_mc,
-            current_mc,
+        return None
+
+    current_return = pct_change(
+        start_mc,
+        current_mc,
+    )
+
+    drawdown = pct_change(
+        event[
+            "peak_mc"
+        ],
+        current_mc,
+    )
+
+    event[
+        "max_drawdown"
+    ] = min(
+        safe_float(
+            event.get(
+                "max_drawdown"
+            )
+        ),
+        drawdown,
+    )
+
+    event[
+        "last_mc"
+    ] = current_mc
+
+    elapsed = (
+        now_ts()
+        - safe_float(
+            event.get(
+                "start_ts"
+            )
         )
+    )
 
-        drawdown = pct_change(
-            event[
-                "peak_mc"
-            ],
-            current_mc,
+    # --------------------------------------------------------
+    # 5 MIN
+    # --------------------------------------------------------
+
+    if (
+        elapsed >= 300
+        and "5m"
+        not in event[
+            "outcomes"
+        ]
+    ):
+
+        label = (
+            "CONTINUING"
+            if current_return >= 10
+            else
+            "FAILED"
+            if current_return <= -15
+            else
+            "UNCLEAR"
         )
 
         event[
-            "max_drawdown"
-        ] = min(
-            safe_float(
-                event.get(
-                    "max_drawdown"
-                )
-            ),
-            drawdown,
+            "outcomes"
+        ]["5m"] = {
+            "return_pct":
+                current_return,
+            "mc":
+                current_mc,
+            "label":
+                label,
+        }
+
+    # --------------------------------------------------------
+    # 15 MIN
+    # --------------------------------------------------------
+
+    if (
+        elapsed >= 900
+        and "15m"
+        not in event[
+            "outcomes"
+        ]
+    ):
+
+        label = (
+            "CONTINUING"
+            if current_return >= 10
+            else
+            "FAILED"
+            if current_return <= -15
+            else
+            "UNCLEAR"
         )
 
         event[
-            "last_mc"
-        ] = current_mc
+            "outcomes"
+        ]["15m"] = {
+            "return_pct":
+                current_return,
+            "mc":
+                current_mc,
+            "label":
+                label,
+        }
 
-        elapsed = (
-            now_ts()
-            - safe_float(
-                event.get(
-                    "start_ts"
-                )
+    # --------------------------------------------------------
+    # 30 MIN FINAL
+    # --------------------------------------------------------
+
+    if (
+        elapsed >= 1800
+        and "30m"
+        not in event[
+            "outcomes"
+        ]
+    ):
+
+        if current_return >= 30:
+
+            final_label = (
+                "RUNNER"
             )
-        )
 
-        # ----------------------------------------------------
-        # +5 MIN
-        # ----------------------------------------------------
+        elif current_return <= -15:
 
-        if (
-            elapsed >= 300
-            and "5m"
-            not in event[
-                "outcomes"
-            ]
-        ):
-
-            label = (
-                "CONTINUING"
-                if current_return
-                >= 10.0
-                else
+            final_label = (
                 "FAILED"
-                if current_return
-                <= -15.0
-                else
+            )
+
+        else:
+
+            final_label = (
                 "UNCLEAR"
             )
 
-            event[
-                "outcomes"
-            ]["5m"] = {
-                "return_pct":
-                    current_return,
-                "mc":
-                    current_mc,
-                "label":
-                    label,
-            }
+        event[
+            "outcomes"
+        ]["30m"] = {
+            "return_pct":
+                current_return,
+            "mc":
+                current_mc,
+            "label":
+                final_label,
+        }
 
-        # ----------------------------------------------------
-        # +15 MIN
-        # ----------------------------------------------------
-
-        if (
-            elapsed >= 900
-            and "15m"
-            not in event[
-                "outcomes"
-            ]
-        ):
-
-            label = (
-                "CONTINUING"
-                if current_return
-                >= 10.0
-                else
-                "FAILED"
-                if current_return
-                <= -15.0
-                else
-                "UNCLEAR"
-            )
-
-            event[
-                "outcomes"
-            ]["15m"] = {
-                "return_pct":
-                    current_return,
-                "mc":
-                    current_mc,
-                "label":
-                    label,
-            }
-
-        # ----------------------------------------------------
-        # +30 MIN FINAL
-        # ----------------------------------------------------
-
-        if (
-            elapsed >= 1800
-            and "30m"
-            not in event[
-                "outcomes"
-            ]
-        ):
-
-            if current_return >= 30.0:
-
-                final_label = (
-                    "RUNNER"
-                )
-
-            elif current_return <= -15.0:
-
-                final_label = (
-                    "FAILED"
-                )
-
-            else:
-
-                final_label = (
-                    "UNCLEAR"
-                )
-
-            event[
-                "outcomes"
-            ]["30m"] = {
-                "return_pct":
-                    current_return,
-                "mc":
-                    current_mc,
-                "label":
-                    final_label,
-            }
-
-            event[
-                "final_label"
-            ] = final_label
+        event[
+            "final_label"
+        ] = final_label
 
     save_state()
 
@@ -1967,22 +2519,22 @@ def telegram_api(
         f"/{method}"
     )
 
-    payload = payload or {}
-
     encoded = json.dumps(
-        payload
+        payload or {}
     ).encode(
         "utf-8"
     )
 
-    request = urllib.request.Request(
-        url,
-        data=encoded,
-        headers={
-            "Content-Type":
-                "application/json",
-        },
-        method="POST",
+    request = (
+        urllib.request.Request(
+            url,
+            data=encoded,
+            headers={
+                "Content-Type":
+                    "application/json",
+            },
+            method="POST",
+        )
     )
 
     try:
@@ -1992,8 +2544,10 @@ def telegram_api(
             timeout=HTTP_TIMEOUT,
         ) as response:
 
-            raw = response.read().decode(
-                "utf-8"
+            raw = (
+                response
+                .read()
+                .decode("utf-8")
             )
 
         return json.loads(
@@ -2003,7 +2557,8 @@ def telegram_api(
     except Exception as exc:
 
         print(
-            f"Telegram error: {exc}"
+            "Telegram error:",
+            exc,
         )
 
         return None
@@ -2026,8 +2581,10 @@ def telegram_send(
         {
             "chat_id":
                 chat_id,
+
             "text":
                 text,
+
             "disable_web_page_preview":
                 True,
         },
@@ -2045,13 +2602,11 @@ def broadcast(
 
         return
 
-    subscribers = state.get(
-        "subscribers",
-        [],
-    )
-
     for chat_id in list(
-        subscribers
+        state.get(
+            "subscribers",
+            [],
+        )
     ):
 
         telegram_send(
@@ -2064,14 +2619,12 @@ def broadcast(
 # TELEGRAM COMMANDS
 # ============================================================
 
-telegram_offset = 0
-
-
 def process_telegram_updates():
 
     global telegram_offset
 
     if not TELEGRAM_BOT_TOKEN:
+
         return
 
     result = telegram_api(
@@ -2079,8 +2632,10 @@ def process_telegram_updates():
         {
             "offset":
                 telegram_offset,
+
             "timeout":
                 0,
+
             "allowed_updates":
                 [
                     "message"
@@ -2089,19 +2644,19 @@ def process_telegram_updates():
     )
 
     if not result:
+
         return
 
     if not result.get(
         "ok"
     ):
+
         return
 
-    updates = result.get(
+    for update in result.get(
         "result",
         [],
-    )
-
-    for update in updates:
+    ):
 
         telegram_offset = (
             update.get(
@@ -2116,6 +2671,7 @@ def process_telegram_updates():
         )
 
         if not message:
+
             continue
 
         chat = message.get(
@@ -2123,6 +2679,7 @@ def process_telegram_updates():
         )
 
         if not chat:
+
             continue
 
         chat_id = chat.get(
@@ -2137,15 +2694,19 @@ def process_telegram_updates():
         ).strip()
 
         if not text:
+
             continue
 
-        command = text.split(
-            " ",
-            1
-        )[0].lower()
+        command = (
+            text.split(
+                " ",
+                1,
+            )[0]
+            .lower()
+        )
 
         # ----------------------------------------------------
-        # /start
+        # START
         # ----------------------------------------------------
 
         if command == "/start":
@@ -2167,22 +2728,21 @@ def process_telegram_updates():
             telegram_send(
                 chat_id,
                 (
-                    "🚀 Runner Bot V3.9\n\n"
+                    "🚀 Runner Bot V4\n\n"
                     "You are subscribed.\n\n"
-                    "Discovery:\n"
-                    "• Solana top pools\n"
-                    "• Solana new pools\n"
-                    "• Solana trending pools\n\n"
+                    "DEX Screener first.\n"
+                    "Solana runner research engine.\n\n"
                     "Runner range:\n"
-                    "$20K-$200K MC\n"
-                    "Liquidity >= $10K\n\n"
+                    "$20K-$300K MC\n"
+                    "Liquidity >= $10K\n"
+                    "Pair age <= 24h\n\n"
                     "Scanning every "
                     f"{int(SCAN_INTERVAL_SECONDS)}s."
                 ),
             )
 
         # ----------------------------------------------------
-        # /stop
+        # STOP
         # ----------------------------------------------------
 
         elif command == "/stop":
@@ -2203,38 +2763,16 @@ def process_telegram_updates():
 
             telegram_send(
                 chat_id,
-                "🛑 Runner alerts stopped for this chat.",
+                "🛑 Runner alerts stopped.",
             )
 
         # ----------------------------------------------------
-        # /alerts
-        # ----------------------------------------------------
-
-        elif command == "/alerts":
-
-            status = (
-                "ON"
-                if HEATING_ALERTS_ENABLED
-                else "OFF"
-            )
-
-            telegram_send(
-                chat_id,
-                (
-                    "Runner alerts: "
-                    f"{status}\n"
-                    "Global bot alerts are controlled "
-                    "by HEATING_ALERTS_ENABLED."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # /status
+        # STATUS
         # ----------------------------------------------------
 
         elif command == "/status":
 
-            active_ignitions = sum(
+            active = sum(
                 1
                 for event
                 in state[
@@ -2248,13 +2786,13 @@ def process_telegram_updates():
             telegram_send(
                 chat_id,
                 (
-                    "📊 RUNNER BOT V3.9\n\n"
-                    f"Tokens tracked: "
+                    "📊 RUNNER BOT V4\n\n"
+                    f"Tracked tokens: "
                     f"{len(state['histories'])}\n"
                     f"Ignitions: "
                     f"{len(state['ignitions'])}\n"
-                    f"Active research events: "
-                    f"{active_ignitions}\n"
+                    f"Active events: "
+                    f"{active}\n"
                     f"Subscribers: "
                     f"{len(state['subscribers'])}\n"
                     f"Alerts: "
@@ -2263,7 +2801,21 @@ def process_telegram_updates():
             )
 
         # ----------------------------------------------------
-        # /scan
+        # ALERTS
+        # ----------------------------------------------------
+
+        elif command == "/alerts":
+
+            telegram_send(
+                chat_id,
+                (
+                    "Runner alerts: "
+                    f"{'ON' if HEATING_ALERTS_ENABLED else 'OFF'}"
+                ),
+            )
+
+        # ----------------------------------------------------
+        # SCAN
         # ----------------------------------------------------
 
         elif command == "/scan":
@@ -2271,14 +2823,14 @@ def process_telegram_updates():
             telegram_send(
                 chat_id,
                 (
-                    "🔎 Manual scan requested.\n"
+                    "🔎 Manual scan queued.\n"
                     "The scanner will run on the next cycle."
                 ),
             )
 
 
 # ============================================================
-# ALERT FORMAT
+# ALERT
 # ============================================================
 
 def build_ignition_alert(
@@ -2310,16 +2862,20 @@ def build_ignition_alert(
         "sells_5m"
     ]
 
-    buy_ratio = analysis[
-        "buy_ratio"
+    age = analysis[
+        "age_hours"
     ]
 
-    accel_1m = analysis[
-        "accel_1m"
+    score = analysis[
+        "score"
     ]
 
-    accel_2m = analysis[
-        "accel_2m"
+    buy_percentage = analysis[
+        "buy_percentage"
+    ]
+
+    activity = analysis[
+        "activity_acceleration"
     ]
 
     price_change = snapshot[
@@ -2332,37 +2888,50 @@ def build_ignition_alert(
         ]
     )
 
-    url = snapshot.get(
-        "url"
-    ) or ""
+    url = (
+        snapshot.get(
+            "url"
+        )
+        or ""
+    )
 
     return (
         "🔥 RUNNER IGNITION\n\n"
 
         f"🪙 {symbol}\n"
-        f"💰 MC: {format_money(mc)}\n"
+
+        f"💰 MC: "
+        f"{format_money(mc)}\n"
+
         f"💧 Liquidity: "
         f"{format_money(liquidity)}\n"
+
+        f"⏱ Pair age: "
+        f"{age:.1f}h\n\n"
+
         f"📊 5m Volume: "
-        f"{format_money(volume)}\n\n"
+        f"{format_money(volume)}\n"
 
         f"🟢 Buys: {buys}\n"
-        f"🔴 Sells: {sells}\n"
-        f"⚖️ Buy/Sell: "
-        f"{buy_ratio:.2f}\n\n"
 
-        f"⚡ 1m acceleration: "
-        f"{format_pct(accel_1m)}\n"
-        f"⚡ 2m acceleration: "
-        f"{format_pct(accel_2m)}\n"
+        f"🔴 Sells: {sells}\n"
+
+        f"📈 Buy participation: "
+        f"{buy_percentage:.1f}%\n\n"
+
+        f"⚡ Activity acceleration: "
+        f"{format_pct(activity)}\n"
+
         f"📈 5m price: "
         f"{format_pct(price_change)}\n\n"
 
-        f"🎯 Score: "
-        f"{analysis['score']}\n"
+        f"🎯 Runner score: "
+        f"{score}/100\n"
+
         f"💥 Breakout: "
         f"{'YES' if analysis['breakout'] else 'NO'}\n"
-        f"📐 Structure: "
+
+        f"📐 Structure range: "
         f"{analysis['range_pct']:.1f}%\n\n"
 
         f"Reasons: {reasons}\n\n"
@@ -2393,7 +2962,7 @@ def build_outcome_alert(
 
     label = outcome.get(
         "label",
-        "UNCLEAR"
+        "UNCLEAR",
     )
 
     return_pct = safe_float(
@@ -2412,10 +2981,15 @@ def build_outcome_alert(
         "📊 RUNNER RESEARCH UPDATE\n\n"
 
         f"🪙 {event['symbol']}\n"
+
         f"⏱ {timeframe}\n"
+
         f"🏷 {label}\n"
+
         f"MC: {format_money(mc)}\n"
-        f"Move: {format_pct(return_pct)}\n"
+
+        f"Move: "
+        f"{format_pct(return_pct)}\n"
     )
 
 
@@ -2430,12 +3004,13 @@ def scan_once():
     if not pairs:
 
         print(
-            "No pairs discovered."
+            "No DEX Screener pairs discovered."
         )
 
         return
 
     candidates = 0
+    analyzed = 0
     ignitions = 0
 
     for pair in pairs:
@@ -2447,7 +3022,15 @@ def scan_once():
         )
 
         if not snapshot:
+
             continue
+
+        # ----------------------------------------------------
+        # Observe before filtering.
+        #
+        # This allows the bot to build history around tokens
+        # that enter the observation band.
+        # ----------------------------------------------------
 
         record_snapshot(
             snapshot
@@ -2461,8 +3044,12 @@ def scan_once():
             "liquidity_usd"
         ]
 
+        age = snapshot[
+            "age_hours"
+        ]
+
         # ----------------------------------------------------
-        # RUNNER FILTER
+        # HARD FILTERS
         # ----------------------------------------------------
 
         if not (
@@ -2479,6 +3066,12 @@ def scan_once():
 
             continue
 
+        if age > (
+            MAX_PAIR_AGE_HOURS
+        ):
+
+            continue
+
         candidates += 1
 
         analysis = analyze(
@@ -2486,7 +3079,10 @@ def scan_once():
         )
 
         if not analysis:
+
             continue
+
+        analyzed += 1
 
         symbol = snapshot[
             "symbol"
@@ -2495,22 +3091,15 @@ def scan_once():
         print(
             f"[TRACK] "
             f"{symbol:<12} "
-            f"MC={format_money(mc):>10} "
-            f"5mVol="
-            f"{format_money(snapshot['volume_5m']):>9} "
-            f"Buy/Sell="
-            f"{snapshot['buys_5m']}/"
-            f"{snapshot['sells_5m']} "
-            f"1mAcc="
-            f"{analysis['accel_1m']:.1f}% "
-            f"2mAcc="
-            f"{analysis['accel_2m']:.1f}% "
-            f"MC="
-            f"{analysis['mc_move']:.1f}% "
-            f"State="
-            f"{analysis['state']} "
-            f"Score="
-            f"{analysis['score']}"
+            f"Age={age:>5.1f}h "
+            f"MC={format_money(mc):>9} "
+            f"Liq={format_money(liquidity):>9} "
+            f"5mVol={format_money(snapshot['volume_5m']):>9} "
+            f"Buy%={analysis['buy_percentage']:>5.1f} "
+            f"Act={analysis['activity_acceleration']:>6.1f}% "
+            f"MC={analysis['mc_move']:>6.1f}% "
+            f"State={analysis['state']:<17} "
+            f"Score={analysis['score']:>3}/100"
         )
 
         # ----------------------------------------------------
@@ -2524,9 +3113,11 @@ def scan_once():
             == "IGNITION"
         ):
 
-            created = create_ignition(
-                snapshot,
-                analysis,
+            created = (
+                create_ignition(
+                    snapshot,
+                    analysis,
+                )
             )
 
             if created:
@@ -2534,10 +3125,15 @@ def scan_once():
                 ignitions += 1
 
                 print(
-                    f"🔥 IGNITION: "
-                    f"{symbol} "
-                    f"MC={format_money(mc)} "
-                    f"Score={analysis['score']}"
+                    "🔥 IGNITION:",
+                    symbol,
+                    format_money(
+                        mc
+                    ),
+                    "score=",
+                    analysis[
+                        "score"
+                    ],
                 )
 
                 broadcast(
@@ -2548,7 +3144,7 @@ def scan_once():
                 )
 
         # ----------------------------------------------------
-        # UPDATE EXISTING IGNITION
+        # UPDATE IGNITION
         # ----------------------------------------------------
 
         event = update_ignition(
@@ -2559,22 +3155,23 @@ def scan_once():
 
             outcomes = event.get(
                 "outcomes",
-                {}
+                {},
             )
 
-            # Notify when each milestone
-            # is first reached.
-            for timeframe in [
+            for timeframe in (
                 "5m",
                 "15m",
                 "30m",
-            ]:
+            ):
 
-                outcome = outcomes.get(
-                    timeframe
+                outcome = (
+                    outcomes.get(
+                        timeframe
+                    )
                 )
 
                 if not outcome:
+
                     continue
 
                 notification_key = (
@@ -2599,51 +3196,90 @@ def scan_once():
                 )
 
     print(
-        f"Scan complete | "
-        f"discovered={len(pairs)} | "
-        f"runner_candidates={candidates} | "
-        f"new_ignitions={ignitions}"
+        "\n"
+        f"SCAN COMPLETE | "
+        f"DEX pairs={len(pairs)} | "
+        f"candidates={candidates} | "
+        f"analyzed={analyzed} | "
+        f"new ignitions={ignitions}"
     )
 
     save_state()
 
 
 # ============================================================
-# STARTUP
+# CONFIG
 # ============================================================
 
 def print_config():
 
     print(
         "\n"
-        "==================================================\n"
-        f"        RUNNER BOT {BOT_VERSION}\n"
-        "==================================================\n"
-        f"Runner range: "
-        f"${MIN_MC / 1000:.0f}K-"
-        f"${MAX_MC / 1000:.0f}K\n"
-        f"Minimum liquidity: "
-        f"${MIN_LIQUIDITY / 1000:.0f}K\n"
-        f"5m volume: FEATURE, NOT HARD GATE\n"
-        f"Scan interval: "
-        f"{SCAN_INTERVAL_SECONDS}s\n"
-        f"Discovery refresh: "
-        f"{DISCOVERY_INTERVAL_SECONDS}s\n"
-        f"Discovery sources:\n"
-        f"  • GeckoTerminal top pools\n"
-        f"  • GeckoTerminal new pools\n"
-        f"  • GeckoTerminal trending pools\n"
-        f"Observation range: "
-        f"${OBSERVE_MIN_MC / 1000:.0f}K-"
-        f"${OBSERVE_MAX_MC / 1000:.0f}K\n"
-        f"Activity model: "
-        f"1m + 2m acceleration\n"
-        f"Ignition score threshold: 7\n"
-        f"Telegram alerts: "
-        f"{'ON' if HEATING_ALERTS_ENABLED else 'OFF'}\n"
-        "==================================================\n"
+        "========================================================\n"
+        f"              RUNNER BOT {BOT_VERSION}\n"
+        "========================================================\n"
+
+        "DATA SOURCE:\n"
+        "  • DEX Screener only\n"
+
+        "DISCOVERY:\n"
+        "  • Latest DEX Screener token profiles\n"
+        "  • Latest DEX Screener boosts\n"
+        "  • Top DEX Screener boosts\n"
+        "  • Previously discovered tokens retained\n"
+
+        "MARKET:\n"
+        "  • Solana only\n"
+
+        f"RUNNER RANGE:\n"
+        f"  • MC: ${MIN_MC/1000:.0f}K"
+        f"-${MAX_MC/1000:.0f}K\n"
+
+        f"  • Liquidity >= "
+        f"${MIN_LIQUIDITY/1000:.0f}K\n"
+
+        f"  • Pair age <= "
+        f"{MAX_PAIR_AGE_HOURS:.0f}h\n"
+
+        "  • 5m volume = FEATURE, NOT HARD GATE\n"
+        "  • Buy/sell = SCORE, NOT HARD GATE\n"
+
+        "SIGNALS:\n"
+        "  • Early age\n"
+        "  • Low MC\n"
+        "  • Liquidity\n"
+        "  • 5m volume\n"
+        "  • Buy participation\n"
+        "  • Transaction participation\n"
+        "  • Consolidation\n"
+        "  • Breakout\n"
+        "  • Activity acceleration\n"
+        "  • Liquidity stability\n"
+        "  • Vertical-pump penalty\n"
+
+        "IGNITION:\n"
+        "  • Score >= 70/100\n"
+        "  • Breakout\n"
+        "  • Activity expansion\n"
+        "  • Buy participation >= 50%\n"
+
+        "TRACKING:\n"
+        "  • +5m\n"
+        "  • +15m\n"
+        "  • +30m\n"
+        "  • Peak MC\n"
+        "  • Max drawdown\n"
+
+        f"SCAN INTERVAL:\n"
+        f"  • {SCAN_INTERVAL_SECONDS}s\n"
+
+        "========================================================\n"
     )
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
@@ -2662,16 +3298,16 @@ def main():
 
         print(
             "WARNING: "
-            "HEATING_ALERTS_ENABLED is false."
+            "HEATING_ALERTS_ENABLED=false"
         )
 
     print(
-        "Runner Engine "
-        f"{BOT_VERSION} is online"
+        f"Runner Engine {BOT_VERSION} "
+        "is online."
     )
 
     # --------------------------------------------------------
-    # Initial discovery
+    # Initial DEX Screener discovery
     # --------------------------------------------------------
 
     try:
@@ -2683,13 +3319,9 @@ def main():
     except Exception as exc:
 
         print(
-            f"Initial discovery error: "
-            f"{exc}"
+            "Initial discovery error:",
+            exc,
         )
-
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
 
     next_scan = 0.0
 
@@ -2727,8 +3359,8 @@ def main():
         except Exception as exc:
 
             print(
-                f"Main loop error: "
-                f"{exc}"
+                "Main loop error:",
+                exc,
             )
 
         elapsed = (
@@ -2750,5 +3382,10 @@ def main():
         )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
