@@ -9,11 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
-# RUNNER BOT V4.6
-# EARLY MC BIAS + PERSISTENT REJECTION TRACKING
+# RUNNER BOT V4.6.1
+# BALANCED EXTENDED-MC TEST + PERSISTENT TRACKING
 # ============================================================
 
-BOT_VERSION = "V4.6-EARLY-MC-TRACKING"
+BOT_VERSION = "V4.6.1-EXTENDED-MC-TEST"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
@@ -47,7 +47,7 @@ SCAN_INTERVAL_SECONDS = int(
 
 
 # ============================================================
-# EXACT V4.6 DECISION-TREE SETTINGS
+# DECISION-TREE SETTINGS
 # ============================================================
 
 # ------------------------------------------------------------
@@ -78,35 +78,32 @@ MAX_AGE_HOURS = 48.0
 
 
 # ============================================================
-# 4. MARKET CAP — V4.6.1 BALANCED EXTENDED-MC TEST
+# 4. MARKET CAP
 # ============================================================
 
 MIN_MC = 7_000
 
-# Normal MC zone
+# Normal MC zone:
+# $7K - $95K
 MAX_MC_NORMAL = 95_000
 
-# Extended MC zone
+# Extended MC zone:
+# >$95K - $140K
 MAX_MC_EXTENDED = 140_000
 
+
 # ============================================================
-# 5. CORE MOMENTUM — V4.6.1
+# 5. CORE MOMENTUM
 # ============================================================
 
+# Normal MC requirements
 MIN_FLOW = 1_200
 MIN_FLOW_MC_PCT = 8.0
 
-# Extended-MC requirements
+# Extended MC requirements
 EXTENDED_MIN_FLOW = 3_000
 EXTENDED_FLOW_MC_PCT = 8.0
 EXTENDED_MIN_BUY_SELL = 1.50
-# ============================================================
-# 5. CORE MOMENTUM — V4.6 BALANCED
-# ============================================================
-
-MIN_FLOW = 1_200
-
-MIN_FLOW_MC_PCT = 8.0
 
 
 # ------------------------------------------------------------
@@ -157,10 +154,7 @@ DEX_BATCH_SIZE = 25
 # TRACKING
 # ============================================================
 
-# Persistent rejection history.
 MAX_REJECTION_HISTORY = 5000
-
-# Persistent scan-level history.
 MAX_SCAN_TRACKING_HISTORY = 1000
 
 
@@ -179,6 +173,7 @@ DEBUG_MODE = (
 DEBUG_TOP_CANDIDATES = 10
 
 # Performance/noise pre-filter ONLY.
+# These are NOT decision-tree rejection criteria.
 PRE_FILTER_MIN_VOLUME_5M = 500
 PRE_FILTER_MIN_ABS_FLOW_USD = 500
 
@@ -208,7 +203,7 @@ def http_get_json(
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "RunnerBot/4.6",
+                "User-Agent": f"RunnerBot/{BOT_VERSION}",
                 "Accept": "application/json",
             },
         )
@@ -302,29 +297,20 @@ def default_tracking_state() -> Dict[str, Any]:
 
     return {
         "total_scans": 0,
-
         "total_discovered": 0,
-
         "total_prefiltered": 0,
-
         "total_processed": 0,
-
         "total_rejected": 0,
-
         "total_qualified": 0,
 
         "rejection_counts": {},
-
         "qualification_counts": {},
 
         "recent_rejections": [],
-
         "recent_qualifications": [],
-
         "recent_scans": [],
 
         "created_at": iso_now(),
-
         "updated_at": iso_now(),
     }
 
@@ -344,7 +330,6 @@ def default_state() -> Dict[str, Any]:
         "created_at": iso_now(),
         "updated_at": iso_now(),
 
-        # Persistent V4.6 tracking.
         "tracking": default_tracking_state(),
     }
 
@@ -373,10 +358,6 @@ def load_state() -> Dict[str, Any]:
             if key not in state:
                 state[key] = value
 
-        # ----------------------------------------------------
-        # Ensure tracking exists.
-        # ----------------------------------------------------
-
         if not isinstance(
             state.get("tracking"),
             dict,
@@ -394,10 +375,6 @@ def load_state() -> Dict[str, Any]:
 
             if key not in state["tracking"]:
                 state["tracking"][key] = value
-
-        # ----------------------------------------------------
-        # Compatibility cleanup.
-        # ----------------------------------------------------
 
         if not isinstance(
             state["tracking"].get(
@@ -1024,7 +1001,7 @@ def print_tracking_summary() -> None:
     )
 
     print(
-        "[V4.6 PERSISTENT TRACKING]"
+        f"[{BOT_VERSION} PERSISTENT TRACKING]"
     )
 
     print(
@@ -1109,7 +1086,7 @@ def print_tracking_summary() -> None:
             )
 
             print(
-                f"{reason:<40} "
+                f"{reason:<45} "
                 f"{count:>7,} "
                 f"({percentage:>5.1f}%)"
             )
@@ -1145,7 +1122,7 @@ def print_tracking_summary() -> None:
         ):
 
             print(
-                f"{strength:<40} "
+                f"{strength:<45} "
                 f"{count:>7,}"
             )
 
@@ -1271,11 +1248,15 @@ def tracking_text() -> str:
     lines.extend(
         [
             "",
-            "V4.6 MC:",
-            "• Min: $7K",
-            "• Normal max: $90K",
-            "• Extended max: $140K",
-            "• Extended Flow/MC: 14%",
+            f"{BOT_VERSION} SETTINGS:",
+            "• Minimum MC: $7K",
+            "• Normal MC max: $95K",
+            "• Extended MC max: $140K",
+            "• Normal Flow: ≥$1.2K",
+            "• Normal Flow/MC: ≥8%",
+            "• Extended Flow: ≥$3K",
+            "• Extended Flow/MC: ≥8%",
+            "• Extended Buy/Sell: ≥1.50x",
         ]
     )
 
@@ -1773,7 +1754,7 @@ def pair_to_snapshot(
     #
     # 5m Volume × ((Buys - Sells) / Total Transactions)
     #
-    # NOT actual dollar net flow.
+    # This is NOT actual dollar net flow.
     # ========================================================
 
     if total_tx > 0:
@@ -2097,7 +2078,7 @@ def build_decision_token(
 
 
 # ============================================================
-# EXACT V4.6 QUALIFICATION ENGINE
+# QUALIFICATION ENGINE
 # ============================================================
 
 def evaluate_token(
@@ -2109,33 +2090,56 @@ def evaluate_token(
     int,
 ]:
 
-    mc = token.get(
-        "mc",
-        0,
+    mc = safe_float(
+        token.get(
+            "mc",
+            0,
+        ),
+        0.0,
     )
 
     liq = token.get(
         "liquidity"
     )
 
-    age_h = token.get(
-        "age_hours",
-        999,
+    age_h = safe_float(
+        token.get(
+            "age_hours",
+            999,
+        ),
+        999.0,
     )
 
-    vol_5m = token.get(
-        "volume_5m",
-        0,
+    vol_5m = safe_float(
+        token.get(
+            "volume_5m",
+            0,
+        ),
+        0.0,
     )
 
-    flow = token.get(
-        "net_flow_5m",
-        0,
+    flow = safe_float(
+        token.get(
+            "net_flow_5m",
+            0,
+        ),
+        0.0,
     )
 
-    flow_mc = token.get(
-        "flow_mc_pct",
-        0,
+    flow_mc = safe_float(
+        token.get(
+            "flow_mc_pct",
+            0,
+        ),
+        0.0,
+    )
+
+    buy_sell_ratio = safe_float(
+        token.get(
+            "buy_sell_ratio",
+            0,
+        ),
+        0.0,
     )
 
     dex = str(
@@ -2174,13 +2178,16 @@ def evaluate_token(
 
     if (
         liq is not None
-        and liq >= MIN_LIQUIDITY
+        and safe_float(
+            liq,
+            0.0,
+        ) >= MIN_LIQUIDITY
     ):
 
-        liquidity_reason = "OK"
+        liquidity_reason = "NORMAL_LIQUIDITY"
 
     elif (
-        (liq is None or liq == 0)
+        (liq is None or safe_float(liq, 0.0) <= 0)
         and is_pumpfun
     ):
 
@@ -2227,7 +2234,7 @@ def evaluate_token(
         )
 
     # --------------------------------------------------------
-    # 4. MARKET CAP — V4.6
+    # 4. MARKET CAP
     # --------------------------------------------------------
 
     if mc < MIN_MC:
@@ -2252,44 +2259,78 @@ def evaluate_token(
         mc > MAX_MC_NORMAL
     )
 
-    if (
-        extended_mc
-        and flow_mc < EXTENDED_MC_MIN_FLOW_PCT
-    ):
-
-        return (
-            False,
-            None,
-            "MC_EXTENDED_BUT_FLOWMC_BELOW_14PCT",
-            0,
-        )
-
     # --------------------------------------------------------
-    # 5. CORE MOMENTUM
+    # 5. NORMAL MC ZONE
+    #
+    # $7K - $95K
+    #
+    # Requirements:
+    # Flow >= $1,200
+    # Flow/MC >= 8%
     # --------------------------------------------------------
 
-    if flow < MIN_FLOW:
+    if not extended_mc:
 
-        return (
-            False,
-            None,
-            "FLOW_BELOW_1500",
-            0,
-        )
+        if flow < MIN_FLOW:
 
-    if flow_mc < MIN_FLOW_MC_PCT:
+            return (
+                False,
+                None,
+                "FLOW_BELOW_1200",
+                0,
+            )
 
-        return (
-            False,
-            None,
-            "FLOW_MC_BELOW_8PCT",
-            0,
-        )
+        if flow_mc < MIN_FLOW_MC_PCT:
 
-    # Volume/Flow and Buy/Sell remain SOFT.
+            return (
+                False,
+                None,
+                "FLOW_MC_BELOW_8PCT",
+                0,
+            )
 
     # --------------------------------------------------------
-    # 6. STRENGTH
+    # 6. EXTENDED MC ZONE
+    #
+    # >$95K - $140K
+    #
+    # Requirements:
+    # Flow >= $3,000
+    # Flow/MC >= 8%
+    # Buy/Sell >= 1.50x
+    # --------------------------------------------------------
+
+    else:
+
+        if flow < EXTENDED_MIN_FLOW:
+
+            return (
+                False,
+                None,
+                "EXTENDED_FLOW_BELOW_3000",
+                0,
+            )
+
+        if flow_mc < EXTENDED_FLOW_MC_PCT:
+
+            return (
+                False,
+                None,
+                "EXTENDED_FLOW_MC_BELOW_8PCT",
+                0,
+            )
+
+        if buy_sell_ratio < EXTENDED_MIN_BUY_SELL:
+
+            return (
+                False,
+                None,
+                "EXTENDED_BUY_SELL_BELOW_1.50",
+                0,
+            )
+
+    # --------------------------------------------------------
+    # 7. SIGNAL STRENGTH
     # --------------------------------------------------------
 
     if (
@@ -2318,7 +2359,8 @@ def evaluate_token(
         strength,
         (
             f"QUALIFIED_{strength} | "
-            f"Liq={liquidity_reason}"
+            f"Liq={liquidity_reason} | "
+            f"MC={'EXTENDED' if extended_mc else 'NORMAL'}"
         ),
         needed_obs,
     )
@@ -2387,7 +2429,7 @@ def ranking_key(
 
 
 # ============================================================
-# NEAR MISSES / REJECTIONS
+# REJECTIONS
 # ============================================================
 
 def print_near_misses(
@@ -2848,7 +2890,7 @@ def telegram_api(
             url,
             data=data,
             headers={
-                "User-Agent": "RunnerBot/4.6",
+                "User-Agent": f"RunnerBot/{BOT_VERSION}",
             },
         )
 
@@ -3617,17 +3659,23 @@ def status_text() -> str:
         f"3. Age:\n"
         f"• ≤48h\n\n"
 
-        f"4. Market Cap — V4.6:\n"
-        f"• ≥$7K\n"
-        f"• ≤$90K normal\n"
-        f"• ≤$140K extended\n"
-        f"• Extended requires Flow/MC ≥14%\n\n"
+        f"4. Market Cap — V4.6.1:\n"
+        f"• Minimum: $7K\n"
+        f"• Normal max: $95K\n"
+        f"• Extended max: $140K\n\n"
 
-        f"5. Core Flow:\n"
-        f"• Flow ≥$1.5K\n"
+        f"Normal MC requirements:\n"
+        f"• Flow ≥$1.2K\n"
+        f"• Flow/MC ≥8%\n\n"
+
+        f"Extended MC requirements:\n"
+        f"• Flow ≥$3K\n"
         f"• Flow/MC ≥8%\n"
-        f"• Volume/Flow = SOFT\n"
-        f"• Buy/Sell = SOFT\n\n"
+        f"• Buy/Sell ≥1.50x\n\n"
+
+        f"Soft metrics:\n"
+        f"• Volume/Flow ≥1.25x preferred only\n"
+        f"• Buy/Sell ≥1.50x preferred only\n\n"
 
         f"6. Strength:\n"
         f"• ULTRA: ≥25% Flow/MC OR ≥$25K flow → 1\n"
@@ -3769,12 +3817,6 @@ def handle_command(
 # ============================================================
 
 def telegram_poll() -> bool:
-
-    """
-    Returns:
-        True  = polling succeeded
-        False = polling failed/conflict
-    """
 
     if not TELEGRAM_BOT_TOKEN:
         return False
@@ -3974,9 +4016,6 @@ def scan_once() -> None:
 
         # ----------------------------------------------------
         # PERFORMANCE PRE-FILTER
-        #
-        # These are deliberately NOT counted as decision-tree
-        # rejections.
         # ----------------------------------------------------
 
         if not passes_pre_filter(
@@ -4009,7 +4048,7 @@ def scan_once() -> None:
                 )
 
         # ----------------------------------------------------
-        # EXACT DECISION TREE
+        # DECISION TREE
         # ----------------------------------------------------
 
         analysis = analyze(
@@ -4026,10 +4065,6 @@ def scan_once() -> None:
                 "UNKNOWN",
             )
 
-            # ------------------------------------------------
-            # PERSISTENT REJECTION TRACKING
-            # ------------------------------------------------
-
             add_rejection_tracking(
                 snapshot,
                 reason,
@@ -4045,7 +4080,7 @@ def scan_once() -> None:
             continue
 
         # ----------------------------------------------------
-        # PERSISTENT QUALIFICATION TRACKING
+        # QUALIFICATION TRACKING
         # ----------------------------------------------------
 
         add_qualification_tracking(
@@ -4236,21 +4271,23 @@ def main() -> None:
     )
 
     print(
-        "MC V4.6 EARLY BIAS: "
+        "MC V4.6.1: "
         f"${MIN_MC:,} - "
         f"${MAX_MC_NORMAL:,} normal / "
         f"${MAX_MC_EXTENDED:,} extended"
     )
 
     print(
-        "Extended MC Flow/MC: "
-        f">= {EXTENDED_MC_MIN_FLOW_PCT}%"
+        "Normal MC: "
+        f"Flow >=${MIN_FLOW:,} | "
+        f"Flow/MC >= {MIN_FLOW_MC_PCT}%"
     )
 
     print(
-        "Core Flow: "
-        f">=${MIN_FLOW:,} | "
-        f"Flow/MC >= {MIN_FLOW_MC_PCT}%"
+        "Extended MC: "
+        f"Flow >=${EXTENDED_MIN_FLOW:,} | "
+        f"Flow/MC >= {EXTENDED_FLOW_MC_PCT}% | "
+        f"Buy/Sell >= {EXTENDED_MIN_BUY_SELL:.2f}x"
     )
 
     print(
@@ -4258,7 +4295,8 @@ def main() -> None:
     )
 
     print(
-        "Buy/Sell: SOFT ONLY"
+        "Buy/Sell: SOFT ONLY "
+        "(except extended-MC requirement)"
     )
 
     print(
