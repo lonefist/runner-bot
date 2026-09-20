@@ -2,6 +2,9 @@ name: Runner Bot
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   runner-bot:
