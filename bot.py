@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# RUNNER BOT V4.2
+# RUNNER BOT V4.3
 # DEX SCREENER FIRST
+# CONFIRMATION LAYER
 # ============================================================
 
-BOT_VERSION = "V4.2-BATCH"
+BOT_VERSION = "V4.3-BATCH"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
@@ -60,6 +61,25 @@ MAX_CONSOLIDATION_RANGE_PCT = 18.0
 
 
 # ============================================================
+# CONFIRMATION
+# ============================================================
+
+# First ignition does NOT immediately alert.
+# It becomes PENDING.
+
+REQUIRED_CONSECUTIVE_IGNITIONS = 2
+
+# Alternative confirmation:
+# MC must rise by at least this percentage from
+# the MC recorded at the first ignition.
+
+CONFIRMATION_MC_INCREASE_PCT = 10.0
+
+# A pending ignition expires after this amount of time.
+CONFIRMATION_TIMEOUT_SECONDS = 300
+
+
+# ============================================================
 # SCANNING
 # ============================================================
 
@@ -72,7 +92,6 @@ DISCOVERY_INTERVAL_SECONDS = 60
 MAX_DISCOVERY_TOKENS = 500
 
 # DexScreener token endpoint supports multiple addresses.
-# Keep batches conservative.
 TOKEN_BATCH_SIZE = 25
 
 
@@ -111,6 +130,7 @@ state: Dict[str, Any] = {
     "subscribers": [],
     "tokens": {},
     "alerts": {},
+    "confirmations": {},
     "telegram_offset": None,
 }
 
@@ -137,12 +157,14 @@ def safe_float(
 ) -> float:
 
     try:
+
         if value is None:
             return default
 
         return float(value)
 
     except Exception:
+
         return default
 
 
@@ -152,16 +174,20 @@ def safe_int(
 ) -> int:
 
     try:
+
         if value is None:
             return default
 
         return int(value)
 
     except Exception:
+
         return default
 
 
-def format_money(value: Any) -> str:
+def format_money(
+    value: Any
+) -> str:
 
     value = safe_float(value)
 
@@ -182,7 +208,9 @@ def load_state() -> None:
 
     global state
 
-    if not os.path.exists(STATE_FILE):
+    if not os.path.exists(
+        STATE_FILE
+    ):
         return
 
     try:
@@ -195,8 +223,14 @@ def load_state() -> None:
 
             loaded = json.load(f)
 
-        if isinstance(loaded, dict):
-            state.update(loaded)
+        if isinstance(
+            loaded,
+            dict
+        ):
+
+            state.update(
+                loaded
+            )
 
     except Exception as e:
 
@@ -208,19 +242,37 @@ def load_state() -> None:
         state.get("subscribers"),
         list
     ):
-        state["subscribers"] = []
+
+        state[
+            "subscribers"
+        ] = []
 
     if not isinstance(
         state.get("tokens"),
         dict
     ):
-        state["tokens"] = {}
+
+        state[
+            "tokens"
+        ] = {}
 
     if not isinstance(
         state.get("alerts"),
         dict
     ):
-        state["alerts"] = {}
+
+        state[
+            "alerts"
+        ] = {}
+
+    if not isinstance(
+        state.get("confirmations"),
+        dict
+    ):
+
+        state[
+            "confirmations"
+        ] = {}
 
 
 def save_state() -> None:
@@ -253,7 +305,9 @@ def save_state() -> None:
 def http_json(
     url: str,
     method: str = "GET",
-    payload: Optional[Dict[str, Any]] = None,
+    payload: Optional[
+        Dict[str, Any]
+    ] = None,
 ) -> Optional[Any]:
 
     for attempt in range(
@@ -267,7 +321,8 @@ def http_json(
             headers = {
                 "User-Agent":
                     "Mozilla/5.0 "
-                    "RunnerBot/4.2",
+                    "RunnerBot/4.3",
+
                 "Accept":
                     "application/json",
             }
@@ -276,7 +331,9 @@ def http_json(
 
                 data = json.dumps(
                     payload
-                ).encode("utf-8")
+                ).encode(
+                    "utf-8"
+                )
 
                 headers[
                     "Content-Type"
@@ -294,11 +351,15 @@ def http_json(
                 timeout=HTTP_TIMEOUT
             ) as response:
 
-                raw = response.read().decode(
-                    "utf-8"
+                raw = (
+                    response
+                    .read()
+                    .decode("utf-8")
                 )
 
-                return json.loads(raw)
+                return json.loads(
+                    raw
+                )
 
         except urllib.error.HTTPError as e:
 
@@ -313,7 +374,10 @@ def http_json(
                 429,
             ):
 
-                if attempt < HTTP_RETRIES - 1:
+                if (
+                    attempt
+                    < HTTP_RETRIES - 1
+                ):
 
                     time.sleep(
                         HTTP_BACKOFF_SECONDS
@@ -326,7 +390,10 @@ def http_json(
 
         except Exception as e:
 
-            if attempt == HTTP_RETRIES - 1:
+            if (
+                attempt
+                == HTTP_RETRIES - 1
+            ):
 
                 print(
                     f"[HTTP ERROR] "
@@ -397,11 +464,14 @@ def discover_tokens() -> List[str]:
             )
 
             if address:
+
                 addresses.add(
                     str(address)
                 )
 
-    tokens = list(addresses)
+    tokens = list(
+        addresses
+    )
 
     print(
         f"[DISCOVERY] "
@@ -415,12 +485,6 @@ def discover_tokens() -> List[str]:
 
 # ============================================================
 # BATCH TOKEN LOOKUP
-#
-# THIS REPLACES THE BROKEN:
-# /token-pairs/solana/{token}
-#
-# WITH:
-# /latest/dex/tokens/{token1,token2,...}
 # ============================================================
 
 def get_token_pairs_batch(
@@ -453,7 +517,9 @@ def get_token_pairs_batch(
             f"{address_string}"
         )
 
-        data = http_json(url)
+        data = http_json(
+            url
+        )
 
         if not isinstance(
             data,
@@ -493,8 +559,9 @@ def get_token_pairs_batch(
                 pair
             )
 
-        # Small pause between batches.
-        time.sleep(0.25)
+        time.sleep(
+            0.25
+        )
 
     return all_pairs
 
@@ -519,7 +586,9 @@ def choose_best_pairs(
         )
 
         token_address = (
-            base.get("address")
+            base.get(
+                "address"
+            )
         )
 
         if not token_address:
@@ -533,11 +602,15 @@ def choose_best_pairs(
         )
 
         liquidity_usd = safe_float(
-            liquidity.get("usd")
+            liquidity.get(
+                "usd"
+            )
         )
 
-        current = best_by_token.get(
-            token_address
+        current = (
+            best_by_token.get(
+                token_address
+            )
         )
 
         if current is None:
@@ -906,11 +979,13 @@ def record_snapshot(
                     "symbol",
                     "UNKNOWN"
                 ),
+
             "name":
                 snapshot.get(
                     "name",
                     ""
                 ),
+
             "history":
                 [],
         }
@@ -956,8 +1031,10 @@ def calculate_structure(
         return {
             "breakout":
                 False,
+
             "consolidation":
                 False,
+
             "range_pct":
                 0,
         }
@@ -968,11 +1045,15 @@ def calculate_structure(
 
     prices = [
         safe_float(
-            x.get("price")
+            x.get(
+                "price"
+            )
         )
         for x in recent
         if safe_float(
-            x.get("price")
+            x.get(
+                "price"
+            )
         ) > 0
     ]
 
@@ -981,14 +1062,21 @@ def calculate_structure(
         return {
             "breakout":
                 False,
+
             "consolidation":
                 False,
+
             "range_pct":
                 0,
         }
 
-    low = min(prices)
-    high = max(prices)
+    low = min(
+        prices
+    )
+
+    high = max(
+        prices
+    )
 
     range_pct = (
         (
@@ -1198,68 +1286,107 @@ def score_token(
 
     # MC
     if 20_000 <= mc <= 150_000:
+
         score += 15
+
     elif mc <= 300_000:
+
         score += 10
 
     # Liquidity
     if liquidity >= 30_000:
+
         score += 15
+
     elif liquidity >= 20_000:
+
         score += 12
+
     elif liquidity >= 10_000:
+
         score += 8
 
     # Volume
     if volume >= 20_000:
+
         score += 15
+
     elif volume >= 10_000:
+
         score += 12
+
     elif volume >= 5_000:
+
         score += 8
+
     elif volume >= 2_500:
+
         score += 4
 
     # Buys
     if buy_percent >= 65:
+
         score += 15
+
     elif buy_percent >= 55:
+
         score += 11
+
     elif buy_percent >= 45:
+
         score += 7
+
     elif buy_percent >= 35:
+
         score += 3
 
     # Transactions
     if tx >= 100:
+
         score += 10
+
     elif tx >= 50:
+
         score += 8
+
     elif tx >= 25:
+
         score += 5
+
     elif tx >= 10:
+
         score += 2
 
     # Age
     if age <= 6:
+
         score += 10
+
     elif age <= 12:
+
         score += 7
+
     elif age <= 24:
+
         score += 4
 
     # Structure
     if breakout:
+
         score += 10
 
     # Activity
     if activity:
+
         score += 10
 
     # Extreme vertical move penalty
     if price_change > 40:
+
         score -= 10
+
     elif price_change > 25:
+
         score -= 5
 
     return max(
@@ -1367,6 +1494,458 @@ def analyze(
 
 
 # ============================================================
+# MC CHANGE HELPERS
+# ============================================================
+
+def get_first_observation_mc(
+    token_address: str
+) -> float:
+
+    history = get_history(
+        token_address
+    )
+
+    if not history:
+        return 0
+
+    for item in history:
+
+        mc = safe_float(
+            item.get(
+                "market_cap"
+            )
+        )
+
+        if mc > 0:
+            return mc
+
+    return 0
+
+
+def percentage_change(
+    old_value: float,
+    new_value: float
+) -> float:
+
+    old_value = safe_float(
+        old_value
+    )
+
+    new_value = safe_float(
+        new_value
+    )
+
+    if old_value <= 0:
+        return 0
+
+    return (
+        (
+            new_value
+            - old_value
+        )
+        / old_value
+    ) * 100
+
+
+# ============================================================
+# CONFIRMATION HELPERS
+# ============================================================
+
+def get_confirmation(
+    address: str
+) -> Optional[Dict[str, Any]]:
+
+    return state[
+        "confirmations"
+    ].get(
+        address
+    )
+
+
+def clear_confirmation(
+    address: str
+) -> None:
+
+    if address in state[
+        "confirmations"
+    ]:
+
+        del state[
+            "confirmations"
+        ][address]
+
+
+def start_confirmation(
+    snapshot: Dict[str, Any],
+    analysis: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    address = snapshot[
+        "token_address"
+    ]
+
+    mc = safe_float(
+        snapshot.get(
+            "market_cap"
+        )
+    )
+
+    confirmation = {
+        "symbol":
+            snapshot.get(
+                "symbol",
+                "UNKNOWN"
+            ),
+
+        "started_at":
+            now_ts(),
+
+        "started_at_iso":
+            now_iso(),
+
+        "ignition_mc":
+            mc,
+
+        "ignition_score":
+            analysis.get(
+                "score",
+                0
+            ),
+
+        "consecutive_ignitions":
+            1,
+
+        "last_ignition_at":
+            now_ts(),
+
+        "last_ignition_mc":
+            mc,
+
+        "status":
+            "PENDING",
+    }
+
+    state[
+        "confirmations"
+    ][address] = confirmation
+
+    return confirmation
+
+
+def confirmation_result(
+    snapshot: Dict[str, Any],
+    analysis: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    address = snapshot[
+        "token_address"
+    ]
+
+    mc = safe_float(
+        snapshot.get(
+            "market_cap"
+        )
+    )
+
+    current_time = now_ts()
+
+    pending = get_confirmation(
+        address
+    )
+
+    # --------------------------------------------------------
+    # NO PENDING CONFIRMATION
+    # --------------------------------------------------------
+
+    if pending is None:
+
+        if analysis.get(
+            "setup"
+        ) != "IGNITION":
+
+            return {
+                "status":
+                    "NONE",
+
+                "confirmed":
+                    False,
+
+                "method":
+                    "",
+            }
+
+        start_confirmation(
+            snapshot,
+            analysis
+        )
+
+        return {
+            "status":
+                "PENDING",
+
+            "confirmed":
+                False,
+
+            "method":
+                "",
+
+            "consecutive":
+                1,
+
+            "mc_change":
+                0,
+        }
+
+    # --------------------------------------------------------
+    # CHECK EXPIRATION
+    # --------------------------------------------------------
+
+    started_at = safe_float(
+        pending.get(
+            "started_at"
+        )
+    )
+
+    if (
+        started_at > 0
+        and
+        current_time
+        - started_at
+        > CONFIRMATION_TIMEOUT_SECONDS
+    ):
+
+        print(
+            f"[CONFIRMATION EXPIRED] "
+            f"{pending.get('symbol', 'UNKNOWN')}"
+        )
+
+        clear_confirmation(
+            address
+        )
+
+        # If current scan itself is ignition,
+        # start a completely new confirmation.
+        if analysis.get(
+            "setup"
+        ) == "IGNITION":
+
+            start_confirmation(
+                snapshot,
+                analysis
+            )
+
+            return {
+                "status":
+                    "PENDING",
+
+                "confirmed":
+                    False,
+
+                "method":
+                    "",
+
+                "consecutive":
+                    1,
+
+                "mc_change":
+                    0,
+            }
+
+        return {
+            "status":
+                "NONE",
+
+            "confirmed":
+                False,
+
+            "method":
+                "",
+        }
+
+    ignition_mc = safe_float(
+        pending.get(
+            "ignition_mc"
+        )
+    )
+
+    mc_change = percentage_change(
+        ignition_mc,
+        mc
+    )
+
+    # --------------------------------------------------------
+    # PATH 1
+    # CONSECUTIVE IGNITION
+    # --------------------------------------------------------
+
+    if analysis.get(
+        "setup"
+    ) == "IGNITION":
+
+        previous_count = safe_int(
+            pending.get(
+                "consecutive_ignitions"
+            )
+        )
+
+        # Avoid counting the original ignition twice.
+        consecutive = (
+            previous_count + 1
+        )
+
+        pending[
+            "consecutive_ignitions"
+        ] = consecutive
+
+        pending[
+            "last_ignition_at"
+        ] = current_time
+
+        pending[
+            "last_ignition_mc"
+        ] = mc
+
+        if (
+            consecutive
+            >= REQUIRED_CONSECUTIVE_IGNITIONS
+        ):
+
+            pending[
+                "status"
+            ] = "CONFIRMED"
+
+            pending[
+                "confirmation_method"
+            ] = (
+                "2 consecutive ignition scans"
+            )
+
+            return {
+                "status":
+                    "CONFIRMED",
+
+                "confirmed":
+                    True,
+
+                "method":
+                    "2 consecutive ignition scans",
+
+                "consecutive":
+                    consecutive,
+
+                "mc_change":
+                    mc_change,
+            }
+
+        return {
+            "status":
+                "PENDING",
+
+            "confirmed":
+                False,
+
+            "method":
+                "",
+
+            "consecutive":
+                consecutive,
+
+            "mc_change":
+                mc_change,
+        }
+
+    # --------------------------------------------------------
+    # PATH 2
+    # MC INCREASE CONFIRMATION
+    # --------------------------------------------------------
+
+    if (
+        mc_change
+        >= CONFIRMATION_MC_INCREASE_PCT
+    ):
+
+        # The token must still have an active runner
+        # structure. We do not confirm a token that simply
+        # went up once and then completely lost activity.
+
+        active_structure = (
+            analysis.get(
+                "breakout"
+            )
+            and
+            analysis.get(
+                "activity"
+            )
+        )
+
+        if active_structure:
+
+            pending[
+                "status"
+            ] = "CONFIRMED"
+
+            pending[
+                "confirmation_method"
+            ] = (
+                f"MC +{mc_change:.1f}% "
+                f"from ignition"
+            )
+
+            return {
+                "status":
+                    "CONFIRMED",
+
+                "confirmed":
+                    True,
+
+                "method":
+                    (
+                        f"MC +{mc_change:.1f}% "
+                        f"from ignition"
+                    ),
+
+                "consecutive":
+                    safe_int(
+                        pending.get(
+                            "consecutive_ignitions"
+                        )
+                    ),
+
+                "mc_change":
+                    mc_change,
+            }
+
+    # --------------------------------------------------------
+    # STILL PENDING
+    # --------------------------------------------------------
+
+    pending[
+        "status"
+    ] = "PENDING"
+
+    return {
+        "status":
+            "PENDING",
+
+        "confirmed":
+            False,
+
+        "method":
+            "",
+
+        "consecutive":
+            safe_int(
+                pending.get(
+                    "consecutive_ignitions"
+                )
+            ),
+
+        "mc_change":
+            mc_change,
+    }
+
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
@@ -1376,6 +1955,7 @@ def telegram(
 ) -> Optional[Any]:
 
     if not TELEGRAM_BOT_TOKEN:
+
         return None
 
     url = (
@@ -1539,6 +2119,9 @@ def process_telegram() -> None:
                     "DEX Screener-first\n"
                     "Solana scanner active\n"
                     "15-second scanning\n\n"
+                    "V4.3 confirmation layer active\n"
+                    "First ignition = pending\n"
+                    "2nd ignition or +10% MC = confirmation\n\n"
                     "/status\n"
                     "/alerts\n"
                     "/scan\n"
@@ -1598,18 +2181,28 @@ def process_telegram() -> None:
             send_message(
                 chat_id,
                 (
-                    "🚀 RUNNER BOT V4.2\n\n"
+                    "🚀 RUNNER BOT V4.3\n\n"
                     f"Tracked tokens: "
                     f"{len(state['tokens'])}\n"
                     f"Subscribers: "
                     f"{len(state['subscribers'])}\n"
+                    f"Pending confirmations: "
+                    f"{len(state['confirmations'])}\n"
+                    f"Confirmed alerts: "
+                    f"{len(state['alerts'])}\n"
                     f"Scan: "
                     f"{SCAN_INTERVAL_SECONDS:.0f}s\n"
                     f"MC: "
                     f"${MIN_MC:,} - "
                     f"${MAX_MC:,}\n"
                     f"Liquidity: "
-                    f"${MIN_LIQUIDITY:,}+"
+                    f"${MIN_LIQUIDITY:,}+\n\n"
+                    f"Confirmation:\n"
+                    f"• {REQUIRED_CONSECUTIVE_IGNITIONS} "
+                    f"consecutive ignitions OR\n"
+                    f"• +{CONFIRMATION_MC_INCREASE_PCT:.0f}% MC\n"
+                    f"• Timeout: "
+                    f"{CONFIRMATION_TIMEOUT_SECONDS // 60}m"
                 )
             )
 
@@ -1617,17 +2210,23 @@ def process_telegram() -> None:
 
 
 # ============================================================
-# ALERT
+# ALERT MESSAGE
 # ============================================================
 
 def ignition_message(
     snapshot: Dict[str, Any],
-    analysis: Dict[str, Any]
+    analysis: Dict[str, Any],
+    confirmation: Dict[str, Any]
 ) -> str:
 
     symbol = snapshot.get(
         "symbol",
         "UNKNOWN"
+    )
+
+    address = snapshot.get(
+        "token_address",
+        ""
     )
 
     mc = safe_float(
@@ -1694,25 +2293,99 @@ def ignition_message(
         ""
     )
 
+    first_mc = (
+        get_first_observation_mc(
+            address
+        )
+    )
+
+    mc_since_tracking = percentage_change(
+        first_mc,
+        mc
+    )
+
+    ignition_mc = safe_float(
+        state[
+            "confirmations"
+        ].get(
+            address,
+            {}
+        ).get(
+            "ignition_mc"
+        )
+    )
+
+    mc_since_ignition = percentage_change(
+        ignition_mc,
+        mc
+    )
+
+    if mc > 0:
+
+        volume_to_mc = (
+            volume / mc
+        ) * 100
+
+    else:
+
+        volume_to_mc = 0
+
+    method = confirmation.get(
+        "method",
+        "Confirmed"
+    )
+
     return (
-        "🔥 IGNITION DETECTED\n\n"
+        "🚨 CONFIRMED RUNNER\n\n"
+
         f"🪙 {symbol}\n\n"
+
         f"📊 Score: {score}/100\n"
-        f"💰 MC: {format_money(mc)}\n"
+
+        f"💰 MC: "
+        f"{format_money(mc)}\n"
+
         f"💧 Liquidity: "
         f"{format_money(liquidity)}\n"
+
         f"📈 5m Volume: "
         f"{format_money(volume)}\n"
-        f"🕐 Age: {age:.1f}h\n\n"
+
+        f"📊 5m Vol / MC: "
+        f"{volume_to_mc:.1f}%\n"
+
+        f"🕐 Age: "
+        f"{age:.1f}h\n\n"
+
         f"🟢 Buys: {buys}\n"
+
         f"🔴 Sells: {sells}\n"
-        f"📊 Buy %: {buy_pct:.1f}%\n"
-        f"⚖️ Ratio: {ratio:.2f}\n"
-        f"📈 5m Change: {change:+.1f}%\n\n"
+
+        f"📊 Buy %: "
+        f"{buy_pct:.1f}%\n"
+
+        f"⚖️ Ratio: "
+        f"{ratio:.2f}\n"
+
+        f"📈 5m Change: "
+        f"{change:+.1f}%\n\n"
+
         f"🚀 Breakout: YES\n"
-        f"⚡ Activity expansion: YES\n"
+
+        f"⚡ Activity expansion: YES\n\n"
+
+        f"📈 MC since tracking: "
+        f"{mc_since_tracking:+.1f}%\n"
+
+        f"🔥 MC since ignition: "
+        f"{mc_since_ignition:+.1f}%\n\n"
+
+        f"✅ Confirmation: "
+        f"{method}\n"
+
         f"👀 Observations: "
         f"{analysis.get('observations', 0)}\n\n"
+
         f"{url}"
     )
 
@@ -1723,7 +2396,8 @@ def ignition_message(
 
 def register_alert(
     snapshot: Dict[str, Any],
-    analysis: Dict[str, Any]
+    analysis: Dict[str, Any],
+    confirmation: Dict[str, Any]
 ) -> None:
 
     address = snapshot[
@@ -1733,6 +2407,7 @@ def register_alert(
     if address in state[
         "alerts"
     ]:
+
         return
 
     mc = safe_float(
@@ -1744,6 +2419,7 @@ def register_alert(
     state[
         "alerts"
     ][address] = {
+
         "symbol":
             snapshot.get(
                 "symbol",
@@ -1768,11 +2444,19 @@ def register_alert(
                 0
             ),
 
+        "confirmation_method":
+            confirmation.get(
+                "method",
+                ""
+            ),
+
         "checks": {
             "5m":
                 None,
+
             "15m":
                 None,
+
             "30m":
                 None,
         }
@@ -1963,43 +2647,134 @@ def scan_once(
             "score"
         ]
 
-        print(
-            f"[TRACK] "
-            f"{symbol} | "
-            f"Score={score}/100 | "
-            f"State={setup} | "
-            f"MC={format_money(mc)} | "
-            f"Liq={format_money(liquidity)} | "
-            f"5mVol={format_money(volume)}"
+        # ----------------------------------------------------
+        # CURRENT CONFIRMATION STATUS
+        # ----------------------------------------------------
+
+        pending = get_confirmation(
+            address
         )
 
-        # ----------------------------------------------------
-        # IGNITION
-        # ----------------------------------------------------
+        if pending:
 
-        if setup == "IGNITION":
-
-            if address not in state[
-                "alerts"
-            ]:
-
-                print(
-                    f"[IGNITION] "
-                    f"{symbol} | "
-                    f"Score={score}"
+            ignition_mc = safe_float(
+                pending.get(
+                    "ignition_mc"
                 )
+            )
 
-                register_alert(
+            mc_change = percentage_change(
+                ignition_mc,
+                mc
+            )
+
+            confirmation_count = safe_int(
+                pending.get(
+                    "consecutive_ignitions"
+                )
+            )
+
+            print(
+                f"[TRACK] "
+                f"{symbol} | "
+                f"Score={score}/100 | "
+                f"State={setup} | "
+                f"MC={format_money(mc)} | "
+                f"Liq={format_money(liquidity)} | "
+                f"5mVol={format_money(volume)} | "
+                f"CONFIRM={confirmation_count}/"
+                f"{REQUIRED_CONSECUTIVE_IGNITIONS} | "
+                f"MC since ignition="
+                f"{mc_change:+.1f}%"
+            )
+
+        else:
+
+            print(
+                f"[TRACK] "
+                f"{symbol} | "
+                f"Score={score}/100 | "
+                f"State={setup} | "
+                f"MC={format_money(mc)} | "
+                f"Liq={format_money(liquidity)} | "
+                f"5mVol={format_money(volume)}"
+            )
+
+        # ----------------------------------------------------
+        # ALREADY ALERTED
+        # ----------------------------------------------------
+
+        if address in state[
+            "alerts"
+        ]:
+
+            continue
+
+        # ----------------------------------------------------
+        # CONFIRMATION ENGINE
+        # ----------------------------------------------------
+
+        result = confirmation_result(
+            snapshot,
+            analysis
+        )
+
+        confirmation_status = result.get(
+            "status",
+            "NONE"
+        )
+
+        if confirmation_status == "PENDING":
+
+            count = safe_int(
+                result.get(
+                    "consecutive",
+                    1
+                )
+            )
+
+            mc_change = safe_float(
+                result.get(
+                    "mc_change",
+                    0
+                )
+            )
+
+            print(
+                f"[PENDING] "
+                f"{symbol} | "
+                f"First ignition recorded | "
+                f"Confirmation="
+                f"{count}/"
+                f"{REQUIRED_CONSECUTIVE_IGNITIONS} | "
+                f"MC since ignition="
+                f"{mc_change:+.1f}%"
+            )
+
+        elif confirmation_status == "CONFIRMED":
+
+            print(
+                f"[CONFIRMED RUNNER] "
+                f"{symbol} | "
+                f"Score={score} | "
+                f"MC={format_money(mc)} | "
+                f"Method="
+                f"{result.get('method', '')}"
+            )
+
+            register_alert(
+                snapshot,
+                analysis,
+                result
+            )
+
+            broadcast(
+                ignition_message(
                     snapshot,
-                    analysis
+                    analysis,
+                    result
                 )
-
-                broadcast(
-                    ignition_message(
-                        snapshot,
-                        analysis
-                    )
-                )
+            )
 
     save_state()
 
@@ -2015,32 +2790,62 @@ def main() -> None:
     load_state()
 
     print("=" * 60)
+
     print(
         f"🚀 RUNNER BOT {BOT_VERSION}"
     )
+
     print("=" * 60)
+
     print(
         "DEX Screener-first"
     )
+
     print(
         "Solana only"
     )
+
     print(
         f"MC: ${MIN_MC:,} - "
         f"${MAX_MC:,}"
     )
+
     print(
         f"Liquidity: "
         f"${MIN_LIQUIDITY:,}+"
     )
+
     print(
         f"Pair age: "
         f"<= {MAX_PAIR_AGE_HOURS}h"
     )
+
     print(
         f"Scan interval: "
         f"{SCAN_INTERVAL_SECONDS:.0f}s"
     )
+
+    print(
+        "Confirmation:"
+    )
+
+    print(
+        f"• "
+        f"{REQUIRED_CONSECUTIVE_IGNITIONS} "
+        f"consecutive ignition scans"
+    )
+
+    print(
+        f"• OR MC +"
+        f"{CONFIRMATION_MC_INCREASE_PCT:.0f}% "
+        f"from ignition"
+    )
+
+    print(
+        f"• Timeout: "
+        f"{CONFIRMATION_TIMEOUT_SECONDS // 60} minutes"
+    )
+
     print("=" * 60)
 
     if TELEGRAM_BOT_TOKEN:
@@ -2121,7 +2926,9 @@ def main() -> None:
                 f"[MAIN ERROR] {e}"
             )
 
-            time.sleep(5)
+            time.sleep(
+                5
+            )
 
 
 # ============================================================
