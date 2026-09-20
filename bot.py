@@ -1,31 +1,28 @@
 import json
 import os
 import time
-import urllib.request
 import urllib.parse
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
-# RUNNER BOT V1
-# FRESH IDEAL RUNNER ENGINE
+# RUNNER BOT V1.1
+# DIRECTIONAL ACTIVITY + PERSISTENCE ENGINE
 #
 # IMPORTANT:
-# - NO SEARCH QUERIES
-# - NO /latest/dex/search?q=...
-# - NO TOKEN-NAME DISCOVERY
-#
-# Discovery comes from DexScreener's latest token/boost
-# feeds, then the bot evaluates the actual token data.
+# - NO DexScreener search queries
+# - Discovery uses live DexScreener feeds
+# - Scores activity only when it is directionally useful
+# - Huge volume + collapsing price is penalized
+# - High B/S with tiny activity is penalized
+# - First observation is ALWAYS WATCH
+# - RUNNER / IDEAL RUNNER require persistence
 # ============================================================
 
-BOT_VERSION = "V1-NO-SEARCH-IDEAL-RUNNER"
-
-
-# ============================================================
-# API
-# ============================================================
+BOT_VERSION = "V1.1-DIRECTIONAL-PERSISTENCE"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
@@ -35,858 +32,401 @@ TELEGRAM_BASE = "https://api.telegram.org"
 # FILES
 # ============================================================
 
-STATE_FILE = "runner_v1_state.json"
-HISTORY_FILE = "runner_v1_history.json"
+STATE_FILE = "runner_v11_state.json"
+HISTORY_FILE = "runner_v11_history.json"
 
 
 # ============================================================
-# TIMING
+# SCANNER SETTINGS
 # ============================================================
 
-SCAN_SECONDS = 20
-
-DISCOVERY_SECONDS = 300
-
-VALIDATION_SECONDS = 300
-
-TRACKING_HOURS = 8.0
-
-
-# ============================================================
-# BROAD DATA BOUNDARIES
-#
-# These are NOT ideal-runner rules.
-# They simply prevent obviously unusable records.
-# ============================================================
+CHAIN = "solana"
 
 MIN_MC = 10_000
 MAX_MC = 1_000_000
 
 MIN_LIQUIDITY = 5_000
 
+SCAN_INTERVAL = 20
+
+DISCOVERY_INTERVAL = 300
+VALIDATION_INTERVAL = 300
+
+TRACKING_HOURS = 8
+
+MAX_DISCOVERY_CANDIDATES = 30
+
 
 # ============================================================
-# RUNNER CLASSIFICATION
+# CLASSIFICATION
 # ============================================================
 
 WATCH_SCORE = 55
-
 RUNNER_SCORE = 72
-
 IDEAL_SCORE = 85
 
-MIN_OBSERVATIONS = 2
+MIN_OBSERVATIONS_RUNNER = 2
+MIN_OBSERVATIONS_IDEAL = 3
 
 
 # ============================================================
-# TELEGRAM
+# OUTCOME RESEARCH
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
+CONTINUATION_MC_MULTIPLE = 1.50
+CONTINUATION_LIQUIDITY_MULTIPLE = 0.70
 
-
-# ============================================================
-# STATE
-# ============================================================
-
-STATE = {
-    "subscribers": [],
-    "tracking": {},
-    "last_discovery": 0,
-    "last_validation": 0,
-    "telegram_offset": 0,
-}
-
-
-HISTORY = {
-    "records": []
-}
-
-
-# ============================================================
-# LOAD FILES
-# ============================================================
-
-def load_json(
-    path: str,
-    default: Any
-) -> Any:
-
-    try:
-
-        if not os.path.exists(path):
-            return default
-
-        with open(
-            path,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception:
-
-        return default
-
-
-STATE = load_json(
-    STATE_FILE,
-    STATE
-)
-
-HISTORY = load_json(
-    HISTORY_FILE,
-    HISTORY
-)
-
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
-def now_iso() -> str:
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def unix_now() -> int:
-
-    return int(time.time())
-
-
-def safe_float(
-    value: Any,
-    default: float = 0.0
-) -> float:
-
-    try:
-
-        if value is None:
-            return default
-
-        return float(value)
-
-    except Exception:
-
-        return default
-
-
-def safe_int(
-    value: Any,
-    default: int = 0
-) -> int:
-
-    try:
-
-        if value is None:
-            return default
-
-        return int(value)
-
-    except Exception:
-
-        return default
-
-
-def clamp(
-    value: float,
-    low: float,
-    high: float
-) -> float:
-
-    return max(
-        low,
-        min(high, value)
-    )
-
-
-def pct_change(
-    old: float,
-    new: float
-) -> float:
-
-    if old <= 0:
-        return 0.0
-
-    return (
-        (new - old)
-        / old
-    ) * 100.0
-
-
-def save_json(
-    path: str,
-    data: Any
-) -> None:
-
-    temporary = (
-        path
-        + ".tmp"
-    )
-
-    with open(
-        temporary,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            data,
-            f,
-            indent=2
-        )
-
-    os.replace(
-        temporary,
-        path
-    )
+FAILURE_MC_MULTIPLE = 0.80
+FAILURE_LIQUIDITY_MULTIPLE = 0.50
 
 
 # ============================================================
 # HTTP
 # ============================================================
 
-def http_get(
-    url: str,
-    timeout: int = 15
-) -> Optional[Any]:
+HTTP_TIMEOUT = 15
 
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent":
-                    "RunnerBotV1/1.0"
-            }
-        )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=timeout
-        ) as response:
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
 
-            body = (
-                response
-                .read()
-                .decode("utf-8")
-            )
 
-            if not body:
-                return None
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-            return json.loads(body)
 
-    except Exception as e:
+def pct_change(old: float, new: float) -> float:
+    if old <= 0:
+        return 0.0
+    return ((new - old) / old) * 100.0
 
-        print(
-            f"HTTP ERROR: {e}"
-        )
 
-        return None
+def load_json(path: str, default: Any) -> Any:
+    try:
+        if not os.path.exists(path):
+            return default
+
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    except Exception:
+        return default
+
+
+def save_json(path: str, data: Any) -> None:
+    temp_path = path + ".tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    os.replace(temp_path, path)
 
 
 # ============================================================
-# TELEGRAM API
+# DEFAULT STATE
 # ============================================================
 
-def telegram_call(
+def default_state() -> Dict[str, Any]:
+    return {
+        "subscribers": [],
+        "tracking": {},
+        "last_discovery": 0,
+        "last_validation": 0,
+        "telegram_offset": 0,
+    }
+
+
+state = load_json(STATE_FILE, default_state())
+
+if not isinstance(state, dict):
+    state = default_state()
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+history = load_json(HISTORY_FILE, [])
+
+if not isinstance(history, list):
+    history = []
+
+
+def history_add(event: Dict[str, Any]) -> None:
+    global history
+
+    event = dict(event)
+    event["timestamp"] = now_iso()
+
+    history.append(event)
+
+    # Keep file manageable.
+    if len(history) > 20_000:
+        history = history[-20_000:]
+
+    save_json(HISTORY_FILE, history)
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+
+def telegram_request(
     method: str,
-    payload: Dict[str, Any]
-) -> Optional[Any]:
+    params: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
 
     if not TELEGRAM_TOKEN:
         return None
 
-    url = (
-        f"{TELEGRAM_BASE}/bot"
-        f"{TELEGRAM_TOKEN}/"
-        f"{method}"
-    )
+    url = f"{TELEGRAM_BASE}/bot{TELEGRAM_TOKEN}/{method}"
 
     try:
-
-        data = urllib.parse.urlencode(
-            payload
-        ).encode("utf-8")
-
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type":
-                    "application/"
-                    "x-www-form-urlencoded"
-            }
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=20
-        ) as response:
-
-            body = (
-                response
-                .read()
-                .decode("utf-8")
+        if params:
+            data = urllib.parse.urlencode(params).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST"
             )
+        else:
+            req = urllib.request.Request(url)
 
-            return json.loads(body)
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw)
 
     except Exception as e:
-
-        print(
-            f"TELEGRAM ERROR: {e}"
-        )
-
+        print(f"Telegram error: {e}")
         return None
 
 
-def telegram_message(
-    chat_id: str,
-    text: str
-) -> None:
+def send_message(chat_id: str, text: str) -> None:
 
-    telegram_call(
+    telegram_request(
         "sendMessage",
         {
             "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview":
-                "true",
+            "disable_web_page_preview": "true",
         }
     )
 
 
 # ============================================================
-# DEXSCREENER DISCOVERY
-#
-# NO SEARCH QUERIES.
-#
-# We use DexScreener's latest feeds.
+# DEXSCREENER
 # ============================================================
 
-def get_latest_token_profiles() -> List[Dict[str, Any]]:
+def dex_get(path: str) -> Any:
 
-    url = (
-        f"{DEX_BASE}"
-        "/token-profiles/latest/v1"
-    )
-
-    data = http_get(url)
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
-
-
-def get_latest_boosts() -> List[Dict[str, Any]]:
-
-    url = (
-        f"{DEX_BASE}"
-        "/token-boosts/latest/v1"
-    )
-
-    data = http_get(url)
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
-
-
-def get_top_boosts() -> List[Dict[str, Any]]:
-
-    url = (
-        f"{DEX_BASE}"
-        "/token-boosts/top/v1"
-    )
-
-    data = http_get(url)
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
-
-
-def get_community_takeovers() -> List[Dict[str, Any]]:
-
-    url = (
-        f"{DEX_BASE}"
-        "/community-takeovers/latest/v1"
-    )
-
-    data = http_get(url)
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
-
-
-# ============================================================
-# TOKEN ADDRESS EXTRACTION
-# ============================================================
-
-def extract_token_addresses(
-    records: List[Dict[str, Any]]
-) -> List[str]:
-
-    addresses = []
-
-    for record in records:
-
-        if not isinstance(
-            record,
-            dict
-        ):
-
-            continue
-
-        chain = (
-            record.get("chainId")
-            or ""
-        )
-
-        if chain != "solana":
-            continue
-
-        address = (
-            record.get("tokenAddress")
-            or record.get("address")
-        )
-
-        if not address:
-            continue
-
-        if address not in addresses:
-
-            addresses.append(
-                address
-            )
-
-    return addresses
-
-
-# ============================================================
-# TOKEN PAIRS
-# ============================================================
-
-def get_token_pairs(
-    token_address: str
-) -> List[Dict[str, Any]]:
-
-    url = (
-        f"{DEX_BASE}"
-        "/token-pairs/v1/solana/"
-        f"{token_address}"
-    )
-
-    data = http_get(url)
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        return []
-
-    return data
-
-
-# ============================================================
-# PAIR AGE
-# ============================================================
-
-def pair_age_hours(
-    pair: Dict[str, Any]
-) -> Optional[float]:
-
-    created = pair.get(
-        "pairCreatedAt"
-    )
-
-    if created is None:
-        return None
+    url = DEX_BASE + path
 
     try:
-
-        created_ms = int(
-            created
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "RunnerBot/1.1"
+            }
         )
 
-        age_seconds = (
-            time.time() * 1000
-            - created_ms
-        ) / 1000
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw)
 
-        return max(
-            0.0,
-            age_seconds / 3600
-        )
+    except urllib.error.HTTPError as e:
+        print(f"Dex HTTP error {e.code}: {path}")
+        return None
 
-    except Exception:
-
+    except Exception as e:
+        print(f"Dex error: {e}")
         return None
 
 
 # ============================================================
-# NORMALIZE PAIR
+# TELEGRAM COMMANDS
 # ============================================================
 
-def normalize_pair(
-    pair: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
+def process_telegram_updates() -> None:
 
-    if not isinstance(
-        pair,
-        dict
-    ):
+    if not TELEGRAM_TOKEN:
+        return
 
-        return None
+    offset = safe_int(state.get("telegram_offset", 0))
 
-    if pair.get(
-        "chainId"
-    ) != "solana":
-
-        return None
-
-    base = (
-        pair.get("baseToken")
-        or {}
+    result = telegram_request(
+        "getUpdates",
+        {
+            "timeout": 1,
+            "offset": offset,
+        }
     )
 
-    token_address = (
-        base.get("address")
-    )
+    if not result or not result.get("ok"):
+        return
 
-    if not token_address:
-        return None
+    updates = result.get("result", [])
 
-    liquidity_object = (
-        pair.get("liquidity")
-        or {}
-    )
+    for update in updates:
 
-    volume_object = (
-        pair.get("volume")
-        or {}
-    )
+        update_id = safe_int(update.get("update_id"))
 
-    transactions = (
-        pair.get("txns")
-        or {}
-    )
+        if update_id >= offset:
+            state["telegram_offset"] = update_id + 1
 
-    m5 = (
-        transactions.get("m5")
-        or {}
-    )
+        message = update.get("message") or {}
 
-    price_change = (
-        pair.get("priceChange")
-        or {}
-    )
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
 
-    mc = safe_float(
-        pair.get("marketCap")
-    )
+        if chat_id is None:
+            continue
 
-    if mc <= 0:
+        text = str(message.get("text", "")).strip()
 
-        mc = safe_float(
-            pair.get("fdv")
-        )
+        if not text:
+            continue
 
-    liquidity = safe_float(
-        liquidity_object.get("usd")
-    )
+        chat_id_str = str(chat_id)
 
-    volume_5m = safe_float(
-        volume_object.get("m5")
-    )
+        if text.startswith("/start"):
 
-    buys_5m = safe_int(
-        m5.get("buys")
-    )
+            if chat_id_str not in state["subscribers"]:
+                state["subscribers"].append(chat_id_str)
 
-    sells_5m = safe_int(
-        m5.get("sells")
-    )
-
-    price_usd = safe_float(
-        pair.get("priceUsd")
-    )
-
-    price_change_5m = safe_float(
-        price_change.get("m5")
-    )
-
-    return {
-
-        "token_address":
-            token_address,
-
-        "symbol":
-            str(
-                base.get("symbol")
-                or "UNKNOWN"
-            ),
-
-        "name":
-            str(
-                base.get("name")
-                or "UNKNOWN"
-            ),
-
-        "pair_address":
-            pair.get(
-                "pairAddress"
+            send_message(
+                chat_id_str,
+                "RUNNER BOT V1.1 is online.\n\n"
+                "Directional activity + persistence engine enabled.\n"
+                "No DexScreener search queries are used."
             )
-            or "",
 
-        "dex":
-            pair.get(
-                "dexId"
+        elif text.startswith("/stop"):
+
+            if chat_id_str in state["subscribers"]:
+                state["subscribers"].remove(chat_id_str)
+
+            send_message(
+                chat_id_str,
+                "Runner alerts stopped for this chat."
             )
-            or "",
 
-        "mc":
-            mc,
+        elif text.startswith("/status"):
 
-        "liquidity":
-            liquidity,
+            tracking_count = len(state.get("tracking", {}))
 
-        "volume_5m":
-            volume_5m,
+            send_message(
+                chat_id_str,
+                f"RUNNER BOT V1.1\n\n"
+                f"Tracked tokens: {tracking_count}\n"
+                f"Subscribers: {len(state['subscribers'])}\n"
+                f"Discovery interval: {DISCOVERY_INTERVAL}s\n"
+                f"Validation interval: {VALIDATION_INTERVAL}s\n"
+                f"Tracking window: {TRACKING_HOURS}h"
+            )
 
-        "buys_5m":
-            buys_5m,
+        elif text.startswith("/history"):
 
-        "sells_5m":
-            sells_5m,
+            alerts = [
+                x for x in history
+                if x.get("event") == "alert"
+            ]
 
-        "price_usd":
-            price_usd,
+            recent = alerts[-10:]
 
-        "price_change_5m":
-            price_change_5m,
+            if not recent:
+                send_message(
+                    chat_id_str,
+                    "No runner alerts recorded yet."
+                )
+            else:
 
-        "age_hours":
-            pair_age_hours(pair),
-    }
+                lines = ["Recent alerts:\n"]
+
+                for item in reversed(recent):
+
+                    lines.append(
+                        f"{item.get('symbol', '?')} | "
+                        f"{item.get('classification', '?')} | "
+                        f"{item.get('score', 0):.1f}"
+                    )
+
+                send_message(
+                    chat_id_str,
+                    "\n".join(lines)
+                )
+
+    save_json(STATE_FILE, state)
 
 
 # ============================================================
-# CHOOSE BEST SOLANA PAIR
+# PAIR EXTRACTION
 # ============================================================
 
-def choose_best_pair(
-    pairs: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
+def choose_best_pair(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
-    normalized = []
+    solana_pairs = [
+        p for p in pairs
+        if str(p.get("chainId", "")).lower() == CHAIN
+    ]
 
-    for pair in pairs:
-
-        item = normalize_pair(
-            pair
-        )
-
-        if item is None:
-            continue
-
-        if item["mc"] <= 0:
-            continue
-
-        if item["liquidity"] <= 0:
-            continue
-
-        normalized.append(
-            item
-        )
-
-    if not normalized:
+    if not solana_pairs:
         return None
 
-    normalized.sort(
-        key=lambda x: (
-            x["liquidity"],
-            x["mc"]
+    # Highest liquidity first.
+    solana_pairs.sort(
+        key=lambda p: safe_float(
+            (p.get("liquidity") or {}).get("usd")
         ),
         reverse=True
     )
 
-    return normalized[0]
+    return solana_pairs[0]
 
 
-# ============================================================
-# DISCOVERY
-# ============================================================
+def token_pairs(token_address: str) -> List[Dict[str, Any]]:
 
-def discover_candidates() -> List[Dict[str, Any]]:
-
-    print()
-    print("=" * 70)
-    print("V1 DISCOVERY — NO SEARCH QUERIES")
-    print(now_iso())
-    print("=" * 70)
-
-    profile_records = (
-        get_latest_token_profiles()
+    data = dex_get(
+        f"/token-pairs/v1/{CHAIN}/{urllib.parse.quote(token_address)}"
     )
 
-    latest_boost_records = (
-        get_latest_boosts()
-    )
+    if not data:
+        return []
 
-    top_boost_records = (
-        get_top_boosts()
-    )
+    if isinstance(data, list):
+        return data
 
-    takeover_records = (
-        get_community_takeovers()
-    )
+    if isinstance(data, dict):
+        pairs = data.get("pairs")
 
-    all_records = (
-        profile_records
-        + latest_boost_records
-        + top_boost_records
-        + takeover_records
-    )
+        if isinstance(pairs, list):
+            return pairs
 
-    addresses = (
-        extract_token_addresses(
-            all_records
-        )
-    )
-
-    print(
-        f"Latest profiles: "
-        f"{len(profile_records)}"
-    )
-
-    print(
-        f"Latest boosts: "
-        f"{len(latest_boost_records)}"
-    )
-
-    print(
-        f"Top boosts: "
-        f"{len(top_boost_records)}"
-    )
-
-    print(
-        f"Community takeovers: "
-        f"{len(takeover_records)}"
-    )
-
-    print(
-        f"Unique Solana tokens: "
-        f"{len(addresses)}"
-    )
-
-    candidates = []
-
-    for address in addresses:
-
-        try:
-
-            pairs = get_token_pairs(
-                address
-            )
-
-            item = choose_best_pair(
-                pairs
-            )
-
-            if item is None:
-                continue
-
-            if item["mc"] < MIN_MC:
-                continue
-
-            if item["mc"] > MAX_MC:
-                continue
-
-            if (
-                item["liquidity"]
-                < MIN_LIQUIDITY
-            ):
-
-                continue
-
-            candidates.append(
-                item
-            )
-
-        except Exception as e:
-
-            print(
-                f"Discovery error "
-                f"{address}: {e}"
-            )
-
-        time.sleep(0.08)
-
-    candidates.sort(
-        key=lambda x: (
-            x["volume_5m"],
-            x["liquidity"]
-        ),
-        reverse=True
-    )
-
-    print(
-        f"Broad candidates: "
-        f"{len(candidates)}"
-    )
-
-    for item in candidates[:50]:
-
-        age = item[
-            "age_hours"
-        ]
-
-        age_text = (
-            f"{age:.1f}h"
-            if age is not None
-            else "N/A"
-        )
-
-        print(
-            f"  {item['symbol']:<14}"
-            f"MC ${item['mc']:,.0f} | "
-            f"Liq ${item['liquidity']:,.0f} | "
-            f"5m Vol ${item['volume_5m']:,.0f} | "
-            f"Age {age_text}"
-        )
-
-    return candidates
+    return []
 
 
 # ============================================================
@@ -894,852 +434,1043 @@ def discover_candidates() -> List[Dict[str, Any]]:
 # ============================================================
 
 def make_snapshot(
-    item: Dict[str, Any]
+    token_address: str,
+    pair: Dict[str, Any],
+    source: str = ""
 ) -> Dict[str, Any]:
 
-    buys = item[
-        "buys_5m"
-    ]
+    base = pair.get("baseToken") or {}
 
-    sells = item[
-        "sells_5m"
-    ]
+    symbol = str(base.get("symbol") or "?")
+    name = str(base.get("name") or symbol)
+
+    market_cap = safe_float(
+        pair.get("marketCap")
+    )
+
+    if market_cap <= 0:
+        market_cap = safe_float(
+            pair.get("fdv")
+        )
+
+    liquidity = safe_float(
+        (pair.get("liquidity") or {}).get("usd")
+    )
+
+    volume_5m = safe_float(
+        (pair.get("volume") or {}).get("m5")
+    )
+
+    txns_5m = (pair.get("txns") or {}).get("m5") or {}
+
+    buys = safe_int(
+        txns_5m.get("buys")
+    )
+
+    sells = safe_int(
+        txns_5m.get("sells")
+    )
+
+    total_txns = buys + sells
 
     if sells > 0:
-
-        bs_ratio = (
-            buys / sells
-        )
-
+        bs_ratio = buys / sells
     elif buys > 0:
-
-        bs_ratio = float(
-            buys
-        )
-
+        bs_ratio = float(buys)
     else:
-
         bs_ratio = 0.0
 
-    volume_mc_pct = 0.0
+    price_change_5m = safe_float(
+        (pair.get("priceChange") or {}).get("m5")
+    )
 
-    if item["mc"] > 0:
+    price_usd = safe_float(
+        pair.get("priceUsd")
+    )
 
-        volume_mc_pct = (
-            item["volume_5m"]
-            / item["mc"]
-        ) * 100
+    created_ms = safe_float(
+        pair.get("pairCreatedAt")
+    )
+
+    if created_ms > 0:
+        age_hours = max(
+            0.0,
+            (time.time() * 1000 - created_ms) / 3_600_000
+        )
+    else:
+        age_hours = 0.0
+
+    volume_mc_pct = (
+        (volume_5m / market_cap) * 100
+        if market_cap > 0
+        else 0.0
+    )
+
+    liquidity_mc_pct = (
+        (liquidity / market_cap) * 100
+        if market_cap > 0
+        else 0.0
+    )
 
     return {
+        "timestamp": now_iso(),
+        "token_address": token_address,
 
-        "timestamp":
-            now_iso(),
+        "symbol": symbol,
+        "name": name,
 
-        "unix":
-            unix_now(),
+        "market_cap": market_cap,
+        "liquidity": liquidity,
 
-        "mc":
-            item["mc"],
+        "price_usd": price_usd,
+        "price_change_5m": price_change_5m,
 
-        "liquidity":
-            item["liquidity"],
+        "volume_5m": volume_5m,
+        "volume_mc_pct": volume_mc_pct,
 
-        "age_hours":
-            item["age_hours"],
+        "buys_5m": buys,
+        "sells_5m": sells,
+        "transactions_5m": total_txns,
+        "bs_ratio": bs_ratio,
 
-        "price_usd":
-            item["price_usd"],
+        "liquidity_mc_pct": liquidity_mc_pct,
 
-        "price_change_5m":
-            item["price_change_5m"],
+        "age_hours": age_hours,
 
-        "buys_5m":
-            item["buys_5m"],
+        "pair_address": pair.get("pairAddress", ""),
+        "dex_id": pair.get("dexId", ""),
 
-        "sells_5m":
-            item["sells_5m"],
-
-        "bs_ratio":
-            bs_ratio,
-
-        "volume_5m":
-            item["volume_5m"],
-
-        "volume_mc_pct":
-            volume_mc_pct,
-
-        "pair_address":
-            item["pair_address"],
-
-        "dex":
-            item["dex"],
-
-        "symbol":
-            item["symbol"],
-
-        "name":
-            item["name"],
+        "source": source,
     }
 
 
 # ============================================================
-# FEATURE CHANGES
+# FEATURE DIFFERENCES
 # ============================================================
 
-def calculate_features(
+def compare_snapshots(
     previous: Optional[Dict[str, Any]],
     current: Dict[str, Any]
 ) -> Dict[str, float]:
 
-    if previous is None:
-
+    if not previous:
         return {
-
-            "mc_change": 0.0,
-
-            "liquidity_change": 0.0,
-
+            "mc_change_pct": 0.0,
+            "liquidity_change_pct": 0.0,
             "price_change_delta": 0.0,
-
-            "volume_change": 0.0,
-
-            "buys_change": 0.0,
-
-            "sells_change": 0.0,
-
+            "volume_change_pct": 0.0,
+            "buys_change_pct": 0.0,
+            "sells_change_pct": 0.0,
             "bs_change": 0.0,
-
             "volume_mc_change": 0.0,
+            "tx_change_pct": 0.0,
         }
 
     return {
+        "mc_change_pct": pct_change(
+            safe_float(previous.get("market_cap")),
+            safe_float(current.get("market_cap"))
+        ),
 
-        "mc_change":
-            pct_change(
-                previous["mc"],
-                current["mc"]
-            ),
-
-        "liquidity_change":
-            pct_change(
-                previous["liquidity"],
-                current["liquidity"]
-            ),
+        "liquidity_change_pct": pct_change(
+            safe_float(previous.get("liquidity")),
+            safe_float(current.get("liquidity"))
+        ),
 
         "price_change_delta":
-            current[
-                "price_change_5m"
-            ]
-            -
-            previous[
-                "price_change_5m"
-            ],
+            safe_float(current.get("price_change_5m"))
+            - safe_float(previous.get("price_change_5m")),
 
-        "volume_change":
-            pct_change(
-                previous["volume_5m"],
-                current["volume_5m"]
-            ),
+        "volume_change_pct": pct_change(
+            safe_float(previous.get("volume_5m")),
+            safe_float(current.get("volume_5m"))
+        ),
 
-        "buys_change":
-            pct_change(
-                previous["buys_5m"],
-                current["buys_5m"]
-            )
-            if previous["buys_5m"] > 0
-            else 0.0,
+        "buys_change_pct": pct_change(
+            safe_float(previous.get("buys_5m")),
+            safe_float(current.get("buys_5m"))
+        ),
 
-        "sells_change":
-            pct_change(
-                previous["sells_5m"],
-                current["sells_5m"]
-            )
-            if previous["sells_5m"] > 0
-            else 0.0,
+        "sells_change_pct": pct_change(
+            safe_float(previous.get("sells_5m")),
+            safe_float(current.get("sells_5m"))
+        ),
 
         "bs_change":
-            current["bs_ratio"]
-            -
-            previous["bs_ratio"],
+            safe_float(current.get("bs_ratio"))
+            - safe_float(previous.get("bs_ratio")),
 
         "volume_mc_change":
-            current["volume_mc_pct"]
-            -
-            previous["volume_mc_pct"],
+            safe_float(current.get("volume_mc_pct"))
+            - safe_float(previous.get("volume_mc_pct")),
+
+        "tx_change_pct": pct_change(
+            safe_float(previous.get("transactions_5m")),
+            safe_float(current.get("transactions_5m"))
+        ),
     }
 
 
 # ============================================================
-# IDEAL RUNNER SCORE
+# SCORE COMPONENT 1
+# DIRECTIONAL BUYING PRESSURE
+# MAX = 30
+#
+# Important:
+# B/S alone cannot give a huge score.
+# Transaction activity matters.
 # ============================================================
 
-def score_runner(
+def score_directional_buying(
+    snap: Dict[str, Any]
+) -> Tuple[float, List[str]]:
+
+    score = 0.0
+    reasons = []
+
+    bs = safe_float(snap.get("bs_ratio"))
+    tx = safe_int(snap.get("transactions_5m"))
+    price = safe_float(snap.get("price_change_5m"))
+    volume_mc = safe_float(snap.get("volume_mc_pct"))
+
+    # Base B/S score.
+    if bs >= 3.0:
+        score += 16
+        reasons.append("very strong B/S")
+    elif bs >= 2.0:
+        score += 14
+        reasons.append("strong B/S")
+    elif bs >= 1.5:
+        score += 11
+        reasons.append("positive B/S")
+    elif bs >= 1.2:
+        score += 8
+    elif bs >= 1.0:
+        score += 4
+    else:
+        score += 0
+        reasons.append("selling pressure")
+
+    # Activity confirmation.
+    if tx >= 200:
+        score += 8
+        reasons.append("high transaction activity")
+    elif tx >= 100:
+        score += 6
+    elif tx >= 50:
+        score += 4
+    elif tx >= 20:
+        score += 2
+    else:
+        # Prevent HUHCAT-style ratios from dominating.
+        score -= 4
+        reasons.append("very low transaction activity")
+
+    # Positive price confirms that buying pressure is actually
+    # moving price upward.
+    if price >= 10:
+        score += 6
+        reasons.append("buying pressure moving price")
+    elif price > 0:
+        score += 4
+    elif price <= -10:
+        score -= 10
+        reasons.append("buying pressure not translating upward")
+    elif price < 0:
+        score -= 5
+
+    # If there is significant activity but price is deeply negative,
+    # explicitly penalize distribution-like behavior.
+    if volume_mc >= 20 and price <= -15:
+        score -= 8
+        reasons.append("high activity with falling price")
+
+    return clamp(score, 0, 30), reasons
+
+
+# ============================================================
+# SCORE COMPONENT 2
+# PRICE MOMENTUM
+# MAX = 20
+# ============================================================
+
+def score_price_momentum(
+    snap: Dict[str, Any]
+) -> Tuple[float, List[str]]:
+
+    score = 0.0
+    reasons = []
+
+    price = safe_float(snap.get("price_change_5m"))
+
+    # Negative movement is actively penalized.
+    if price <= -30:
+        score = 0
+        reasons.append("severe price decline")
+
+    elif price <= -15:
+        score = 1
+        reasons.append("strong price decline")
+
+    elif price < 0:
+        score = 4
+        reasons.append("price declining")
+
+    elif price == 0:
+        score = 5
+
+    elif price <= 3:
+        score = 9
+
+    elif price <= 10:
+        score = 15
+        reasons.append("healthy upward momentum")
+
+    elif price <= 25:
+        score = 18
+        reasons.append("strong upward momentum")
+
+    elif price <= 40:
+        score = 16
+        reasons.append("strong but extended")
+
+    elif price <= 60:
+        score = 12
+        reasons.append("very extended move")
+
+    else:
+        score = 7
+        reasons.append("extreme short-term spike")
+
+    return score, reasons
+
+
+# ============================================================
+# SCORE COMPONENT 3
+# VOLUME QUALITY
+# MAX = 20
+#
+# Volume is only rewarded strongly when price direction
+# and buying pressure agree with it.
+# ============================================================
+
+def score_volume_quality(
+    snap: Dict[str, Any]
+) -> Tuple[float, List[str]]:
+
+    score = 0.0
+    reasons = []
+
+    volume_mc = safe_float(snap.get("volume_mc_pct"))
+    price = safe_float(snap.get("price_change_5m"))
+    bs = safe_float(snap.get("bs_ratio"))
+    tx = safe_int(snap.get("transactions_5m"))
+
+    # First determine raw activity.
+    if volume_mc >= 50:
+        raw = 14
+    elif volume_mc >= 30:
+        raw = 13
+    elif volume_mc >= 15:
+        raw = 11
+    elif volume_mc >= 7:
+        raw = 8
+    elif volume_mc >= 3:
+        raw = 5
+    elif volume_mc >= 1:
+        raw = 3
+    elif volume_mc > 0:
+        raw = 1
+    else:
+        raw = 0
+
+    # Quality multiplier / adjustment.
+    if price > 0 and bs >= 1.5:
+        score = raw + 6
+        reasons.append("volume aligned with buying")
+
+    elif price > 0 and bs >= 1.0:
+        score = raw + 3
+        reasons.append("volume partly aligned")
+
+    elif price == 0 and bs >= 1.5:
+        score = raw
+        reasons.append("volume without price confirmation")
+
+    elif price < 0 and volume_mc >= 20:
+        # Major penalty for exactly what V1 demonstrated was bad.
+        score = raw - 12
+        reasons.append("high volume during price decline")
+
+    elif price < 0:
+        score = raw - 5
+        reasons.append("volume during price decline")
+
+    else:
+        score = raw
+
+    # Tiny transaction count prevents inflated ratios/activity.
+    if tx < 20:
+        score -= 4
+        reasons.append("insufficient transaction activity")
+
+    return clamp(score, 0, 20), reasons
+
+
+# ============================================================
+# SCORE COMPONENT 4
+# LIQUIDITY / STRUCTURE
+# MAX = 15
+# ============================================================
+
+def score_structure(
+    snap: Dict[str, Any],
+    changes: Dict[str, float]
+) -> Tuple[float, List[str]]:
+
+    score = 0.0
+    reasons = []
+
+    liquidity_mc = safe_float(
+        snap.get("liquidity_mc_pct")
+    )
+
+    liquidity = safe_float(
+        snap.get("liquidity")
+    )
+
+    liq_change = safe_float(
+        changes.get("liquidity_change_pct")
+    )
+
+    if liquidity_mc >= 20:
+        score += 10
+        reasons.append("strong liquidity structure")
+
+    elif liquidity_mc >= 12:
+        score += 8
+
+    elif liquidity_mc >= 8:
+        score += 6
+
+    elif liquidity_mc >= 5:
+        score += 4
+
+    elif liquidity_mc >= 3:
+        score += 2
+
+    if liquidity >= 50_000:
+        score += 3
+    elif liquidity >= 20_000:
+        score += 2
+    elif liquidity >= 10_000:
+        score += 1
+
+    if liq_change >= 5:
+        score += 2
+        reasons.append("liquidity increasing")
+
+    elif liq_change < -10:
+        score -= 3
+        reasons.append("liquidity falling")
+
+    return clamp(score, 0, 15), reasons
+
+
+# ============================================================
+# SCORE COMPONENT 5
+# PERSISTENCE
+# MAX = 15
+#
+# This looks across observations, not just one candle.
+# ============================================================
+
+def score_persistence(
+    snapshots: List[Dict[str, Any]]
+) -> Tuple[float, List[str]]:
+
+    if not snapshots:
+        return 0.0, []
+
+    aligned = 0
+    directional = 0
+
+    recent = snapshots[-3:]
+
+    for snap in recent:
+
+        bs = safe_float(snap.get("bs_ratio"))
+        price = safe_float(snap.get("price_change_5m"))
+        volume_mc = safe_float(snap.get("volume_mc_pct"))
+        tx = safe_int(snap.get("transactions_5m"))
+
+        # A genuinely aligned observation:
+        # buying > selling
+        # price positive
+        # meaningful activity
+        if (
+            bs >= 1.2
+            and price > 0
+            and volume_mc >= 1
+            and tx >= 20
+        ):
+            aligned += 1
+
+        if bs >= 1.5 and price > 0:
+            directional += 1
+
+    if len(recent) >= 3 and aligned >= 3:
+        score = 15
+        reasons = ["three consecutive aligned observations"]
+
+    elif aligned >= 2:
+        score = 11
+        reasons = ["repeated directional activity"]
+
+    elif aligned >= 1:
+        score = 6
+        reasons = ["one confirmed aligned observation"]
+
+    else:
+        score = 0
+        reasons = ["no persistent directional confirmation"]
+
+    # Additional bonus for consistent directional pressure.
+    if directional >= 3:
+        score = min(15, score + 2)
+
+    return score, reasons
+
+
+# ============================================================
+# FULL SCORE
+# ============================================================
+
+def calculate_score(
+    snap: Dict[str, Any],
+    previous: Optional[Dict[str, Any]],
     snapshots: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
 
-    if not snapshots:
-
-        return {
-
-            "score": 0,
-
-            "classification":
-                "UNKNOWN",
-
-            "structure": 0,
-
-            "flow": 0,
-
-            "volume": 0,
-
-            "price": 0,
-
-            "liquidity": 0,
-
-            "persistence": 0,
-        }
-
-    current = snapshots[-1]
-
-    previous = (
-        snapshots[-2]
-        if len(snapshots) >= 2
-        else None
+    changes = compare_snapshots(
+        previous,
+        snap
     )
 
+    directional_score, directional_reasons = (
+        score_directional_buying(snap)
+    )
 
-    # ========================================================
-    # STRUCTURE
-    # ========================================================
+    price_score, price_reasons = (
+        score_price_momentum(snap)
+    )
 
-    structure = 0.0
+    volume_score, volume_reasons = (
+        score_volume_quality(snap)
+    )
 
-    mc = current["mc"]
-
-    liquidity = current[
-        "liquidity"
-    ]
-
-    if mc > 0:
-
-        liquidity_ratio = (
-            liquidity / mc
+    structure_score, structure_reasons = (
+        score_structure(
+            snap,
+            changes
         )
-
-        if liquidity_ratio >= 0.20:
-            structure = 20
-
-        elif liquidity_ratio >= 0.12:
-            structure = 16
-
-        elif liquidity_ratio >= 0.08:
-            structure = 12
-
-        elif liquidity_ratio >= 0.05:
-            structure = 8
-
-        elif liquidity_ratio >= 0.03:
-            structure = 4
-
-
-    # ========================================================
-    # FLOW
-    # ========================================================
-
-    flow = 0.0
-
-    buys = current[
-        "buys_5m"
-    ]
-
-    sells = current[
-        "sells_5m"
-    ]
-
-    bs = current[
-        "bs_ratio"
-    ]
-
-    if bs >= 3.0:
-        flow += 25
-
-    elif bs >= 2.0:
-        flow += 22
-
-    elif bs >= 1.5:
-        flow += 18
-
-    elif bs >= 1.2:
-        flow += 12
-
-    elif bs >= 1.0:
-        flow += 7
-
-    if buys > sells:
-        flow += 3
-
-    if previous:
-
-        if (
-            current["bs_ratio"]
-            >
-            previous["bs_ratio"]
-        ):
-
-            flow += 2
-
-        if (
-            current["buys_5m"]
-            >
-            previous["buys_5m"]
-        ):
-
-            flow += 2
-
-    flow = clamp(
-        flow,
-        0,
-        30
     )
 
-
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    volume = 0.0
-
-    volume_mc = current[
-        "volume_mc_pct"
-    ]
-
-    if volume_mc >= 30:
-        volume += 20
-
-    elif volume_mc >= 20:
-        volume += 17
-
-    elif volume_mc >= 12:
-        volume += 14
-
-    elif volume_mc >= 7:
-        volume += 10
-
-    elif volume_mc >= 3:
-        volume += 6
-
-    if previous:
-
-        if (
-            current["volume_5m"]
-            >
-            previous["volume_5m"]
-        ):
-
-            volume += 5
-
-        if (
-            current["volume_mc_pct"]
-            >
-            previous["volume_mc_pct"]
-        ):
-
-            volume += 3
-
-    volume = clamp(
-        volume,
-        0,
-        25
+    persistence_score, persistence_reasons = (
+        score_persistence(snapshots)
     )
-
-
-    # ========================================================
-    # PRICE
-    # ========================================================
-
-    price = 0.0
-
-    price_change = current[
-        "price_change_5m"
-    ]
-
-    if (
-        3
-        <= price_change
-        <= 25
-    ):
-
-        price += 15
-
-    elif (
-        0
-        < price_change
-        < 3
-    ):
-
-        price += 9
-
-    elif (
-        25
-        < price_change
-        <= 50
-    ):
-
-        price += 10
-
-    elif price_change > 50:
-
-        price += 3
-
-    if previous:
-
-        if price_change > 0:
-
-            price += 3
-
-        if (
-            current["mc"]
-            >
-            previous["mc"]
-        ):
-
-            price += 2
-
-    price = clamp(
-        price,
-        0,
-        20
-    )
-
-
-    # ========================================================
-    # LIQUIDITY MOMENTUM
-    # ========================================================
-
-    liquidity_score = 0.0
-
-    if previous:
-
-        liquidity_change = pct_change(
-            previous["liquidity"],
-            current["liquidity"]
-        )
-
-        if liquidity_change >= 5:
-            liquidity_score = 10
-
-        elif liquidity_change >= 1:
-            liquidity_score = 8
-
-        elif liquidity_change >= -2:
-            liquidity_score = 6
-
-        elif liquidity_change >= -5:
-            liquidity_score = 3
-
-        else:
-            liquidity_score = 0
-
-    else:
-
-        liquidity_score = 6
-
-
-    # ========================================================
-    # PERSISTENCE
-    # ========================================================
-
-    persistence = 0.0
-
-    if len(snapshots) >= 2:
-
-        aligned = 0
-
-        for snap in snapshots[-3:]:
-
-            local_bs = snap[
-                "bs_ratio"
-            ]
-
-            local_price = snap[
-                "price_change_5m"
-            ]
-
-            local_volume = snap[
-                "volume_mc_pct"
-            ]
-
-            signals = 0
-
-            if local_bs > 1:
-                signals += 1
-
-            if local_price > 0:
-                signals += 1
-
-            if local_volume > 0:
-                signals += 1
-
-            if signals >= 2:
-                aligned += 1
-
-        if aligned >= 3:
-            persistence = 10
-
-        elif aligned >= 2:
-            persistence = 7
-
-        elif aligned >= 1:
-            persistence = 4
-
-
-    # ========================================================
-    # FINAL SCORE
-    # ========================================================
 
     total = (
-        structure
-        + flow
-        + volume
-        + price
-        + liquidity_score
-        + persistence
+        directional_score
+        + price_score
+        + volume_score
+        + structure_score
+        + persistence_score
     )
 
-    total = clamp(
-        total,
-        0,
-        100
-    )
+    # ========================================================
+    # HARD QUALITY GUARD
+    #
+    # High activity + major price collapse should never
+    # become an ideal runner.
+    # ========================================================
 
-    if len(snapshots) < MIN_OBSERVATIONS:
+    price = safe_float(snap.get("price_change_5m"))
+    volume_mc = safe_float(snap.get("volume_mc_pct"))
 
-        classification = "WATCH"
+    hard_warning = False
 
-    elif total >= IDEAL_SCORE:
+    if volume_mc >= 20 and price <= -15:
+        hard_warning = True
 
-        classification = (
-            "IDEAL RUNNER"
-        )
-
-    elif total >= RUNNER_SCORE:
-
-        classification = "RUNNER"
-
-    elif total >= WATCH_SCORE:
-
-        classification = "WATCH"
-
-    else:
-
-        classification = "OBSERVE"
-
+    if hard_warning:
+        total = min(total, 45)
 
     return {
+        "total": clamp(total, 0, 100),
 
-        "score":
-            round(total, 1),
+        "directional": directional_score,
+        "price": price_score,
+        "volume": volume_score,
+        "structure": structure_score,
+        "persistence": persistence_score,
 
-        "classification":
-            classification,
+        "changes": changes,
 
-        "structure":
-            round(structure, 1),
+        "reasons": (
+            directional_reasons
+            + price_reasons
+            + volume_reasons
+            + structure_reasons
+            + persistence_reasons
+        ),
 
-        "flow":
-            round(flow, 1),
-
-        "volume":
-            round(volume, 1),
-
-        "price":
-            round(price, 1),
-
-        "liquidity":
-            round(
-                liquidity_score,
-                1
-            ),
-
-        "persistence":
-            round(
-                persistence,
-                1
-            ),
+        "hard_warning": hard_warning,
     }
 
 
 # ============================================================
-# HISTORY
+# CLASSIFICATION
 # ============================================================
 
-def create_history_record(
-    item: Dict[str, Any]
+def classify(
+    score: float,
+    observation_count: int,
+    snap: Dict[str, Any],
+    scoring: Dict[str, Any]
+) -> str:
+
+    if observation_count < MIN_OBSERVATIONS_RUNNER:
+        return "WATCH"
+
+    price = safe_float(
+        snap.get("price_change_5m")
+    )
+
+    bs = safe_float(
+        snap.get("bs_ratio")
+    )
+
+    volume_mc = safe_float(
+        snap.get("volume_mc_pct")
+    )
+
+    # Hard rejection for distribution-like activity.
+    if scoring.get("hard_warning"):
+        return "WATCH"
+
+    # Runner requires actual directional confirmation.
+    if score >= RUNNER_SCORE:
+
+        if price > 0 and bs >= 1.2:
+            if (
+                observation_count >= MIN_OBSERVATIONS_IDEAL
+                and score >= IDEAL_SCORE
+                and price > 0
+                and bs >= 1.5
+            ):
+                return "IDEAL RUNNER"
+
+            return "RUNNER"
+
+    return "WATCH"
+
+
+# ============================================================
+# ALERT DECISION
+# ============================================================
+
+def should_alert(
+    token: Dict[str, Any],
+    classification: str
+) -> bool:
+
+    previous_class = token.get("last_alert_classification")
+
+    if classification not in {
+        "RUNNER",
+        "IDEAL RUNNER"
+    }:
+        return False
+
+    # Alert only when entering a runner state
+    # or upgrading to ideal.
+    if previous_class == classification:
+        return False
+
+    return True
+
+
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def money(value: float) -> str:
+
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+
+    return f"${value:.0f}"
+
+
+def format_alert(
+    snap: Dict[str, Any],
+    scoring: Dict[str, Any],
+    classification: str,
+    observations: int
+) -> str:
+
+    score = scoring["total"]
+
+    bs = safe_float(
+        snap.get("bs_ratio")
+    )
+
+    price = safe_float(
+        snap.get("price_change_5m")
+    )
+
+    volume_mc = safe_float(
+        snap.get("volume_mc_pct")
+    )
+
+    tx = safe_int(
+        snap.get("transactions_5m")
+    )
+
+    liquidity = safe_float(
+        snap.get("liquidity")
+    )
+
+    mc = safe_float(
+        snap.get("market_cap")
+    )
+
+    direction = scoring["directional"]
+    price_score = scoring["price"]
+    volume_score = scoring["volume"]
+    structure = scoring["structure"]
+    persistence = scoring["persistence"]
+
+    reasons = scoring.get("reasons", [])
+
+    reasons_text = ", ".join(
+        reasons[:6]
+    )
+
+    return (
+        f"🚀 {classification}\n\n"
+        f"{snap.get('symbol', '?')} | "
+        f"{snap.get('name', '?')}\n\n"
+
+        f"MC: {money(mc)}\n"
+        f"Liquidity: {money(liquidity)}\n"
+        f"5m Price: {price:+.2f}%\n"
+        f"B/S: {bs:.2f}\n"
+        f"5m Vol/MC: {volume_mc:.2f}%\n"
+        f"5m Transactions: {tx}\n\n"
+
+        f"SCORE: {score:.1f}/100\n\n"
+
+        f"Directional: {direction:.1f}/30\n"
+        f"Price: {price_score:.1f}/20\n"
+        f"Volume Quality: {volume_score:.1f}/20\n"
+        f"Structure: {structure:.1f}/15\n"
+        f"Persistence: {persistence:.1f}/15\n\n"
+
+        f"Observations: {observations}\n\n"
+
+        f"Why:\n{reasons_text}\n\n"
+
+        f"Pair: {snap.get('pair_address', '')}\n"
+        f"DEX: {snap.get('dex_id', '')}\n\n"
+
+        f"⚠️ Experimental scanner signal. "
+        f"Not a guarantee of continuation."
+    )
+
+
+# ============================================================
+# DISCOVERY
+# ============================================================
+
+def discover_feed(
+    endpoint: str
+) -> List[Dict[str, Any]]:
+
+    data = dex_get(endpoint)
+
+    if not data:
+        return []
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+
+        for key in (
+            "data",
+            "pairs",
+            "tokens",
+            "profiles",
+            "boosts"
+        ):
+
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return value
+
+    return []
+
+
+def extract_token_address(item: Dict[str, Any]) -> str:
+
+    for key in (
+        "tokenAddress",
+        "token_address",
+        "address"
+    ):
+
+        value = item.get(key)
+
+        if value:
+            return str(value)
+
+    return ""
+
+
+def discovery_candidates() -> List[Dict[str, Any]]:
+
+    print()
+    print("=" * 70)
+    print("V1.1 DISCOVERY — NO SEARCH QUERIES")
+    print(now_iso())
+    print("=" * 70)
+
+    profiles = discover_feed(
+        "/token-profiles/latest/v1"
+    )
+
+    boosts = discover_feed(
+        "/token-boosts/latest/v1"
+    )
+
+    top_boosts = discover_feed(
+        "/token-boosts/top/v1"
+    )
+
+    takeovers = discover_feed(
+        "/community-takeovers/latest/v1"
+    )
+
+    print(f"Latest profiles: {len(profiles)}")
+    print(f"Latest boosts: {len(boosts)}")
+    print(f"Top boosts: {len(top_boosts)}")
+    print(f"Community takeovers: {len(takeovers)}")
+
+    all_items = (
+        profiles
+        + boosts
+        + top_boosts
+        + takeovers
+    )
+
+    addresses = []
+
+    seen = set()
+
+    for item in all_items:
+
+        if not isinstance(item, dict):
+            continue
+
+        address = extract_token_address(item)
+
+        if not address:
+            continue
+
+        if address in seen:
+            continue
+
+        seen.add(address)
+        addresses.append(address)
+
+    print(
+        f"Unique Solana tokens: {len(addresses)}"
+    )
+
+    candidates = []
+
+    for address in addresses:
+
+        pairs = token_pairs(address)
+
+        pair = choose_best_pair(pairs)
+
+        if not pair:
+            continue
+
+        snap = make_snapshot(
+            address,
+            pair,
+            source="live-feed"
+        )
+
+        mc = safe_float(
+            snap["market_cap"]
+        )
+
+        liquidity = safe_float(
+            snap["liquidity"]
+        )
+
+        if mc < MIN_MC:
+            continue
+
+        if mc > MAX_MC:
+            continue
+
+        if liquidity < MIN_LIQUIDITY:
+            continue
+
+        candidates.append(snap)
+
+    # Prefer actual activity rather than arbitrary ordering.
+    candidates.sort(
+        key=lambda x: (
+            safe_float(x.get("volume_mc_pct")),
+            safe_float(x.get("transactions_5m"))
+        ),
+        reverse=True
+    )
+
+    candidates = candidates[
+        :MAX_DISCOVERY_CANDIDATES
+    ]
+
+    print(
+        f"Broad candidates: {len(candidates)}"
+    )
+
+    for i, snap in enumerate(
+        candidates,
+        start=1
+    ):
+
+        print(
+            f"  {i:<2} "
+            f"{snap.get('symbol', '?'):<12} "
+            f"MC {money(snap.get('market_cap', 0)):<10} | "
+            f"Liq {money(snap.get('liquidity', 0)):<10} | "
+            f"5m Vol {money(snap.get('volume_5m', 0)):<10} | "
+            f"Age {snap.get('age_hours', 0):.1f}h"
+        )
+
+    return candidates
+
+
+# ============================================================
+# TRACKING
+# ============================================================
+
+def token_tracking_record(
+    snap: Dict[str, Any]
 ) -> Dict[str, Any]:
 
     return {
+        "token_address": snap["token_address"],
+        "symbol": snap["symbol"],
+        "name": snap["name"],
 
-        "token_address":
-            item["token_address"],
+        "started_at": now_iso(),
 
-        "symbol":
-            item["symbol"],
+        "alerted": False,
 
-        "name":
-            item["name"],
-
-        "discovered_at":
-            now_iso(),
-
-        "discovery":
-            make_snapshot(item),
+        "last_alert_score": 0.0,
+        "last_alert_classification": None,
 
         "snapshots": [],
 
-        "alerts": [],
+        "max_market_cap": snap["market_cap"],
+        "min_market_cap": snap["market_cap"],
 
-        "outcome": {
+        "max_liquidity": snap["liquidity"],
+        "min_liquidity": snap["liquidity"],
 
-            "status":
-                "TRACKING",
-
-            "classification":
-                None,
-
-            "max_mc":
-                None,
-
-            "max_mc_multiple":
-                None,
-
-            "min_liquidity":
-                None,
-
-            "liquidity_ratio":
-                None,
-        },
+        "outcome": None,
     }
 
 
-def get_history_record(
-    token_address: str
-) -> Optional[Dict[str, Any]]:
-
-    for record in HISTORY[
-        "records"
-    ]:
-
-        if (
-            record[
-                "token_address"
-            ]
-            ==
-            token_address
-        ):
-
-            return record
-
-    return None
-
-
-def append_history_snapshot(
-    token_address: str,
-    snapshot: Dict[str, Any]
-) -> None:
-
-    record = get_history_record(
-        token_address
-    )
-
-    if record is None:
-        return
-
-    record[
-        "snapshots"
-    ].append(
-        snapshot
-    )
-
-
-# ============================================================
-# TRACK NEW CANDIDATES
-# ============================================================
-
-def track_new_candidates(
+def ensure_tracking(
     candidates: List[Dict[str, Any]]
 ) -> None:
 
+    tracking = state.setdefault(
+        "tracking",
+        {}
+    )
+
     added = 0
 
-    for item in candidates:
+    for snap in candidates:
 
-        address = item[
-            "token_address"
-        ]
+        address = snap["token_address"]
 
-        if address in STATE[
-            "tracking"
-        ]:
-
+        if address in tracking:
             continue
 
-        STATE[
-            "tracking"
-        ][address] = {
-
-            "token_address":
-                address,
-
-            "symbol":
-                item["symbol"],
-
-            "name":
-                item["name"],
-
-            "started_tracking":
-                time.time(),
-
-            "snapshots": [],
-
-            "latest_score":
-                None,
-
-            "latest_item":
-                item,
-
-            "runner_alerted":
-                False,
-
-            "ideal_alerted":
-                False,
-        }
-
-        HISTORY[
-            "records"
-        ].append(
-            create_history_record(
-                item
-            )
+        tracking[address] = token_tracking_record(
+            snap
         )
 
         added += 1
 
-    print(
-        f"NEW TRACKING: {added}"
-    )
+        history_add(
+            {
+                "event": "discovery",
+                "token_address": address,
+                "symbol": snap["symbol"],
+                "market_cap": snap["market_cap"],
+                "liquidity": snap["liquidity"],
+            }
+        )
 
-
-# ============================================================
-# ALERT FORMAT
-# ============================================================
-
-def format_alert(
-    item: Dict[str, Any],
-    score: Dict[str, Any],
-    snapshots: List[Dict[str, Any]]
-) -> str:
-
-    current = snapshots[-1]
-
-    age = current[
-        "age_hours"
-    ]
-
-    age_text = (
-        f"{age:.1f}h"
-        if age is not None
-        else "N/A"
-    )
-
-    return f"""
-🔥 {score["classification"]}
-
-{item["symbol"]}
-
-MC: ${current["mc"]:,.0f}
-Liquidity: ${current["liquidity"]:,.0f}
-Age: {age_text}
-
-BUYING FLOW
-Buys: {current["buys_5m"]}
-Sells: {current["sells_5m"]}
-B/S: {current["bs_ratio"]:.2f}
-
-MOMENTUM
-5m Price: {current["price_change_5m"]:+.2f}%
-5m Volume: ${current["volume_5m"]:,.0f}
-Volume/MC: {current["volume_mc_pct"]:.2f}%
-
-RUNNER PROFILE
-Score: {score["score"]:.1f}/100
-
-Structure: {score["structure"]:.1f}
-Flow: {score["flow"]:.1f}
-Volume: {score["volume"]:.1f}
-Price: {score["price"]:.1f}
-Liquidity: {score["liquidity"]:.1f}
-Persistence: {score["persistence"]:.1f}
-
-Observations: {len(snapshots)}
-
-DEX:
-https://dexscreener.com/solana/{current["pair_address"]}
-""".strip()
-
-
-# ============================================================
-# SEND ALERT
-# ============================================================
-
-def send_alert(
-    message: str
-) -> None:
-
-    for chat_id in STATE[
-        "subscribers"
-    ]:
-
-        telegram_message(
-            chat_id,
-            message
+    if added:
+        print(
+            f"NEW TRACKING: {added}"
         )
 
 
 # ============================================================
-# VALIDATE ONE TOKEN
+# VALIDATION
 # ============================================================
 
-def validate_candidate(
-    token_address: str
+def validate_token(
+    address: str,
+    token: Dict[str, Any]
 ) -> None:
 
-    tracking = STATE[
-        "tracking"
-    ].get(
-        token_address
-    )
+    pairs = token_pairs(address)
 
-    if not tracking:
+    pair = choose_best_pair(pairs)
+
+    if not pair:
         return
 
-    pairs = get_token_pairs(
-        token_address
+    snap = make_snapshot(
+        address,
+        pair,
+        source="validation"
     )
 
-    item = choose_best_pair(
-        pairs
+    snapshots = token.setdefault(
+        "snapshots",
+        []
     )
-
-    if item is None:
-        return
-
-    snapshot = make_snapshot(
-        item
-    )
-
-    snapshots = tracking[
-        "snapshots"
-    ]
 
     previous = (
         snapshots[-1]
@@ -1747,142 +1478,179 @@ def validate_candidate(
         else None
     )
 
-    snapshot[
-        "features"
-    ] = calculate_features(
+    # Calculate using existing observations.
+    scoring = calculate_score(
+        snap,
         previous,
-        snapshot
+        snapshots + [snap]
     )
 
-    snapshots.append(
-        snapshot
+    observations = len(snapshots) + 1
+
+    classification = classify(
+        scoring["total"],
+        observations,
+        snap,
+        scoring
     )
 
-    score = score_runner(
-        snapshots
+    # Update tracking metrics.
+    token["max_market_cap"] = max(
+        safe_float(token.get("max_market_cap")),
+        safe_float(snap.get("market_cap"))
     )
 
-    tracking[
-        "latest_score"
-    ] = score
-
-    tracking[
-        "latest_item"
-    ] = item
-
-    append_history_snapshot(
-        token_address,
-        snapshot
+    token["min_market_cap"] = min(
+        safe_float(token.get("min_market_cap")),
+        safe_float(snap.get("market_cap"))
     )
 
-    already_ideal = tracking[
-        "ideal_alerted"
-    ]
+    token["max_liquidity"] = max(
+        safe_float(token.get("max_liquidity")),
+        safe_float(snap.get("liquidity"))
+    )
 
-    already_runner = tracking[
-        "runner_alerted"
-    ]
+    token["min_liquidity"] = min(
+        safe_float(token.get("min_liquidity")),
+        safe_float(snap.get("liquidity"))
+    )
 
-    alert_type = None
+    snapshots.append(snap)
 
-    if (
-        score["classification"]
-        ==
-        "IDEAL RUNNER"
-        and not already_ideal
+    # Keep recent observations in active state.
+    if len(snapshots) > 50:
+        token["snapshots"] = snapshots[-50:]
+
+    token["last_score"] = scoring["total"]
+    token["last_classification"] = classification
+
+    print(
+        f"VALIDATION | "
+        f"{snap['symbol']} | "
+        f"{classification} | "
+        f"{scoring['total']:.1f}/100 | "
+        f"B/S {snap['bs_ratio']:.2f} | "
+        f"5m {snap['price_change_5m']:+.2f}% | "
+        f"Vol/MC {snap['volume_mc_pct']:.2f}% | "
+        f"Dir {scoring['directional']:.1f} | "
+        f"VolQ {scoring['volume']:.1f} | "
+        f"Pers {scoring['persistence']:.1f}"
+    )
+
+    history_add(
+        {
+            "event": "validation",
+
+            "token_address": address,
+
+            "symbol": snap["symbol"],
+
+            "classification": classification,
+
+            "score": scoring["total"],
+
+            "directional_score":
+                scoring["directional"],
+
+            "price_score":
+                scoring["price"],
+
+            "volume_score":
+                scoring["volume"],
+
+            "structure_score":
+                scoring["structure"],
+
+            "persistence_score":
+                scoring["persistence"],
+
+            "observations": observations,
+
+            "market_cap":
+                snap["market_cap"],
+
+            "liquidity":
+                snap["liquidity"],
+
+            "price_change_5m":
+                snap["price_change_5m"],
+
+            "volume_mc_pct":
+                snap["volume_mc_pct"],
+
+            "bs_ratio":
+                snap["bs_ratio"],
+
+            "transactions_5m":
+                snap["transactions_5m"],
+
+            "hard_warning":
+                scoring["hard_warning"],
+        }
+    )
+
+    # Alert if entering/upgrading runner status.
+    if should_alert(
+        token,
+        classification
     ):
 
-        alert_type = (
-            "IDEAL RUNNER"
+        alert_text = format_alert(
+            snap,
+            scoring,
+            classification,
+            observations
         )
 
-        tracking[
-            "ideal_alerted"
-        ] = True
+        for chat_id in state.get(
+            "subscribers",
+            []
+        ):
 
-    elif (
-        score["classification"]
-        ==
-        "RUNNER"
-        and not already_runner
-    ):
+            send_message(
+                chat_id,
+                alert_text
+            )
 
-        alert_type = (
-            "RUNNER"
+        token["alerted"] = True
+
+        token["last_alert_score"] = (
+            scoring["total"]
         )
 
-        tracking[
-            "runner_alerted"
-        ] = True
-
-    if alert_type:
-
-        message = format_alert(
-            item,
-            score,
-            snapshots
+        token["last_alert_classification"] = (
+            classification
         )
 
-        send_alert(
-            message
-        )
+        history_add(
+            {
+                "event": "alert",
 
-        record = get_history_record(
-            token_address
-        )
+                "token_address": address,
 
-        if record:
+                "symbol": snap["symbol"],
 
-            record[
-                "alerts"
-            ].append({
-
-                "timestamp":
-                    now_iso(),
-
-                "type":
-                    alert_type,
+                "classification":
+                    classification,
 
                 "score":
-                    score,
+                    scoring["total"],
 
-                "snapshot":
-                    snapshot,
-            })
+                "market_cap":
+                    snap["market_cap"],
 
-        print()
-        print(
-            "=" * 70
-        )
+                "liquidity":
+                    snap["liquidity"],
 
-        print(
-            f"🔥 ALERT: "
-            f"{alert_type}"
-        )
+                "price_change_5m":
+                    snap["price_change_5m"],
 
-        print(
-            f"{item['symbol']} | "
-            f"Score "
-            f"{score['score']:.1f}/100"
-        )
+                "bs_ratio":
+                    snap["bs_ratio"],
 
-        print(
-            "=" * 70
-        )
-
-    else:
-
-        print(
-            f"VALIDATION | "
-            f"{item['symbol']} | "
-            f"{score['classification']} | "
-            f"{score['score']:.1f}/100 | "
-            f"B/S "
-            f"{snapshot['bs_ratio']:.2f} | "
-            f"5m "
-            f"{snapshot['price_change_5m']:+.2f}% | "
-            f"Vol/MC "
-            f"{snapshot['volume_mc_pct']:.2f}%"
+                "volume_mc_pct":
+                    snap["volume_mc_pct"],
+            }
         )
 
 
@@ -1890,74 +1658,70 @@ def validate_candidate(
 # OUTCOME
 # ============================================================
 
-def finalize_outcome(
-    token_address: str,
-    tracking: Dict[str, Any]
-) -> None:
+def evaluate_outcome(
+    token: Dict[str, Any]
+) -> Optional[str]:
 
-    snapshots = tracking[
-        "snapshots"
-    ]
-
-    record = get_history_record(
-        token_address
-    )
-
-    if record is None:
-        return
-
-    if not snapshots:
-
-        record[
-            "outcome"
-        ]["status"] = (
-            "NO_DATA"
-        )
-
-        return
-
-    alerts = record.get(
-        "alerts",
+    snapshots = token.get(
+        "snapshots",
         []
     )
 
-    if not alerts:
+    if not snapshots:
+        return None
 
-        record[
-            "outcome"
-        ]["status"] = (
-            "NO_ALERT"
+    started_at = token.get(
+        "started_at"
+    )
+
+    if not started_at:
+        return None
+
+    try:
+        started = datetime.fromisoformat(
+            started_at
         )
 
-        return
+        age_hours = (
+            datetime.now(timezone.utc)
+            - started
+        ).total_seconds() / 3600
 
-    alert_snapshot = alerts[
-        0
-    ].get(
-        "snapshot"
+    except Exception:
+        return None
+
+    if age_hours < TRACKING_HOURS:
+        return None
+
+    alert_mc = None
+    alert_liq = None
+
+    # Find first runner/ideal alert.
+    for snap in snapshots:
+
+        if snap.get("market_cap", 0) <= 0:
+            continue
+
+        # The first snapshot is used as research baseline
+        # when no actual alert exists.
+        if alert_mc is None:
+            alert_mc = safe_float(
+                snap.get("market_cap")
+            )
+
+            alert_liq = safe_float(
+                snap.get("liquidity")
+            )
+
+    if not alert_mc or not alert_liq:
+        return "UNRESOLVED"
+
+    max_mc = safe_float(
+        token.get("max_market_cap")
     )
 
-    if not alert_snapshot:
-        return
-
-    alert_mc = alert_snapshot[
-        "mc"
-    ]
-
-    alert_liquidity = (
-        alert_snapshot[
-            "liquidity"
-        ]
-    )
-
-    max_mc = max(
-        s["mc"]
-        for s in snapshots
-    )
-
-    min_liquidity = min(
-        s["liquidity"]
-        for s in snapshots
+    min_liq = safe_float(
+        token.get("min_liquidity")
     )
 
     mc_multiple = (
@@ -1966,346 +1730,139 @@ def finalize_outcome(
         else 0
     )
 
-    liquidity_ratio = (
-        min_liquidity
-        / alert_liquidity
-        if alert_liquidity > 0
+    liq_multiple = (
+        min_liq / alert_liq
+        if alert_liq > 0
         else 0
     )
 
     if (
-        mc_multiple >= 1.50
-        and liquidity_ratio >= 0.70
+        mc_multiple >= CONTINUATION_MC_MULTIPLE
+        and liq_multiple >=
+        CONTINUATION_LIQUIDITY_MULTIPLE
     ):
+        return "CONTINUATION"
 
-        outcome = (
-            "CONTINUATION"
-        )
-
-    elif (
-        mc_multiple < 0.80
-        or liquidity_ratio < 0.50
+    if (
+        mc_multiple < FAILURE_MC_MULTIPLE
+        or liq_multiple < FAILURE_LIQUIDITY_MULTIPLE
     ):
+        return "FAILURE"
 
-        outcome = (
-            "FAILURE"
-        )
+    return "MIXED"
 
-    else:
 
-        outcome = "MIXED"
+def clean_old_tracking() -> None:
 
-    record[
-        "outcome"
-    ] = {
-
-        "status":
-            "COMPLETE",
-
-        "classification":
-            outcome,
-
-        "max_mc":
-            max_mc,
-
-        "max_mc_multiple":
-            mc_multiple,
-
-        "min_liquidity":
-            min_liquidity,
-
-        "liquidity_ratio":
-            liquidity_ratio,
-
-        "completed_at":
-            now_iso(),
-    }
-
-    print(
-        f"OUTCOME | "
-        f"{tracking['symbol']} | "
-        f"{outcome} | "
-        f"MC x{mc_multiple:.2f} | "
-        f"Liq {liquidity_ratio:.2f}"
+    tracking = state.get(
+        "tracking",
+        {}
     )
-
-
-# ============================================================
-# REMOVE OLD TRACKING
-# ============================================================
-
-def prune_tracking() -> None:
-
-    current_time = time.time()
 
     remove = []
 
-    for (
-        address,
-        tracking
-    ) in STATE[
-        "tracking"
-    ].items():
+    for address, token in tracking.items():
 
-        elapsed_hours = (
-            current_time
-            -
-            tracking[
-                "started_tracking"
-            ]
-        ) / 3600
+        if token.get("outcome"):
+            continue
 
-        if (
-            elapsed_hours
-            >= TRACKING_HOURS
-        ):
+        outcome = evaluate_outcome(
+            token
+        )
 
-            finalize_outcome(
-                address,
-                tracking
+        if outcome:
+
+            token["outcome"] = outcome
+
+            history_add(
+                {
+                    "event": "outcome",
+
+                    "token_address":
+                        address,
+
+                    "symbol":
+                        token.get("symbol"),
+
+                    "outcome":
+                        outcome,
+
+                    "max_market_cap":
+                        token.get("max_market_cap"),
+
+                    "min_liquidity":
+                        token.get("min_liquidity"),
+                }
             )
 
-            remove.append(
-                address
+            print(
+                f"OUTCOME | "
+                f"{token.get('symbol', '?')} | "
+                f"{outcome}"
             )
+
+            remove.append(address)
 
     for address in remove:
-
-        del STATE[
-            "tracking"
-        ][address]
+        del tracking[address]
 
 
 # ============================================================
-# TELEGRAM UPDATES
+# VALIDATE ALL
 # ============================================================
 
-def process_updates() -> None:
+def validate_all() -> None:
 
-    if not TELEGRAM_TOKEN:
+    tracking = state.get(
+        "tracking",
+        {}
+    )
+
+    if not tracking:
         return
 
-    offset = STATE.get(
-        "telegram_offset",
-        0
+    print(
+        f"VALIDATING {len(tracking)} candidates..."
     )
 
-    url = (
-        f"{TELEGRAM_BASE}/bot"
-        f"{TELEGRAM_TOKEN}/getUpdates"
-        f"?timeout=1"
-        f"&offset={offset}"
+    for address in list(tracking.keys()):
+
+        try:
+            validate_token(
+                address,
+                tracking[address]
+            )
+
+        except Exception as e:
+
+            print(
+                f"VALIDATION ERROR | "
+                f"{address} | {e}"
+            )
+
+    clean_old_tracking()
+
+    save_json(
+        STATE_FILE,
+        state
     )
-
-    data = http_get(
-        url,
-        timeout=5
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        return
-
-    updates = data.get(
-        "result",
-        []
-    )
-
-    for update in updates:
-
-        update_id = update.get(
-            "update_id"
-        )
-
-        if update_id is not None:
-
-            STATE[
-                "telegram_offset"
-            ] = (
-                update_id + 1
-            )
-
-        message = update.get(
-            "message"
-        )
-
-        if not message:
-            continue
-
-        chat = (
-            message.get("chat")
-            or {}
-        )
-
-        chat_id = str(
-            chat.get("id")
-        )
-
-        text = (
-            message.get("text")
-            or ""
-        ).strip()
-
-        if not chat_id:
-            continue
-
-        # ----------------------------------------------------
-        # START
-        # ----------------------------------------------------
-
-        if text.startswith(
-            "/start"
-        ):
-
-            if (
-                chat_id
-                not in STATE[
-                    "subscribers"
-                ]
-            ):
-
-                STATE[
-                    "subscribers"
-                ].append(
-                    chat_id
-                )
-
-            telegram_message(
-                chat_id,
-                "🔥 Runner Bot V1 "
-                "is online.\n\n"
-                "No search queries are "
-                "being used.\n\n"
-                "I am monitoring Solana "
-                "tokens through live "
-                "DexScreener discovery "
-                "feeds and evaluating "
-                "flow, volume, price, "
-                "liquidity and "
-                "persistence."
-            )
-
-        # ----------------------------------------------------
-        # STATUS
-        # ----------------------------------------------------
-
-        elif text.startswith(
-            "/status"
-        ):
-
-            tracking_count = len(
-                STATE[
-                    "tracking"
-                ]
-            )
-
-            history_count = len(
-                HISTORY[
-                    "records"
-                ]
-            )
-
-            telegram_message(
-                chat_id,
-                "RUNNER BOT V1\n\n"
-                f"Tracking: "
-                f"{tracking_count}\n"
-                f"History: "
-                f"{history_count}\n"
-                f"Subscribers: "
-                f"{len(STATE['subscribers'])}"
-            )
-
-        # ----------------------------------------------------
-        # HISTORY
-        # ----------------------------------------------------
-
-        elif text.startswith(
-            "/history"
-        ):
-
-            total = len(
-                HISTORY[
-                    "records"
-                ]
-            )
-
-            alerts = sum(
-                len(
-                    record.get(
-                        "alerts",
-                        []
-                    )
-                )
-                for record
-                in HISTORY[
-                    "records"
-                ]
-            )
-
-            telegram_message(
-                chat_id,
-                "RUNNER BOT V1 HISTORY\n\n"
-                f"Records: {total}\n"
-                f"Alerts: {alerts}"
-            )
-
-        # ----------------------------------------------------
-        # STOP
-        # ----------------------------------------------------
-
-        elif text.startswith(
-            "/stop"
-        ):
-
-            if (
-                chat_id
-                in STATE[
-                    "subscribers"
-                ]
-            ):
-
-                STATE[
-                    "subscribers"
-                ].remove(
-                    chat_id
-                )
-
-            telegram_message(
-                chat_id,
-                "Runner alerts disabled."
-            )
 
 
 # ============================================================
-# MAIN
+# MAIN LOOP
 # ============================================================
 
-def main():
+def main() -> None:
 
     print("=" * 70)
-
-    print(
-        "RUNNER BOT V1"
-    )
-
-    print(
-        "FRESH IDEAL RUNNER ENGINE"
-    )
-
-    print(
-        "NO SEARCH QUERIES"
-    )
-
+    print("RUNNER BOT V1.1")
+    print("DIRECTIONAL ACTIVITY + PERSISTENCE ENGINE")
+    print("NO SEARCH QUERIES")
     print("=" * 70)
 
     print(
         f"MC research range: "
-        f"${MIN_MC:,} - "
-        f"${MAX_MC:,}"
+        f"${MIN_MC:,} - ${MAX_MC:,}"
     )
 
     print(
@@ -2314,185 +1871,115 @@ def main():
     )
 
     print(
-        f"Watch score: "
-        f"{WATCH_SCORE}"
+        f"Watch score: {WATCH_SCORE}"
     )
 
     print(
-        f"Runner score: "
-        f"{RUNNER_SCORE}"
+        f"Runner score: {RUNNER_SCORE}"
     )
 
     print(
-        f"Ideal runner score: "
-        f"{IDEAL_SCORE}"
+        f"Ideal runner score: {IDEAL_SCORE}"
     )
 
     print(
-        "Discovery: "
-        "DexScreener live feeds"
+        "Scoring: "
+        "Directional 30 | "
+        "Price 20 | "
+        "Volume Quality 20 | "
+        "Structure 15 | "
+        "Persistence 15"
+    )
+
+    print(
+        "Discovery: DexScreener live feeds"
     )
 
     print(
         "Search queries: NONE"
     )
 
-    print(
-        "Telegram: "
-        + (
-            "connected"
-            if TELEGRAM_TOKEN
-            else
-            "NOT CONNECTED"
+    if TELEGRAM_TOKEN:
+        print(
+            "Telegram: connected"
         )
-    )
+    else:
+        print(
+            "Telegram: NOT CONNECTED"
+        )
 
     print("=" * 70)
+
+    last_discovery_run = 0
+    last_validation_run = 0
 
     while True:
 
         try:
 
-            current_time = time.time()
+            process_telegram_updates()
 
-            # ------------------------------------------------
-            # TELEGRAM
-            # ------------------------------------------------
-
-            process_updates()
+            now = time.time()
 
             # ------------------------------------------------
             # DISCOVERY
             # ------------------------------------------------
 
             if (
-                current_time
-                -
-                STATE[
-                    "last_discovery"
-                ]
-                >=
-                DISCOVERY_SECONDS
+                now - last_discovery_run
+                >= DISCOVERY_INTERVAL
             ):
 
                 candidates = (
-                    discover_candidates()
+                    discovery_candidates()
                 )
 
-                track_new_candidates(
+                ensure_tracking(
                     candidates
                 )
 
-                STATE[
-                    "last_discovery"
-                ] = current_time
+                state["last_discovery"] = now
 
                 save_json(
                     STATE_FILE,
-                    STATE
+                    state
                 )
 
-                save_json(
-                    HISTORY_FILE,
-                    HISTORY
-                )
+                last_discovery_run = now
 
             # ------------------------------------------------
             # VALIDATION
             # ------------------------------------------------
 
             if (
-                current_time
-                -
-                STATE[
-                    "last_validation"
-                ]
-                >=
-                VALIDATION_SECONDS
+                now - last_validation_run
+                >= VALIDATION_INTERVAL
             ):
 
-                addresses = list(
-                    STATE[
-                        "tracking"
-                    ].keys()
-                )
+                validate_all()
 
-                print()
-                print(
-                    f"VALIDATING "
-                    f"{len(addresses)} "
-                    f"candidates..."
-                )
-
-                for address in addresses:
-
-                    try:
-
-                        validate_candidate(
-                            address
-                        )
-
-                    except Exception as e:
-
-                        print(
-                            f"VALIDATION ERROR "
-                            f"{address}: "
-                            f"{e}"
-                        )
-
-                    time.sleep(
-                        0.15
-                    )
-
-                STATE[
-                    "last_validation"
-                ] = current_time
+                state["last_validation"] = now
 
                 save_json(
                     STATE_FILE,
-                    STATE
+                    state
                 )
 
-                save_json(
-                    HISTORY_FILE,
-                    HISTORY
-                )
-
-            # ------------------------------------------------
-            # CLEANUP
-            # ------------------------------------------------
-
-            prune_tracking()
-
-            save_json(
-                STATE_FILE,
-                STATE
-            )
-
-            save_json(
-                HISTORY_FILE,
-                HISTORY
-            )
+                last_validation_run = now
 
             time.sleep(
-                SCAN_SECONDS
+                SCAN_INTERVAL
             )
 
         except KeyboardInterrupt:
 
-            print()
             print(
-                "Runner Bot V1 stopped."
+                "\nBot stopped."
             )
 
             save_json(
                 STATE_FILE,
-                STATE
-            )
-
-            save_json(
-                HISTORY_FILE,
-                HISTORY
+                state
             )
 
             break
@@ -2500,11 +1987,12 @@ def main():
         except Exception as e:
 
             print(
-                f"MAIN LOOP ERROR: "
-                f"{e}"
+                f"MAIN LOOP ERROR: {e}"
             )
 
-            time.sleep(5)
+            time.sleep(
+                SCAN_INTERVAL
+            )
 
 
 # ============================================================
@@ -2512,5 +2000,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
