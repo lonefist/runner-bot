@@ -1,358 +1,314 @@
+# RUNNER BOT V5.6-DEXSCREENER-VALID-SEARCH
+# Full replacement for bot.py.
+# Discovery uses only documented DexScreener endpoints.
+# User filters/recovery rules are unchanged.
+
 import json, os, time, urllib.parse, urllib.request, urllib.error
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
 
-BOT_VERSION = "V5.5-DEXSCREENER-BROAD-SEARCH"
-DEX_BASE = "https://api.dexscreener.com"
-TELEGRAM_BASE = "https://api.telegram.org"
-STATE_FILE = "runner_state.json"
+BOT_VERSION="V5.6-DEXSCREENER-VALID-SEARCH"
+DEX="https://api.dexscreener.com"
+TG="https://api.telegram.org"
+STATE_FILE="runner_state.json"
 
-# DISCOVERY: intentionally broad; NO maximum age
-MIN_MARKET_CAP = 30_000.0
-MAX_MARKET_CAP = 350_000.0
-MIN_LIQUIDITY = 30_000.0
-MIN_PAIR_AGE_HOURS = 6.0
-MAX_PAIR_AGE_HOURS = None
+MIN_MC=30000.0
+MAX_MC=350000.0
+MIN_LIQ=30000.0
+MIN_AGE_H=6.0
 
-# SECOND-WAVE / RECOVERY
-MIN_RECOVERY_VOL_MC = 0.035
-MIN_CURRENT_BS = 1.35
-MIN_PREVIOUS_BS = 1.30
-MIN_PRICE_CHANGE_5M = 2.0
-MAX_PRICE_CHANGE_5M = 40.0
-MIN_VOLUME_EXPANSION = 0.08
-CONFIRMATIONS_REQUIRED = 2
-TRACKING_WINDOW_HOURS = 8.0
+MIN_VOL_MC=.035
+MIN_BS=1.35
+MIN_PREV_BS=1.30
+MIN_PC5=2.0
+MAX_PC5=40.0
+MIN_VOL_EXP=.08
+CONFIRMATIONS=2
+TRACK_H=8.0
 
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
-DISCOVERY_INTERVAL_SECONDS = int(os.getenv("DISCOVERY_INTERVAL_SECONDS", "300"))
-VALIDATION_INTERVAL_SECONDS = int(os.getenv("VALIDATION_INTERVAL_SECONDS", "300"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ALERTS_ENABLED = os.getenv("HEATING_ALERTS_ENABLED", "true").lower() == "true"
+SCAN=int(os.getenv("SCAN_INTERVAL_SECONDS","15"))
+DISCOVERY=int(os.getenv("DISCOVERY_INTERVAL_SECONDS","300"))
+VALIDATION=int(os.getenv("VALIDATION_INTERVAL_SECONDS","300"))
+TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+ALERTS=os.getenv("HEATING_ALERTS_ENABLED","true").lower()=="true"
 
-# DexScreener search is a query endpoint, not a full screener endpoint.
-# Search returns matching pairs and is rate-limited at 300 requests/minute.
-# We use a broad sweep and deduplicate by token/pair before filtering.
-SEARCH_QUERIES = list("abcdefghijklmnopqrstuvwxyz0123456789") + [
-    "sol", "usdc", "usdt", "usd", "coin", "token", "cat", "dog", "ai",
-    "meme", "inu", "pepe", "frog", "moon", "pump", "doge", "shib",
-    "woof", "baby", "bear", "bull", "ape", "kitty", "goat", "fish",
-    "chad", "elon", "trump", "game", "arc", "agent", "ai16z", "solana",
-]
-SUPPLEMENTARY_ENDPOINTS = [
-    "/token-profiles/latest/v1",
-    "/token-boosts/latest/v1",
-    "/token-boosts/top/v1",
-    "/community-takeovers/latest/v1",
-    "/ads/latest/v1",
+# Meaningful queries only. One-character queries caused HTTP 400s.
+# Search returns matching pairs; it is not a paginated copy of the website screener.
+QUERIES=[
+"solana","sol","usdc","usdt","coin","token","meme","cat","dog","doge",
+"shib","pepe","inu","frog","moon","pump","woof","baby","bear","bull",
+"ape","kitty","goat","fish","chad","elon","trump","game","arc","agent",
+"ai","ai16z","degen","based","bonk","wif","snek","penguin","rabbit",
+"horse","duck","bird","hamster","pizza","money","rich","gold","fire",
+"rocket","star","world","meta","bot","chain","labs","finance","swap",
+"club","dao","cult","mini","max","go","fun","cash","king","queen"
 ]
 
+SUPPLEMENTARY=[
+"/token-profiles/latest/v1",
+"/token-boosts/latest/v1",
+"/token-boosts/top/v1",
+"/community-takeovers/latest/v1",
+"/ads/latest/v1"
+]
 
-def http_get_json(url: str, timeout: int = 20, retries: int = 2) -> Any:
-    last = None
-    for attempt in range(retries + 1):
+def ts(): return time.time()
+def utc(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def n(v,d=0.0):
+    try:return float(v)
+    except:return d
+
+def http(url, timeout=20, retries=2):
+    last=None
+    for i in range(retries+1):
         try:
-            req = urllib.request.Request(url, headers={"Accept":"application/json", "User-Agent":f"RunnerBot/{BOT_VERSION}"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8", errors="replace"))
+            req=urllib.request.Request(url,headers={"Accept":"application/json","User-Agent":f"RunnerBot/{BOT_VERSION}"})
+            with urllib.request.urlopen(req,timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8","replace"))
         except urllib.error.HTTPError as e:
-            last = e
-            time.sleep((2 if e.code == 429 else 1) + attempt)
+            last=e
+            if e.code==429: time.sleep(2+i*2)
+            elif 500<=e.code<600: time.sleep(1+i)
+            else: break
         except Exception as e:
-            last = e
-            time.sleep(1 + attempt)
+            last=e; time.sleep(1+i)
     print(f"HTTP ERROR | {url} | {last}")
     return None
 
-
-def now() -> float: return time.time()
-def utc_text() -> str: return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-def sf(v: Any, default=0.0) -> float:
-    try: return float(v)
-    except Exception: return default
-
-
-def money(v: Any) -> str:
-    v = sf(v)
-    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
-    if v >= 1_000: return f"{v/1_000:.1f}K"
-    return f"{v:.0f}"
-
-
-def age_text(hours: float) -> str:
-    return f"{hours:.1f}h" if hours < 24 else f"{hours/24:.1f}d"
-
-
-def market_cap(p: Dict[str,Any]) -> float:
-    return sf(p.get("marketCap")) or sf(p.get("fdv"))
-
-
-def liquidity(p: Dict[str,Any]) -> float:
-    return sf((p.get("liquidity") or {}).get("usd"))
-
-
-def age_hours(p: Dict[str,Any]) -> Optional[float]:
-    x = p.get("pairCreatedAt")
-    if x is None: return None
-    try: return max(0.0, (now() - float(x)/1000) / 3600)
-    except Exception: return None
-
-
-def token_address(p: Dict[str,Any]) -> str:
-    return str((p.get("baseToken") or {}).get("address") or "")
-
-
-def pair_key(p: Dict[str,Any]) -> str:
-    return str(p.get("pairAddress") or "")
-
-
-def pair_quality(p: Dict[str,Any]) -> Tuple[float,float]:
-    return (liquidity(p), market_cap(p))
-
-
-def best_solana_pair(pairs: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
-    x = [p for p in pairs if isinstance(p,dict) and p.get("chainId") == "solana"]
-    return max(x, key=pair_quality) if x else None
-
-
-# ---------------- STATE ----------------
 def default_state():
-    return {"subscribers":[], "tracking":{}, "last_discovery":0, "last_validation":0, "telegram_offset":None}
+    return {"subscribers":[],"tracking":{},"telegram_offset":None,"last_discovery":0,"last_validation":0}
 
-
-def load_state():
-    if not os.path.exists(STATE_FILE): return default_state()
+def load():
     try:
-        with open(STATE_FILE, encoding="utf-8") as f: s=json.load(f)
-        b=default_state(); b.update(s if isinstance(s,dict) else {})
-        return b
-    except Exception as e:
-        print(f"STATE LOAD ERROR | {e}"); return default_state()
+        with open(STATE_FILE,encoding="utf-8") as f:s=json.load(f)
+        d=default_state()
+        if not isinstance(s,dict):return d
+        for k,v in d.items():s.setdefault(k,v)
+        return s
+    except Exception:return default_state()
 
+STATE=load()
 
-STATE = load_state()
-
-
-def save_state():
+def save():
     try:
         tmp=STATE_FILE+".tmp"
-        with open(tmp,"w",encoding="utf-8") as f: json.dump(STATE,f,indent=2)
+        with open(tmp,"w",encoding="utf-8") as f:json.dump(STATE,f,indent=2)
         os.replace(tmp,STATE_FILE)
-    except Exception as e: print(f"STATE SAVE ERROR | {e}")
+    except Exception as e:print(f"STATE SAVE ERROR | {e}")
 
-
-# ---------------- TELEGRAM ----------------
-def tg(method: str, payload: Dict[str,Any]):
-    if not TELEGRAM_BOT_TOKEN: return None
+def tg(method,payload):
+    if not TOKEN:return None
     try:
         data=urllib.parse.urlencode(payload).encode()
-        req=urllib.request.Request(f"{TELEGRAM_BASE}/bot{TELEGRAM_BOT_TOKEN}/{method}", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req,timeout=20) as r: return json.loads(r.read().decode())
+        req=urllib.request.Request(f"{TG}/bot{TOKEN}/{method}",data=data,headers={"Content-Type":"application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req,timeout=20) as r:return json.loads(r.read().decode())
     except Exception as e:
-        print(f"TELEGRAM ERROR | {method} | {e}"); return None
+        print(f"TELEGRAM ERROR | {method} | {e}");return None
 
+def send(cid,text):
+    tg("sendMessage",{"chat_id":str(cid),"text":text,"disable_web_page_preview":"true"})
 
-def send(chat_id, text): tg("sendMessage", {"chat_id":str(chat_id),"text":text,"disable_web_page_preview":"true"})
-
-
-def poll_telegram():
-    if not TELEGRAM_BOT_TOKEN: return
-    payload={"timeout":"1","allowed_updates":json.dumps(["message"])}
-    if STATE.get("telegram_offset") is not None: payload["offset"]=str(STATE["telegram_offset"])
-    r=tg("getUpdates",payload)
-    if not r or not r.get("ok"): return
+def poll():
+    if not TOKEN:return
+    q={"timeout":"1","allowed_updates":json.dumps(["message"])}
+    if STATE.get("telegram_offset") is not None:q["offset"]=str(STATE["telegram_offset"])
+    r=tg("getUpdates",q)
+    if not r or not r.get("ok"):return
     for u in r.get("result",[]):
         STATE["telegram_offset"]=u["update_id"]+1
-        m=u.get("message") or {}; chat=(m.get("chat") or {}).get("id"); text=(m.get("text") or "").strip()
-        if chat is None: continue
-        if text=="/start":
-            if chat not in STATE["subscribers"]: STATE["subscribers"].append(chat)
-            send(chat,"Runner Bot is online.\nDexScreener broad discovery is active.\nUse /status or /tracking.")
-        elif text=="/stop":
-            STATE["subscribers"]=[x for x in STATE["subscribers"] if x!=chat]; send(chat,"Alerts stopped for this chat.")
-        elif text=="/alerts": send(chat,f"Alerts: {'ON' if chat in STATE['subscribers'] else 'OFF'}")
-        elif text=="/status": send(chat,f"{BOT_VERSION}\nTracking: {len(STATE['tracking'])}\nDiscovery: every {DISCOVERY_INTERVAL_SECONDS}s\nValidation: every {VALIDATION_INTERVAL_SECONDS}s\nSubscribers: {len(STATE['subscribers'])}")
-        elif text=="/tracking":
-            if not STATE["tracking"]: send(chat,"Tracking: none.")
-            else:
-                lines=["TRACKING"]
-                for x in STATE["tracking"].values(): lines.append(f"- {x.get('symbol','?')} | MC ${money(x.get('market_cap',0))} | liq ${money(x.get('liquidity',0))}")
-                send(chat,"\n".join(lines))
-    save_state()
+        m=u.get("message") or {};c=m.get("chat") or {};cid=c.get("id")
+        if cid is None:continue
+        t=(m.get("text") or "").strip()
+        if t=="/start":
+            if cid not in STATE["subscribers"]:STATE["subscribers"].append(cid)
+            send(cid,"Runner Bot is online.\nV5.6 DexScreener valid-search discovery is active.")
+        elif t=="/stop":
+            STATE["subscribers"]=[x for x in STATE["subscribers"] if x!=cid];send(cid,"Alerts stopped.")
+        elif t=="/alerts":send(cid,f"Alerts: {'ON' if cid in STATE['subscribers'] else 'OFF'}")
+        elif t=="/status":send(cid,f"{BOT_VERSION}\nTracking: {len(STATE['tracking'])}\nDiscovery: {DISCOVERY}s\nValidation: {VALIDATION}s")
+        elif t=="/tracking":
+            if not STATE["tracking"]:send(cid,"Tracking: none.")
+            else:send(cid,"TRACKING\n"+"\n".join(f"- {r.get('symbol','?')} | MC ${money(r.get('mc',0))} | liq ${money(r.get('liq',0))}" for r in STATE["tracking"].values()))
+    save()
 
+def money(v):
+    v=n(v)
+    return f"{v/1e6:.2f}M" if v>=1e6 else f"{v/1e3:.1f}K" if v>=1e3 else f"{v:.0f}"
 
-# ---------------- DISCOVERY ----------------
-def search(q: str) -> List[Dict[str,Any]]:
-    u=f"{DEX_BASE}/latest/dex/search?q={urllib.parse.quote(q,safe='')}"
-    d=http_get_json(u)
+def mc(p):return n(p.get("marketCap")) or n(p.get("fdv"))
+def liq(p):return n((p.get("liquidity") or {}).get("usd"))
+def age(p):
+    x=p.get("pairCreatedAt")
+    if x is None:return None
+    return max(0,(ts()-n(x)/1000)/3600)
+def key(p):return str((p.get("baseToken") or {}).get("address") or "")
+def tx5(p):
+    x=(p.get("txns") or {}).get("m5") or {}
+    return int(n(x.get("buys"))),int(n(x.get("sells")))
+def vol5(p):return n((p.get("volume") or {}).get("m5"))
+def pc5(p):return n((p.get("priceChange") or {}).get("m5"))
+
+def search(q):
+    u=f"{DEX}/latest/dex/search?q={urllib.parse.quote(q,safe='')}"
+    d=http(u)
     return d.get("pairs",[]) if isinstance(d,dict) and isinstance(d.get("pairs"),list) else []
 
+def best(ps):
+    ps=[p for p in ps if isinstance(p,dict) and p.get("chainId")=="solana"]
+    return max(ps,key=lambda p:(liq(p),mc(p))) if ps else None
 
-def supplementary() -> List[Dict[str,Any]]:
-    out=[]
-    for ep in SUPPLEMENTARY_ENDPOINTS:
-        d=http_get_json(DEX_BASE+ep)
-        if isinstance(d,list): out.extend(x for x in d if isinstance(x,dict))
-    return out
-
-
-def discover_raw() -> Tuple[List[Dict[str,Any]],Dict[str,int]]:
-    pairs={}; stats={"queries":0,"search_results":0,"supplementary_tokens":0,"supplementary_pairs":0}
-    for q in SEARCH_QUERIES:
-        stats["queries"]+=1
+def discover():
+    pairs={}
+    c={"queries":0,"search_results":0,"supp_tokens":0,"supp_pairs":0}
+    for q in QUERIES:
+        c["queries"]+=1
         for p in search(q):
-            stats["search_results"]+=1
-            if p.get("chainId")!="solana": continue
-            k=pair_key(p)
-            if k and (k not in pairs or pair_quality(p)>pair_quality(pairs[k])): pairs[k]=p
-    supp=supplementary(); stats["supplementary_tokens"]=len(supp)
-    addrs=[]; seen=set()
-    for x in supp:
-        if x.get("chainId")!="solana": continue
+            c["search_results"]+=1
+            if p.get("chainId")!="solana":continue
+            pa=p.get("pairAddress")
+            if not pa:continue
+            if pa not in pairs or (liq(p),mc(p))>(liq(pairs[pa]),mc(p)):pairs[pa]=p
+
+    extras=[]
+    for ep in SUPPLEMENTARY:
+        d=http(DEX+ep)
+        if isinstance(d,list):extras.extend(x for x in d if isinstance(x,dict))
+    c["supp_tokens"]=len(extras)
+
+    addrs=[];seen=set()
+    for x in extras:
         a=x.get("tokenAddress")
-        if a and a not in seen: seen.add(a); addrs.append(a)
-    # /tokens/v1/solana/{tokenAddresses} accepts up to 30 token addresses.
+        if x.get("chainId")=="solana" and a and a not in seen:
+            seen.add(a);addrs.append(a)
+
     for i in range(0,len(addrs),30):
-        joined=",".join(addrs[i:i+30])
-        d=http_get_json(f"{DEX_BASE}/tokens/v1/solana/{urllib.parse.quote(joined,safe=',')}")
-        if not isinstance(d,list): continue
+        batch=",".join(addrs[i:i+30])
+        d=http(f"{DEX}/tokens/v1/solana/{urllib.parse.quote(batch,safe=',')}")
+        if not isinstance(d,list):continue
         for p in d:
-            if not isinstance(p,dict) or p.get("chainId")!="solana": continue
-            stats["supplementary_pairs"]+=1
-            k=pair_key(p)
-            if k and (k not in pairs or pair_quality(p)>pair_quality(pairs[k])): pairs[k]=p
-    return list(pairs.values()),stats
+            if not isinstance(p,dict) or p.get("chainId")!="solana":continue
+            c["supp_pairs"]+=1
+            pa=p.get("pairAddress")
+            if pa and (pa not in pairs or (liq(p),mc(p))>(liq(pairs[pa]),mc(pairs[pa]))):pairs[pa]=p
 
+    tokens={}
+    for p in pairs.values():
+        k=key(p)
+        if k and (k not in tokens or (liq(p),mc(p))>(liq(tokens[k]),mc(tokens[k]))):tokens[k]=p
 
-def filter_discovery(raw):
-    audit={"raw":len(raw),"solana":0,"unique":0,"mc_below":0,"mc_above":0,"liq_below":0,"age_below":0,"missing_age":0,"qualified":0}
-    best={}
-    for p in raw:
-        if p.get("chainId")!="solana": continue
-        audit["solana"]+=1; k=token_address(p)
-        if k and (k not in best or pair_quality(p)>pair_quality(best[k])): best[k]=p
-    audit["unique"]=len(best); out=[]
-    for p in best.values():
-        mc=market_cap(p); liq=liquidity(p); age=age_hours(p)
-        if mc<MIN_MARKET_CAP: audit["mc_below"]+=1; continue
-        if mc>MAX_MARKET_CAP: audit["mc_above"]+=1; continue
-        if liq<MIN_LIQUIDITY: audit["liq_below"]+=1; continue
-        if age is None: audit["missing_age"]+=1; continue
-        if age<MIN_PAIR_AGE_HOURS: audit["age_below"]+=1; continue
-        out.append(p)
-    audit["qualified"]=len(out); return out,audit
-
+    a={"raw":len(pairs),"unique":len(tokens),"mc_low":0,"mc_high":0,"liq_low":0,"age_low":0,"missing_age":0,"qualified":0}
+    good=[]
+    for p in tokens.values():
+        a0=age(p)
+        if mc(p)<MIN_MC:a["mc_low"]+=1;continue
+        if mc(p)>MAX_MC:a["mc_high"]+=1;continue
+        if liq(p)<MIN_LIQ:a["liq_low"]+=1;continue
+        if a0 is None:a["missing_age"]+=1;continue
+        if a0<MIN_AGE_H:a["age_low"]+=1;continue
+        good.append(p)
+    a["qualified"]=len(good)
+    return good,c,a
 
 def prune():
-    cutoff=now()-TRACKING_WINDOW_HOURS*3600
+    cutoff=ts()-TRACK_H*3600
     for k in list(STATE["tracking"]):
-        if sf(STATE["tracking"][k].get("discovered_at"))<=cutoff:
-            print(f"TRACKING EXPIRED | {STATE['tracking'][k].get('symbol','?')}"); del STATE["tracking"][k]
+        if n(STATE["tracking"][k].get("discovered_at"))<=cutoff:
+            print(f"TRACKING EXPIRED | {STATE['tracking'][k].get('symbol','?')}")
+            del STATE["tracking"][k]
 
+def add(good):
+    new=0
+    for p in good:
+        k=key(p)
+        if not k or k in STATE["tracking"]:continue
+        b=p.get("baseToken") or {}
+        STATE["tracking"][k]={"address":k,"pair_address":p.get("pairAddress"),"symbol":b.get("symbol") or "?","name":b.get("name") or "?","mc":mc(p),"liq":liq(p),"discovered_at":ts(),"streak":0,"previous_bs":None,"previous_volume":None,"alerted":False}
+        print(f"TRACKING NEW | {b.get('symbol','?')} | MC ${money(mc(p))} | liq ${money(liq(p))} | age {(age(p) or 0):.1f}h")
+        new+=1
+    return new
+
+def token_pair(addr):
+    d=http(f"{DEX}/token-pairs/v1/solana/{urllib.parse.quote(addr,safe='')}")
+    return best(d) if isinstance(d,list) else None
+
+def alert(p,r,bs,buy,sell,v,vm,pc,exp):
+    b=p.get("baseToken") or {}
+    msg=(f"ð¥ RUNNER RECOVERY CONFIRMED\n\nToken: {b.get('symbol') or r['symbol']}\nMC: ${money(mc(p))}\nLiquidity: ${money(liq(p))}\nAge: {(age(p) or 0):.1f}h\n\n5m Price: {pc:+.2f}%\n5m Buys/Sells: {buy}/{sell}\nB/S: {bs:.2f}\n5m Volume: ${money(v)}\nVol/MC: {vm*100:.2f}%\nVolume expansion: {exp*100:+.1f}%\nConfirmations: {CONFIRMATIONS}/{CONFIRMATIONS}\n\nDexScreener: {p.get('url','')}\n\nâ ï¸ Scanner signal only. Not financial advice.")
+    print("="*68);print(msg);print("="*68)
+    if ALERTS:
+        for cid in STATE["subscribers"]:send(cid,msg)
+
+def validate(addr,r):
+    p=token_pair(addr)
+    if not p:print(f"VALIDATION | {r['symbol']} | no pair data");return
+    buy,sell=tx5(p);v=vol5(p);price=pc5(p);m=mc(p)
+    bs=buy/sell if sell else (float("inf") if buy else 0)
+    vm=v/m if m else 0
+    prev=r.get("previous_bs");pv=r.get("previous_volume")
+    prevpass=prev is None or prev>=MIN_PREV_BS
+    exp=None if pv is None or pv<=0 else (v-pv)/pv
+    exppass=exp is not None and exp>=MIN_VOL_EXP
+    ppass=MIN_PC5<=price<=MAX_PC5; bpass=bs>=MIN_BS; vpass=vm>=MIN_VOL_MC
+    ok=ppass and bpass and vpass and prevpass and exppass
+    r["streak"]=r.get("streak",0)+1 if ok else 0
+    print(f"VALIDATION | {r['symbol']}")
+    print(f"  MC: ${money(m)}");print(f"  Liquidity: ${money(liq(p))}");print(f"  Age: {(age(p) or 0):.1f}h")
+    print(f"  5m Price: {price:+.2f}% {'PASS' if ppass else 'FAIL'}")
+    print(f"  B/S: {bs:.2f} ({buy}/{sell}) {'PASS' if bpass else 'FAIL'}")
+    print(f"  5m Vol/MC: {vm*100:.2f}% {'PASS' if vpass else 'FAIL'}")
+    print(f"  Previous B/S: {'N/A PASS' if prev is None else f'{prev:.2f} '+('PASS' if prevpass else 'FAIL')}")
+    print(f"  Volume expansion: {'N/A FAIL' if exp is None else f'{exp*100:+.1f}% '+('PASS' if exppass else 'FAIL')}")
+    print(f"  Recovery: {'PASS' if ok else 'FAIL'}");print(f"  Streak: {r['streak']}/{CONFIRMATIONS}")
+    r["previous_bs"]=bs;r["previous_volume"]=v
+    if ok and r["streak"]>=CONFIRMATIONS and not r.get("alerted"):
+        alert(p,r,bs,buy,sell,v,vm,price,exp);r["alerted"]=True
 
 def discovery_cycle():
-    print("="*68); print(f"DISCOVERY | {utc_text()}"); print("="*68); prune()
-    raw,src=discover_raw(); qualified,a=filter_discovery(raw); before=len(STATE["tracking"]); new=0
-    for p in qualified:
-        k=token_address(p)
-        if not k or k in STATE["tracking"]: continue
-        b=p.get("baseToken") or {}; STATE["tracking"][k]={
-            "address":k,"pair_address":p.get("pairAddress"),"symbol":b.get("symbol") or "?","name":b.get("name") or "?","url":p.get("url") or "","discovered_at":now(),"streak":0,"previous_bs":None,"previous_volume":None,"alerted":False,
-            "market_cap":market_cap(p),"liquidity":liquidity(p)
-        }; new+=1
-        print(f"TRACKING NEW | {b.get('symbol','?')} | MC ${money(market_cap(p))} | liq ${money(liquidity(p))} | age {age_text(age_hours(p) or 0)}")
+    print("="*68);print(f"DISCOVERY | {utc()}");print("="*68);prune()
+    good,c,a=discover();before=len(STATE["tracking"]);new=add(good)
     print("DISCOVERY AUDIT")
-    print(f"Search queries:          {src['queries']}")
-    print(f"Search pair results:     {src['search_results']}")
-    print(f"Supplementary tokens:    {src['supplementary_tokens']}")
-    print(f"Supplementary Solana:    {src['supplementary_pairs']}")
-    print(f"Raw unique pairs:        {a['raw']}")
-    print(f"Solana pairs:            {a['solana']}")
-    print(f"Unique tokens:           {a['unique']}")
-    print(f"MC below $30K:           {a['mc_below']}")
-    print(f"MC above $350K:          {a['mc_above']}")
-    print(f"Liquidity below $30K:    {a['liq_below']}")
-    print(f"Age below 6h:            {a['age_below']}")
-    print(f"Missing age:             {a['missing_age']}")
-    print(f"ALL DISCOVERY FILTERS:   {a['qualified']}")
-    print(f"Already tracked before:  {before}")
-    print(f"NEW TRACKING:            {new}")
-    if qualified:
-        print("QUALIFIED DISCOVERY TOKENS")
-        for p in sorted(qualified,key=liquidity,reverse=True):
-            print(f"  {(p.get('baseToken') or {}).get('symbol','?')} | MC ${money(market_cap(p))} | liq ${money(liquidity(p))} | age {age_text(age_hours(p) or 0)}")
-    STATE["last_discovery"]=now(); save_state()
-
-
-# ---------------- VALIDATION ----------------
-def fetch_pair(address):
-    d=http_get_json(f"{DEX_BASE}/token-pairs/v1/solana/{urllib.parse.quote(address,safe='')}")
-    return best_solana_pair(d) if isinstance(d,list) else None
-
-
-def validate(address,r):
-    p=fetch_pair(address)
-    if not p: print(f"VALIDATION | {r.get('symbol','?')} | no pair data"); return
-    mc=market_cap(p); liq=liquidity(p); age=age_hours(p) or 0
-    t=(p.get("txns") or {}).get("m5") or {}; buys=int(sf(t.get("buys"))); sells=int(sf(t.get("sells")))
-    vol=sf((p.get("volume") or {}).get("m5")); price=sf((p.get("priceChange") or {}).get("m5"))
-    bs=(buys/sells) if sells else (float("inf") if buys else 0.0); vmc=(vol/mc) if mc else 0
-    prev_bs=r.get("previous_bs"); prev_vol=r.get("previous_volume")
-    prev_pass=True if prev_bs is None else prev_bs>=MIN_PREVIOUS_BS
-    exp=None if prev_vol is None or prev_vol<=0 else (vol-prev_vol)/prev_vol
-    exp_pass=exp is not None and exp>=MIN_VOLUME_EXPANSION
-    price_pass=MIN_PRICE_CHANGE_5M<=price<=MAX_PRICE_CHANGE_5M; bs_pass=bs>=MIN_CURRENT_BS; vmc_pass=vmc>=MIN_RECOVERY_VOL_MC
-    recovery=price_pass and bs_pass and vmc_pass and prev_pass and exp_pass
-    r["streak"]=int(r.get("streak",0))+1 if recovery else 0
-    print(f"VALIDATION | {r.get('symbol','?')}")
-    print(f"  MC: ${money(mc)}"); print(f"  Liquidity: ${money(liq)}"); print(f"  Age: {age_text(age)}")
-    print(f"  5m Price: {price:+.2f}% {'PASS' if price_pass else 'FAIL'}")
-    print(f"  B/S: {bs:.2f} ({buys}/{sells}) {'PASS' if bs_pass else 'FAIL'}")
-    print(f"  5m Vol/MC: {vmc*100:.2f}% {'PASS' if vmc_pass else 'FAIL'}")
-    print(f"  Previous B/S: {'N/A PASS' if prev_bs is None else f'{prev_bs:.2f} '+('PASS' if prev_pass else 'FAIL')}")
-    print(f"  Volume expansion: {'N/A FAIL' if exp is None else f'{exp*100:+.1f}% '+('PASS' if exp_pass else 'FAIL')}")
-    print(f"  Recovery: {'PASS' if recovery else 'FAIL'}"); print(f"  Streak: {r['streak']}/{CONFIRMATIONS_REQUIRED}")
-    r["previous_bs"]=bs; r["previous_volume"]=vol; r["last_validation"]=now(); r["market_cap"]=mc; r["liquidity"]=liq
-    if recovery and r["streak"]>=CONFIRMATIONS_REQUIRED and not r.get("alerted"):
-        alert(p,r,bs,buys,sells,vol,vmc,price,exp or 0); r["alerted"]=True
-
-
-def alert(p,r,bs,buys,sells,vol,vmc,price,exp):
-    symbol=(p.get("baseToken") or {}).get("symbol") or r.get("symbol") or "?"; age=age_hours(p) or 0
-    msg=(f"ð¥ RUNNER RECOVERY CONFIRMED\\n\\nToken: {symbol}\\nMC: ${money(market_cap(p))}\\nLiquidity: ${money(liquidity(p))}\\nAge: {age_text(age)}\\n\\n5m Price: {price:+.2f}%\\n5m Buys/Sells: {buys}/{sells}\\nB/S: {bs:.2f}\\n5m Volume: ${money(vol)}\\nVol/MC: {vmc*100:.2f}%\\nVolume expansion: {exp*100:+.1f}%\\nConfirmations: {CONFIRMATIONS_REQUIRED}/{CONFIRMATIONS_REQUIRED}\\n\\nDexScreener: {p.get('url') or r.get('url','')}\\n\\nâ ï¸ Scanner signal only. Not financial advice.")
-    print("="*68); print(msg); print("="*68)
-    if ALERTS_ENABLED:
-        for chat in STATE["subscribers"]: send(chat,msg)
-
+    print(f"Valid search queries:     {c['queries']}")
+    print(f"Search pair results:      {c['search_results']}")
+    print(f"Supplementary tokens:     {c['supp_tokens']}")
+    print(f"Supplementary pairs:      {c['supp_pairs']}")
+    print(f"Raw unique pairs:         {a['raw']}")
+    print(f"Unique tokens:            {a['unique']}")
+    print(f"MC below $30K:            {a['mc_low']}")
+    print(f"MC above $350K:           {a['mc_high']}")
+    print(f"Liquidity below $30K:     {a['liq_low']}")
+    print(f"Age below 6h:             {a['age_low']}")
+    print(f"Missing age:              {a['missing_age']}")
+    print(f"ALL DISCOVERY FILTERS:    {a['qualified']}")
+    print(f"Already tracked before:   {before}")
+    print(f"NEW TRACKING:             {new}")
+    for p in sorted(good,key=liq,reverse=True):
+        b=p.get("baseToken") or {}
+        print(f"QUALIFIED | {b.get('symbol','?')} | MC ${money(mc(p))} | liq ${money(liq(p))} | age {(age(p) or 0):.1f}h")
+    STATE["last_discovery"]=ts();save()
 
 def validation_cycle():
-    print("="*68); print("VALIDATION"); print("="*68); prune()
-    for addr,r in list(STATE["tracking"].items()):
-        try: validate(addr,r)
-        except Exception as e: print(f"VALIDATION ERROR | {r.get('symbol','?')} | {e}")
+    print("="*68);print("VALIDATION");print("="*68);prune()
+    for k,r in list(STATE["tracking"].items()):
+        try:validate(k,r)
+        except Exception as e:print(f"VALIDATION ERROR | {r.get('symbol','?')} | {e}")
         time.sleep(.15)
-    STATE["last_validation"]=now(); save_state()
-
-
-def config():
-    print("="*68); print(f"RUNNER BOT {BOT_VERSION}"); print("="*68)
-    print(f"MC: ${MIN_MARKET_CAP/1000:.0f}K-${MAX_MARKET_CAP/1000:.0f}K")
-    print(f"Liquidity: ${MIN_LIQUIDITY/1000:.0f}K+"); print(f"Pair age: {MIN_PAIR_AGE_HOURS:.0f}h+"); print("Maximum age: NONE")
-    print(f"Recovery Vol/MC: {MIN_RECOVERY_VOL_MC*100:.1f}%+"); print(f"Current B/S: {MIN_CURRENT_BS:.2f}+"); print(f"Previous B/S: {MIN_PREVIOUS_BS:.2f}+")
-    print(f"5m Price: {MIN_PRICE_CHANGE_5M:+.0f}% to {MAX_PRICE_CHANGE_5M:+.0f}%"); print(f"Volume expansion: {MIN_VOLUME_EXPANSION*100:.0f}%+")
-    print(f"Confirmation: {CONFIRMATIONS_REQUIRED} consecutive validations"); print(f"Tracking window: {TRACKING_WINDOW_HOURS:.1f}h"); print(f"Search queries: {len(SEARCH_QUERIES)}"); print("="*68)
-
+    STATE["last_validation"]=ts();save()
 
 def main():
-    config(); print("WARNING | TELEGRAM_BOT_TOKEN missing" if not TELEGRAM_BOT_TOKEN else "Telegram: connected")
-    last_d=0; last_v=0
+    print("="*68);print(f"RUNNER BOT {BOT_VERSION}");print("="*68)
+    print("MC: $30K-$350K");print("Liquidity: $30K+");print("Pair age: 6h+");print("Maximum age: NONE")
+    print("Recovery Vol/MC: 3.5%+");print("Current B/S: 1.35+");print("Previous B/S: 1.30+")
+    print("5m Price: +2% to +40%");print("Volume expansion: 8%+");print("Confirmation: 2 consecutive validations")
+    print("Tracking window: 8.0h");print(f"Valid search queries: {len(QUERIES)}");print("="*68)
+    print("Telegram: connected" if TOKEN else "Telegram: NOT CONNECTED")
+    ld=lv=0
     while True:
         try:
-            poll_telegram(); t=now()
-            if t-last_d>=DISCOVERY_INTERVAL_SECONDS: discovery_cycle(); last_d=now()
-            if t-last_v>=VALIDATION_INTERVAL_SECONDS: validation_cycle(); last_v=now()
-            time.sleep(max(1,SCAN_INTERVAL_SECONDS))
-        except KeyboardInterrupt: print("STOPPED"); break
-        except Exception as e: print(f"MAIN LOOP ERROR | {e}"); time.sleep(5)
+            poll();t=ts()
+            if t-ld>=DISCOVERY:discovery_cycle();ld=ts()
+            t=ts()
+            if t-lv>=VALIDATION:validation_cycle();lv=ts()
+            time.sleep(max(1,SCAN))
+        except KeyboardInterrupt:print("STOPPED");break
+        except Exception as e:print(f"MAIN LOOP ERROR | {e}");time.sleep(5)
 
-if __name__ == "__main__": main()
+if __name__=="__main__":main()
