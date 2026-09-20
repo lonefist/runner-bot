@@ -78,18 +78,28 @@ MAX_AGE_HOURS = 48.0
 
 
 # ============================================================
-# 4. MARKET CAP — V4.6 BALANCED EARLY BIAS
+# 4. MARKET CAP — V4.6.1 BALANCED EXTENDED-MC TEST
 # ============================================================
 
 MIN_MC = 7_000
 
+# Normal MC zone
 MAX_MC_NORMAL = 95_000
 
+# Extended MC zone
 MAX_MC_EXTENDED = 140_000
 
-EXTENDED_MC_MIN_FLOW_PCT = 13.0
+# ============================================================
+# 5. CORE MOMENTUM — V4.6.1
+# ============================================================
 
+MIN_FLOW = 1_200
+MIN_FLOW_MC_PCT = 8.0
 
+# Extended-MC requirements
+EXTENDED_MIN_FLOW = 3_000
+EXTENDED_FLOW_MC_PCT = 8.0
+EXTENDED_MIN_BUY_SELL = 1.50
 # ============================================================
 # 5. CORE MOMENTUM — V4.6 BALANCED
 # ============================================================
