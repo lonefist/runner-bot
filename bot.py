@@ -3,6 +3,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,7 +18,6 @@ BOT_VERSION = "V4.5-BALANCED-FLOW"
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-# Keep this filename for state/history compatibility.
 STATE_FILE = "runner_state_v42.json"
 
 
@@ -38,8 +38,6 @@ ALERTS_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 
-# IMPORTANT:
-# Keep this environment variable defined.
 SCAN_INTERVAL_SECONDS = int(
     os.getenv(
         "SCAN_INTERVAL_SECONDS",
@@ -84,18 +82,19 @@ MAX_AGE_HOURS = 48.0
 # ------------------------------------------------------------
 
 MIN_MC = 6_000
+MAX_MC_NORMAL = 150_000
+MAX_MC_EXTENDED = 250_000
 
-NORMAL_MAX_MC = 150_000
-EXTENDED_MAX_MC = 250_000
-
-EXTENDED_MC_MIN_FLOW_MC_PCT = 11.0
+# IMPORTANT:
+# This is the canonical V4.5 name.
+EXTENDED_MC_MIN_FLOW_PCT = 11.0
 
 
 # ------------------------------------------------------------
 # 5. CORE MOMENTUM
 # ------------------------------------------------------------
 
-MIN_FLOW_PROXY_USD = 1_500
+MIN_FLOW = 1_500
 MIN_FLOW_MC_PCT = 8.0
 
 
@@ -103,21 +102,19 @@ MIN_FLOW_MC_PCT = 8.0
 # 6. SOFT METRICS
 # ------------------------------------------------------------
 
-# These are displayed/recorded but NEVER hard-reject
-# a candidate in the V4.5 decision tree.
 PREFERRED_VOLUME_FLOW_RATIO = 1.25
 PREFERRED_BUY_SELL_RATIO = 1.50
 
 
 # ------------------------------------------------------------
-# 7. SIGNAL STRENGTH / OBSERVATIONS
+# 7. SIGNAL STRENGTH
 # ------------------------------------------------------------
 
-ULTRA_FLOW_MC_PCT = 25.0
-ULTRA_FLOW_USD = 25_000
+ULTRA_FLOW_MC = 25.0
+ULTRA_FLOW_ABS = 25_000
 
-STRONG_FLOW_MC_PCT = 15.0
-STRONG_FLOW_USD = 15_000
+STRONG_FLOW_MC = 15.0
+STRONG_FLOW_ABS = 15_000
 
 NORMAL_OBSERVATIONS = 3
 STRONG_OBSERVATIONS = 2
@@ -141,9 +138,7 @@ GLOBAL_ALERT_COOLDOWN_SECONDS = 60
 MAX_STORED_TOKENS = 1500
 MAX_HISTORY_PER_TOKEN = 300
 
-DISCOVERY_INTERVAL_SECONDS = 60
 MAX_DISCOVERY_TOKENS = 500
-
 DEX_BATCH_SIZE = 25
 
 
@@ -159,16 +154,9 @@ DEBUG_MODE = (
     in ("1", "true", "yes", "on")
 )
 
-# Requested debug display.
 DEBUG_TOP_CANDIDATES = 10
 
 # Performance/noise pre-filter ONLY.
-#
-# IMPORTANT:
-# This is NOT part of qualification.
-# A token below these levels is simply ignored before
-# running the full decision tree because it has essentially
-# no activity to analyze.
 PRE_FILTER_MIN_VOLUME_5M = 500
 PRE_FILTER_MIN_ABS_FLOW_USD = 500
 
@@ -246,14 +234,12 @@ def safe_float(
 ) -> float:
 
     try:
-
         if value is None:
             return default
 
         return float(value)
 
     except Exception:
-
         return default
 
 
@@ -263,14 +249,12 @@ def safe_int(
 ) -> int:
 
     try:
-
         if value is None:
             return default
 
         return int(value)
 
     except Exception:
-
         return default
 
 
@@ -296,25 +280,15 @@ def default_state() -> Dict[str, Any]:
 
     return {
         "version": BOT_VERSION,
-
         "subscribers": [],
-
         "alerts_enabled": ALERTS_ENABLED,
-
         "tokens": {},
-
         "pending": {},
-
         "alerts": {},
-
         "last_global_alert": 0,
-
         "last_discovery": 0,
-
         "offset": 0,
-
         "created_at": iso_now(),
-
         "updated_at": iso_now(),
     }
 
@@ -324,7 +298,6 @@ def load_state() -> Dict[str, Any]:
     if not os.path.exists(
         STATE_FILE
     ):
-
         return default_state()
 
     try:
@@ -342,7 +315,6 @@ def load_state() -> Dict[str, Any]:
         for key, value in base.items():
 
             if key not in state:
-
                 state[key] = value
 
         state["version"] = BOT_VERSION
@@ -450,18 +422,15 @@ def discover_tokens() -> List[str]:
             continue
 
         if isinstance(data, list):
-
             items = data
 
         elif isinstance(data, dict):
-
             items = data.get(
                 "tokens",
                 [],
             )
 
         else:
-
             items = []
 
         for item in items:
@@ -483,35 +452,26 @@ def discover_tokens() -> List[str]:
                 continue
 
             address = (
-                item.get(
-                    "tokenAddress"
-                )
-                or item.get(
-                    "address"
-                )
+                item.get("tokenAddress")
+                or item.get("address")
             )
 
             if not address:
                 continue
 
             if address not in addresses:
-
-                addresses.append(
-                    address
-                )
+                addresses.append(address)
 
             if (
                 len(addresses)
                 >= MAX_DISCOVERY_TOKENS
             ):
-
                 break
 
         if (
             len(addresses)
             >= MAX_DISCOVERY_TOKENS
         ):
-
             break
 
     print(
@@ -545,9 +505,7 @@ def get_token_pairs_batch(
             start + DEX_BATCH_SIZE
         ]
 
-        joined = ",".join(
-            batch
-        )
+        joined = ",".join(batch)
 
         encoded = urllib.parse.quote(
             joined,
@@ -595,12 +553,9 @@ def get_token_pairs_batch(
                     "",
                 )
             ).lower() != "solana":
-
                 continue
 
-            all_pairs.append(
-                pair
-            )
+            all_pairs.append(pair)
 
     return all_pairs
 
@@ -621,7 +576,6 @@ def pair_liquidity(
         liquidity,
         dict,
     ):
-
         return 0.0
 
     return safe_float(
@@ -642,7 +596,6 @@ def pair_volume_5m(
         volume,
         dict,
     ):
-
         return 0.0
 
     return safe_float(
@@ -663,7 +616,6 @@ def pair_liquidity_valid(
         liquidity,
         dict,
     ):
-
         return False
 
     value = liquidity.get(
@@ -714,9 +666,7 @@ def choose_best_pairs(
         if not address:
             continue
 
-        key = token_key(
-            address
-        )
+        key = token_key(address)
 
         grouped.setdefault(
             key,
@@ -733,15 +683,11 @@ def choose_best_pairs(
         valid_liquidity_pairs = [
             pair
             for pair in token_pairs
-            if pair_liquidity_valid(
-                pair
-            )
+            if pair_liquidity_valid(pair)
         ]
 
         if valid_liquidity_pairs:
 
-            # Prefer the highest real positive liquidity.
-            # 5m volume is the tiebreaker.
             selected[address] = max(
                 valid_liquidity_pairs,
                 key=lambda p: (
@@ -752,10 +698,6 @@ def choose_best_pairs(
 
         else:
 
-            # ALL pairs have unavailable/zero liquidity.
-            #
-            # Select highest-volume pair ONLY so the token
-            # can be diagnosed by the decision tree.
             selected[address] = max(
                 token_pairs,
                 key=lambda p: (
@@ -796,10 +738,6 @@ def pair_to_snapshot(
         symbol,
     )
 
-    # --------------------------------------------------------
-    # TRANSACTIONS
-    # --------------------------------------------------------
-
     txns = (
         pair.get(
             "txns"
@@ -828,14 +766,7 @@ def pair_to_snapshot(
         0,
     )
 
-    total_tx = (
-        buys
-        + sells
-    )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
+    total_tx = buys + sells
 
     volume = (
         pair.get(
@@ -851,10 +782,6 @@ def pair_to_snapshot(
         0.0,
     )
 
-    # --------------------------------------------------------
-    # PRICE CHANGE
-    # --------------------------------------------------------
-
     price_change = (
         pair.get(
             "priceChange"
@@ -868,13 +795,6 @@ def pair_to_snapshot(
         ),
         0.0,
     )
-
-    # --------------------------------------------------------
-    # LIQUIDITY
-    #
-    # Missing liquidity is deliberately kept distinct from
-    # real positive liquidity.
-    # --------------------------------------------------------
 
     liquidity_obj = pair.get(
         "liquidity"
@@ -920,10 +840,6 @@ def pair_to_snapshot(
 
         liquidity = None
 
-    # --------------------------------------------------------
-    # MARKET CAP
-    # --------------------------------------------------------
-
     market_cap = safe_float(
         pair.get(
             "marketCap"
@@ -931,8 +847,6 @@ def pair_to_snapshot(
         0.0,
     )
 
-    # DEX Screener may have FDV even where marketCap
-    # is unavailable.
     if market_cap <= 0:
 
         market_cap = safe_float(
@@ -942,14 +856,13 @@ def pair_to_snapshot(
             0.0,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FLOW PROXY
     #
-    # Flow Proxy =
     # 5m Volume × ((Buys - Sells) / Total Transactions)
     #
-    # This is NOT actual dollar net flow.
-    # --------------------------------------------------------
+    # NOT actual dollar net flow.
+    # ========================================================
 
     if total_tx > 0:
 
@@ -996,10 +909,6 @@ def pair_to_snapshot(
         )
     )
 
-    # --------------------------------------------------------
-    # AGE
-    # --------------------------------------------------------
-
     pair_created_at = safe_float(
         pair.get(
             "pairCreatedAt"
@@ -1029,10 +938,6 @@ def pair_to_snapshot(
 
         age_hours = None
 
-    # --------------------------------------------------------
-    # DEX
-    # --------------------------------------------------------
-
     dex_id = str(
         pair.get(
             "dexId",
@@ -1060,9 +965,7 @@ def pair_to_snapshot(
         "market_cap": market_cap,
 
         "liquidity": liquidity,
-        "liquidity_data_valid": (
-            liquidity_data_valid
-        ),
+        "liquidity_data_valid": liquidity_data_valid,
 
         "volume_5m": volume_5m,
 
@@ -1072,22 +975,11 @@ def pair_to_snapshot(
 
         "buy_sell_ratio": buy_sell_ratio,
 
-        # Internal name.
         "flow_proxy_5m": flow_proxy,
+        "flow_pressure_pct": flow_pressure_pct,
+        "volume_flow_ratio": volume_flow_ratio,
 
-        # Maps to user's decision-tree:
-        # flow_mc_pct
-        "flow_pressure_pct": (
-            flow_pressure_pct
-        ),
-
-        "volume_flow_ratio": (
-            volume_flow_ratio
-        ),
-
-        "price_change_5m": (
-            price_change_5m
-        ),
+        "price_change_5m": price_change_5m,
 
         "age_hours": age_hours,
 
@@ -1153,7 +1045,6 @@ def record_snapshot(
             :-MAX_HISTORY_PER_TOKEN
         ]
 
-    # Keep state bounded.
     if (
         len(STATE["tokens"])
         > MAX_STORED_TOKENS
@@ -1193,15 +1084,6 @@ def passes_pre_filter(
     snapshot: Dict[str, Any],
 ) -> bool:
 
-    """
-    Performance/noise filter ONLY.
-
-    This is NOT a V4.5 qualification rule.
-
-    The real decision tree still determines whether a
-    processed token qualifies.
-    """
-
     volume = safe_float(
         snapshot.get(
             "volume_5m"
@@ -1219,10 +1101,8 @@ def passes_pre_filter(
     )
 
     if (
-        volume
-        < PRE_FILTER_MIN_VOLUME_5M
-        and flow
-        < PRE_FILTER_MIN_ABS_FLOW_USD
+        volume < PRE_FILTER_MIN_VOLUME_5M
+        and flow < PRE_FILTER_MIN_ABS_FLOW_USD
     ):
 
         return False
@@ -1231,7 +1111,7 @@ def passes_pre_filter(
 
 
 # ============================================================
-# EXACT V4.5 DECISION TOKEN
+# DECISION TOKEN
 # ============================================================
 
 def build_decision_token(
@@ -1316,27 +1196,6 @@ def evaluate_token(
     str,
     int,
 ]:
-    """
-    Exact V4.5 decision tree.
-
-    Returns:
-        (
-            qualified,
-            strength,
-            reason,
-            observations_needed
-        )
-
-    strength:
-        ULTRA
-        STRONG
-        NORMAL
-        None
-    """
-
-    # ========================================================
-    # 1 BASIC SANITY
-    # ========================================================
 
     mc = token.get(
         "mc",
@@ -1367,16 +1226,6 @@ def evaluate_token(
         0,
     )
 
-    buy_sell = token.get(
-        "buy_sell_ratio",
-        0,
-    )
-
-    vol_flow = token.get(
-        "vol_flow_ratio",
-        0,
-    )
-
     dex = str(
         token.get(
             "dex",
@@ -1390,13 +1239,8 @@ def evaluate_token(
         "pump",
     ]
 
-    # Keep these reads explicit because they are part
-    # of the decision-token specification.
-    _ = buy_sell
-    _ = vol_flow
-
     # --------------------------------------------------------
-    # SANITY
+    # 1. BASIC SANITY
     # --------------------------------------------------------
 
     if (
@@ -1412,20 +1256,16 @@ def evaluate_token(
             0,
         )
 
-    # ========================================================
-    # 2 LIQUIDITY
-    # ========================================================
-
-    liq_ok = False
-    liq_reason = ""
+    # --------------------------------------------------------
+    # 2. LIQUIDITY
+    # --------------------------------------------------------
 
     if (
         liq is not None
         and liq >= MIN_LIQUIDITY
     ):
 
-        liq_ok = True
-        liq_reason = "OK"
+        liquidity_reason = "OK"
 
     elif (
         (liq is None or liq == 0)
@@ -1433,21 +1273,13 @@ def evaluate_token(
     ):
 
         if (
-            age_h
-            <= EARLY_PUMPFUN_MAX_AGE_HOURS
-
-            and vol_5m
-            >= EARLY_PUMPFUN_MIN_VOLUME_5M
-
-            and flow
-            >= EARLY_PUMPFUN_MIN_FLOW
-
-            and flow_mc
-            >= EARLY_PUMPFUN_MIN_FLOW_MC_PCT
+            age_h <= EARLY_PUMPFUN_MAX_AGE_HOURS
+            and vol_5m >= EARLY_PUMPFUN_MIN_VOLUME_5M
+            and flow >= EARLY_PUMPFUN_MIN_FLOW
+            and flow_mc >= EARLY_PUMPFUN_MIN_FLOW_MC_PCT
         ):
 
-            liq_ok = True
-            liq_reason = (
+            liquidity_reason = (
                 "EARLY_PUMPFUN_FALLBACK"
             )
 
@@ -1469,13 +1301,9 @@ def evaluate_token(
             0,
         )
 
-    # Prevent accidental unused-variable warnings
-    # without changing the decision tree.
-    _ = liq_ok
-
-    # ========================================================
-    # 3 AGE
-    # ========================================================
+    # --------------------------------------------------------
+    # 3. AGE
+    # --------------------------------------------------------
 
     if age_h > MAX_AGE_HOURS:
 
@@ -1486,9 +1314,9 @@ def evaluate_token(
             0,
         )
 
-    # ========================================================
-    # 4 MARKET CAP
-    # ========================================================
+    # --------------------------------------------------------
+    # 4. MARKET CAP
+    # --------------------------------------------------------
 
     if mc < MIN_MC:
 
@@ -1499,7 +1327,7 @@ def evaluate_token(
             0,
         )
 
-    if mc > EXTENDED_MAX_MC:
+    if mc > MAX_MC_EXTENDED:
 
         return (
             False,
@@ -1509,13 +1337,12 @@ def evaluate_token(
         )
 
     extended_mc = (
-        mc > NORMAL_MAX_MC
+        mc > MAX_MC_NORMAL
     )
 
     if (
         extended_mc
-        and flow_mc
-        < EXTENDED_MC_MIN_FLOW_PCT
+        and flow_mc < EXTENDED_MC_MIN_FLOW_PCT
     ):
 
         return (
@@ -1525,11 +1352,11 @@ def evaluate_token(
             0,
         )
 
-    # ========================================================
-    # 5 CORE MOMENTUM
-    # ========================================================
+    # --------------------------------------------------------
+    # 5. CORE MOMENTUM
+    # --------------------------------------------------------
 
-    if flow < MIN_FLOW_PROXY_USD:
+    if flow < MIN_FLOW:
 
         return (
             False,
@@ -1547,60 +1374,46 @@ def evaluate_token(
             0,
         )
 
-    # IMPORTANT:
-    #
-    # Volume/Flow is SOFT ONLY.
-    #
-    # No hard rejection.
-    #
-    # Buy/Sell is SOFT ONLY.
-    #
-    # No hard rejection.
+    # Volume/Flow and Buy/Sell are deliberately SOFT.
 
-    # ========================================================
-    # 6 STRENGTH
-    # ========================================================
+    # --------------------------------------------------------
+    # 6. STRENGTH
+    # --------------------------------------------------------
 
     if (
-        flow_mc >= ULTRA_FLOW_MC_PCT
-        or flow >= ULTRA_FLOW_USD
+        flow_mc >= ULTRA_FLOW_MC
+        or flow >= ULTRA_FLOW_ABS
     ):
 
         strength = "ULTRA"
-        needed_obs = (
-            ULTRA_OBSERVATIONS
-        )
+        needed_obs = ULTRA_OBSERVATIONS
 
     elif (
-        flow_mc >= STRONG_FLOW_MC_PCT
-        or flow >= STRONG_FLOW_USD
+        flow_mc >= STRONG_FLOW_MC
+        or flow >= STRONG_FLOW_ABS
     ):
 
         strength = "STRONG"
-        needed_obs = (
-            STRONG_OBSERVATIONS
-        )
+        needed_obs = STRONG_OBSERVATIONS
 
     else:
 
         strength = "NORMAL"
-        needed_obs = (
-            NORMAL_OBSERVATIONS
-        )
+        needed_obs = NORMAL_OBSERVATIONS
 
     return (
         True,
         strength,
         (
             f"QUALIFIED_{strength} | "
-            f"Liq={liq_reason}"
+            f"Liq={liquidity_reason}"
         ),
         needed_obs,
     )
 
 
 # ============================================================
-# CANDIDATE EVALUATION WRAPPER
+# CANDIDATE EVALUATION
 # ============================================================
 
 def evaluate_snapshot(
@@ -1612,14 +1425,10 @@ def evaluate_snapshot(
     int,
 ]:
 
-    decision_token = (
+    return evaluate_token(
         build_decision_token(
             snapshot
         )
-    )
-
-    return evaluate_token(
-        decision_token
     )
 
 
@@ -1647,7 +1456,8 @@ def ranking_key(
             snapshot.get(
                 "flow_proxy_5m"
             ),
-        0.0)
+            0.0,
+        )
     )
 
     buy_sell = safe_float(
@@ -1665,42 +1475,8 @@ def ranking_key(
 
 
 # ============================================================
-# NEAR MISS
+# NEAR MISSES / REJECTIONS
 # ============================================================
-
-def should_log_near_miss(
-    snapshot: Dict[str, Any],
-) -> bool:
-
-    flow_pct = safe_float(
-        snapshot.get(
-            "flow_pressure_pct"
-        ),
-        0.0,
-    )
-
-    flow = abs(
-        safe_float(
-            snapshot.get(
-                "flow_proxy_5m"
-            ),
-            0.0,
-        )
-    )
-
-    volume = safe_float(
-        snapshot.get(
-            "volume_5m"
-        ),
-        0.0,
-    )
-
-    return (
-        flow_pct >= 6.0
-        or flow >= 1_000
-        or volume >= 500
-    )
-
 
 def print_near_misses(
     near_misses: List[
@@ -1717,11 +1493,6 @@ def print_near_misses(
     if not near_misses:
         return
 
-    # Same signal-priority ranking:
-    #
-    # 1. Flow/MC descending
-    # 2. Absolute Flow descending
-    # 3. Buy/Sell descending
     near_misses.sort(
         key=lambda item:
             ranking_key(
@@ -1736,8 +1507,8 @@ def print_near_misses(
     )
 
     print(
-        f"\n[NEAR MISSES] "
-        f"Top {limit}"
+        f"\n[REJECTIONS] "
+        f"Top {limit} of {len(near_misses)} processed rejected candidates"
     )
 
     for index, (
@@ -1850,18 +1621,6 @@ def score_token(
     snapshot: Dict[str, Any],
 ) -> int:
 
-    """
-    Diagnostic score ONLY.
-
-    IMPORTANT:
-    This score does NOT qualify or reject tokens.
-
-    V4.5 ranking is based on:
-        Flow/MC
-        absolute Flow
-        Buy/Sell
-    """
-
     score = 0
 
     flow_pct = safe_float(
@@ -1895,7 +1654,6 @@ def score_token(
         "age_hours"
     )
 
-    # Flow/MC
     if flow_pct >= 25:
         score += 40
     elif flow_pct >= 15:
@@ -1903,7 +1661,6 @@ def score_token(
     elif flow_pct >= 8:
         score += 20
 
-    # Absolute flow
     if flow >= 25_000:
         score += 25
     elif flow >= 15_000:
@@ -1913,7 +1670,6 @@ def score_token(
     elif flow >= 1_500:
         score += 5
 
-    # Buy/Sell
     if buy_sell >= 5:
         score += 15
     elif buy_sell >= 3:
@@ -1923,7 +1679,6 @@ def score_token(
     elif buy_sell > 0:
         score += 2
 
-    # Liquidity
     if (
         liquidity is not None
         and safe_float(
@@ -1944,18 +1699,14 @@ def score_token(
 
         score += 5
 
-    # Age
     if age is not None:
 
         if age <= 12:
             score += 5
-
         elif age <= 24:
             score += 4
-
         elif age <= 36:
             score += 3
-
         elif age <= 48:
             score += 2
 
@@ -1979,26 +1730,19 @@ def analyze(
         )
     )
 
-    liquidity = snapshot.get(
-        "liquidity"
-    )
-
+    # IMPORTANT:
+    # This is TRUE only when the token actually qualified
+    # through the early pump.fun liquidity fallback.
     liquidity_fallback = (
-        not snapshot.get(
-            "liquidity_data_valid",
-            False,
-        )
+        "EARLY_PUMPFUN_FALLBACK"
+        in reason
     )
 
-    analysis = {
+    return {
         "qualified": qualified,
-
         "passed": qualified,
-
         "reason": reason,
-
         "signal_strength": strength,
-
         "required_observations": needed,
 
         "liquidity_fallback": (
@@ -2012,7 +1756,7 @@ def analyze(
                 ),
                 0.0,
             )
-            > NORMAL_MAX_MC
+            > MAX_MC_NORMAL
         ),
 
         "score": score_token(
@@ -2039,10 +1783,10 @@ def analyze(
             >= PREFERRED_BUY_SELL_RATIO
         ),
 
-        "liquidity_value": liquidity,
+        "liquidity_value": snapshot.get(
+            "liquidity"
+        ),
     }
-
-    return analysis
 
 
 # ============================================================
@@ -2211,6 +1955,33 @@ def telegram_api(
                 raw
             )
 
+    except urllib.error.HTTPError as exc:
+
+        # IMPORTANT:
+        # Telegram's 409 response is an HTTP error.
+        # Read the JSON body so telegram_poll() can
+        # identify the conflict correctly.
+        try:
+
+            raw = exc.read().decode(
+                "utf-8"
+            )
+
+            data = json.loads(
+                raw
+            )
+
+            return data
+
+        except Exception:
+
+            print(
+                f"[TELEGRAM HTTP ERROR] "
+                f"{exc}"
+            )
+
+            return None
+
     except Exception as exc:
 
         print(
@@ -2218,6 +1989,35 @@ def telegram_api(
         )
 
         return None
+
+
+def telegram_delete_webhook() -> None:
+
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    result = telegram_api(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": "false"
+        },
+    )
+
+    if result and result.get(
+        "ok",
+        False,
+    ):
+
+        print(
+            "[TELEGRAM] Webhook cleared."
+        )
+
+    else:
+
+        print(
+            "[TELEGRAM] Webhook cleanup "
+            "returned no success."
+        )
 
 
 def telegram_send(
@@ -2347,17 +2147,20 @@ def format_alert(
         "unknown",
     )
 
-    liquidity_valid = bool(
-        snapshot.get(
-            "liquidity_data_valid",
+    fallback = bool(
+        analysis.get(
+            "liquidity_fallback",
             False,
         )
     )
 
-    if (
-        liquidity_valid
-        and liquidity is not None
-    ):
+    if fallback:
+
+        liq_text = (
+            "N/A — pump.fun early fallback"
+        )
+
+    elif liquidity is not None:
 
         liq_text = (
             f"${safe_float(liquidity):,.0f}"
@@ -2365,9 +2168,7 @@ def format_alert(
 
     else:
 
-        liq_text = (
-            "N/A — pump.fun early fallback"
-        )
+        liq_text = "N/A"
 
     signal_strength = analysis.get(
         "signal_strength",
@@ -2384,13 +2185,6 @@ def format_alert(
     extended = bool(
         analysis.get(
             "extended_mc",
-            False,
-        )
-    )
-
-    fallback = bool(
-        analysis.get(
-            "liquidity_fallback",
             False,
         )
     )
@@ -2458,9 +2252,7 @@ def format_alert(
     )
 
     return "\n".join(
-        line
-        for line in lines
-        if line is not None
+        lines
     )
 
 
@@ -2583,7 +2375,6 @@ def update_outcomes() -> None:
                 - alert_time
                 < window
             ):
-
                 continue
 
             closest = None
@@ -2604,7 +2395,6 @@ def update_outcomes() -> None:
                     ts
                     <= alert_time + window
                 ):
-
                     closest = snapshot
 
             if closest is None:
@@ -2662,7 +2452,7 @@ def process_confirmation(
     )
 
     # --------------------------------------------------------
-    # NEW QUALIFIED TOKEN
+    # FIRST OBSERVATION
     # --------------------------------------------------------
 
     if pending is None:
@@ -2691,11 +2481,9 @@ def process_confirmation(
             f"{strength}"
         )
 
-        # ULTRA requires exactly one observation.
-        if (
-            strength == "ULTRA"
-            and required == 1
-        ):
+        # ULTRA has required=1, so its first observation
+        # immediately satisfies confirmation.
+        if required == 1:
 
             if global_on_cooldown():
 
@@ -2729,7 +2517,7 @@ def process_confirmation(
 
             print(
                 f"[ALERT] "
-                f"ULTRA "
+                f"{strength} "
                 f"{snapshot['symbol']}"
             )
 
@@ -2774,7 +2562,7 @@ def process_confirmation(
         return False
 
     # --------------------------------------------------------
-    # QUALIFIED AGAIN
+    # ADD OBSERVATION
     # --------------------------------------------------------
 
     confirmations = safe_int(
@@ -2794,8 +2582,6 @@ def process_confirmation(
         "last_seen"
     ] = now_ts()
 
-    # If the current observation is stronger, use the
-    # smaller observation requirement.
     old_required = safe_int(
         pending.get(
             "required"
@@ -2834,7 +2620,7 @@ def process_confirmation(
     )
 
     # --------------------------------------------------------
-    # ALERT
+    # CONFIRMED
     # --------------------------------------------------------
 
     if confirmations >= required:
@@ -2977,10 +2763,7 @@ def handle_command(
     if not parts:
         return
 
-    command = (
-        parts[0]
-        .lower()
-    )
+    command = parts[0].lower()
 
     if command == "/start":
 
@@ -3068,16 +2851,25 @@ def handle_command(
         return
 
 
-def telegram_poll() -> None:
+# ============================================================
+# TELEGRAM POLLING
+# ============================================================
+
+def telegram_poll() -> bool:
+
+    """
+    Returns:
+        True  = polling succeeded
+        False = polling failed/conflict
+    """
 
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return False
 
     result = telegram_api(
         "getUpdates",
         {
             "timeout": "1",
-
             "offset": str(
                 STATE.get(
                     "offset",
@@ -3088,14 +2880,50 @@ def telegram_poll() -> None:
     )
 
     if not result:
-        return
+        return False
 
     if not result.get(
         "ok",
         False,
     ):
 
-        return
+        error_code = safe_int(
+            result.get(
+                "error_code"
+            ),
+            0,
+        )
+
+        description = result.get(
+            "description",
+            "",
+        )
+
+        if error_code == 409:
+
+            print(
+                "[TELEGRAM 409] Another bot "
+                "instance is already polling "
+                "this token."
+            )
+
+            print(
+                "[TELEGRAM 409] Stop the other "
+                "GitHub Actions/Replit/local "
+                "instance before continuing."
+            )
+
+            time.sleep(10)
+
+        else:
+
+            print(
+                f"[TELEGRAM API ERROR] "
+                f"{error_code}: "
+                f"{description}"
+            )
+
+        return False
 
     updates = result.get(
         "result",
@@ -3113,9 +2941,7 @@ def telegram_poll() -> None:
 
         STATE[
             "offset"
-        ] = (
-            update_id + 1
-        )
+        ] = update_id + 1
 
         message = update.get(
             "message"
@@ -3137,7 +2963,6 @@ def telegram_poll() -> None:
             chat_id is None
             or not text
         ):
-
             continue
 
         if text.startswith("/"):
@@ -3148,6 +2973,8 @@ def telegram_poll() -> None:
             )
 
     save_state()
+
+    return True
 
 
 # ============================================================
@@ -3197,7 +3024,7 @@ def scan_once() -> None:
         f"{len(selected_pairs)} tokens selected"
     )
 
-    near_misses: List[
+    rejected_candidates: List[
         Tuple[
             str,
             Dict[str, Any],
@@ -3223,29 +3050,20 @@ def scan_once() -> None:
             pair
         )
 
-        # ----------------------------------------------------
-        # PERFORMANCE PRE-FILTER
-        # ----------------------------------------------------
-
+        # Performance filter.
+        #
+        # Tokens rejected here are not considered "processed"
+        # candidates because the full decision tree is never run.
         if not passes_pre_filter(
             snapshot
         ):
-
             continue
 
         processed_count += 1
 
-        # ----------------------------------------------------
-        # RECORD HISTORY
-        # ----------------------------------------------------
-
         record_snapshot(
             snapshot
         )
-
-        # ----------------------------------------------------
-        # LIQUIDITY DEBUG
-        # ----------------------------------------------------
 
         if not snapshot.get(
             "liquidity_data_valid",
@@ -3280,22 +3098,17 @@ def scan_once() -> None:
                 "UNKNOWN",
             )
 
-            if should_log_near_miss(
-                snapshot
-            ):
-
-                near_misses.append(
-                    (
-                        reason,
-                        snapshot,
-                    )
+            # IMPORTANT:
+            # Every candidate that reaches the decision tree
+            # is recorded with its exact rejection reason.
+            rejected_candidates.append(
+                (
+                    reason,
+                    snapshot,
                 )
+            )
 
             continue
-
-        # ----------------------------------------------------
-        # QUALIFIED
-        # ----------------------------------------------------
 
         qualified_tokens.append(
             (
@@ -3306,10 +3119,6 @@ def scan_once() -> None:
 
     # --------------------------------------------------------
     # RANK QUALIFIED TOKENS
-    #
-    # 1. Flow/MC descending
-    # 2. Absolute Flow descending
-    # 3. Buy/Sell descending
     # --------------------------------------------------------
 
     qualified_tokens.sort(
@@ -3321,7 +3130,7 @@ def scan_once() -> None:
     )
 
     # --------------------------------------------------------
-    # PROCESS QUALIFIED TOKENS IN RANK ORDER
+    # PROCESS QUALIFIED TOKENS
     # --------------------------------------------------------
 
     for rank, (
@@ -3384,11 +3193,11 @@ def scan_once() -> None:
         )
 
     # --------------------------------------------------------
-    # NEAR MISSES
+    # REJECTIONS
     # --------------------------------------------------------
 
     print_near_misses(
-        near_misses
+        rejected_candidates
     )
 
     # --------------------------------------------------------
@@ -3403,7 +3212,7 @@ def scan_once() -> None:
         f"[SCAN SUMMARY] "
         f"Processed={processed_count} | "
         f"Qualified={len(qualified_tokens)} | "
-        f"NearMisses={len(near_misses)}"
+        f"Rejected={len(rejected_candidates)}"
     )
 
 
@@ -3450,24 +3259,27 @@ def main() -> None:
     print(
         "MC: "
         f"${MIN_MC:,} - "
-        f"${NORMAL_MAX_MC:,} normal / "
-        f"${EXTENDED_MAX_MC:,} extended"
+        f"${MAX_MC_NORMAL:,} normal / "
+        f"${MAX_MC_EXTENDED:,} extended"
+    )
+
+    print(
+        "Extended MC Flow/MC: "
+        f">= {EXTENDED_MC_MIN_FLOW_PCT}%"
     )
 
     print(
         "Core Flow: "
-        f">=${MIN_FLOW_PROXY_USD:,} | "
+        f">=${MIN_FLOW:,} | "
         f"Flow/MC >= {MIN_FLOW_MC_PCT}%"
     )
 
     print(
-        "Volume/Flow: "
-        "SOFT ONLY"
+        "Volume/Flow: SOFT ONLY"
     )
 
     print(
-        "Buy/Sell: "
-        "SOFT ONLY"
+        "Buy/Sell: SOFT ONLY"
     )
 
     print(
@@ -3483,6 +3295,18 @@ def main() -> None:
     print(
         "=" * 75
     )
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        print(
+            "[WARNING] "
+            "TELEGRAM_BOT_TOKEN is not set."
+        )
+
+    else:
+
+        # Remove webhook so polling can work.
+        telegram_delete_webhook()
 
     last_scan = 0
 
