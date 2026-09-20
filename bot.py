@@ -295,7 +295,7 @@ def discover_pairs():
         if not isinstance(data, dict):
             continue
 
-        for pair in data.get("pairs", []):
+        for pair in (data.get("pairs") or []):
             if str(pair.get("chainId", "")).lower() == "solana":
                 resolved.append(pair)
 
