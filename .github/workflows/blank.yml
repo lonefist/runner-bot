@@ -6,7 +6,6 @@ on:
     branches:
       - main
 
-# Only ONE Runner Bot workflow is allowed to run at a time.
 concurrency:
   group: runner-bot
   cancel-in-progress: true
@@ -17,8 +16,12 @@ jobs:
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
+
       HEATING_ALERTS_ENABLED: "true"
       SCAN_INTERVAL_SECONDS: "15"
+
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -28,6 +31,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
 
       - name: Run Runner Bot
         run: |
