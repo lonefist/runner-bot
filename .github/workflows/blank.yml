@@ -6,6 +6,11 @@ on:
     branches:
       - main
 
+# Only ONE Runner Bot workflow is allowed to run at a time.
+concurrency:
+  group: runner-bot
+  cancel-in-progress: true
+
 jobs:
   runner-bot:
     runs-on: ubuntu-latest
