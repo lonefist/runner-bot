@@ -16,56 +16,79 @@ BOT_VERSION = "V4.4-FLOW-PRESSURE"
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-# IMPORTANT:
-# Keep this filename so existing V4.2/V4.3 history is preserved.
+# Keep this filename so existing history is preserved.
 STATE_FILE = "runner_state_v42.json"
+
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
+
+ALERTS_ENABLED = (
+    os.getenv(
+        "HEATING_ALERTS_ENABLED",
+        "true"
+    ).lower()
+    in ("1", "true", "yes", "on")
+)
+
+# FIX:
+# GitHub Actions provides SCAN_INTERVAL_SECONDS as an
+# environment variable. Python must explicitly read it.
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "15"
+    )
+)
 
 
 # ============================================================
 # CORE RUNNER FILTERS
 # ============================================================
 
-# Radar sweet spot
 IDEAL_MIN_MC = 5_000
 IDEAL_MAX_MC = 80_000
 
-# Absolute maximum
 MAX_MC = 150_000
 
-# Observation range
 OBSERVE_MIN_MC = 5_000
 OBSERVE_MAX_MC = 175_000
 
-# Liquidity
 MIN_LIQUIDITY = 5_000
 PREFERRED_LIQUIDITY = 8_000
 
-# Avoid pools where liquidity is an extreme percentage
-# of market cap.
 MAX_LIQUIDITY_MC_RATIO = 0.90
 
-# Age
 MAX_PAIR_AGE_HOURS = 48
 
 
 # ============================================================
-# FLOW-PRESSURE PROXY
+# FLOW PRESSURE PROXY
 # ============================================================
 
 # IMPORTANT:
 #
-# We do NOT have real dollar net-flow data yet.
+# DEX Screener does not provide true dollar net-flow data
+# in the endpoint used by this bot.
 #
-# Instead:
+# Therefore:
 #
 # Flow Proxy =
 # 5m Volume × ((Buys - Sells) / Total Transactions)
 #
-# This is a market-pressure proxy derived from DEX Screener
-# transaction counts.
+# This is a BUY-PRESSURE PROXY.
 #
-# It is NOT equivalent to Birdeye/Bitquery dollar net flow.
+# It is NOT true dollar net flow.
 #
+# Real dollar net flow would require a trade-level provider
+# such as Birdeye/Bitquery/etc.
+# ============================================================
 
 MIN_FLOW_PROXY_USD = 2_000
 
@@ -74,10 +97,8 @@ FLOW_MC_QUALIFY_PCT = 8.0
 FLOW_MC_STRONG_PCT = 15.0
 FLOW_MC_HOT_PCT = 20.0
 
-# Real activity must be larger than the estimated net pressure.
 MIN_VOLUME_TO_FLOW_RATIO = 1.5
 
-# Flow acceleration comparison
 FLOW_LOOKBACK_SECONDS = 60
 FLOW_ACCELERATION_PCT = 20.0
 
@@ -133,11 +154,8 @@ PENDING_EXPIRY_SECONDS = 5 * 60
 # ALERT CONTROL
 # ============================================================
 
-# Same token cannot create another confirmed alert
-# until this amount of time has passed.
 ALERT_COOLDOWN_SECONDS = 10 * 60
 
-# Global minimum interval between Telegram alerts.
 GLOBAL_ALERT_COOLDOWN_SECONDS = 60
 
 
@@ -151,24 +169,6 @@ OUTCOME_WINDOWS_SECONDS = {
     "30m": 30 * 60,
     "60m": 60 * 60,
 }
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-).strip()
-
-ALERTS_ENABLED = (
-    os.getenv(
-        "HEATING_ALERTS_ENABLED",
-        "true"
-    ).lower()
-    in ("1", "true", "yes", "on")
-)
 
 
 # ============================================================
@@ -235,21 +235,13 @@ def default_state() -> Dict[str, Any]:
 
     return {
         "version": BOT_VERSION,
-
         "tokens": {},
-
         "alerts": {},
-
         "pending_ignitions": {},
-
         "subscribers": [],
-
         "last_discovery": 0,
-
         "discovered_tokens": [],
-
         "telegram_offset": 0,
-
         "last_alert_time": 0,
     }
 
@@ -257,7 +249,6 @@ def default_state() -> Dict[str, Any]:
 def load_state() -> Dict[str, Any]:
 
     if not os.path.exists(STATE_FILE):
-
         return default_state()
 
     try:
@@ -270,21 +261,13 @@ def load_state() -> Dict[str, Any]:
 
             state = json.load(f)
 
-        if not isinstance(
-            state,
-            dict
-        ):
-
+        if not isinstance(state, dict):
             return default_state()
 
         defaults = default_state()
 
         for key, value in defaults.items():
-
-            state.setdefault(
-                key,
-                value
-            )
+            state.setdefault(key, value)
 
         return state
 
@@ -337,7 +320,6 @@ def save_state() -> None:
 # ============================================================
 
 def now_ts() -> float:
-
     return time.time()
 
 
@@ -406,16 +388,10 @@ def money(
 ) -> str:
 
     if value >= 1_000_000:
-
-        return (
-            f"${value / 1_000_000:.2f}M"
-        )
+        return f"${value / 1_000_000:.2f}M"
 
     if value >= 1_000:
-
-        return (
-            f"${value / 1_000:.1f}K"
-        )
+        return f"${value / 1_000:.1f}K"
 
     return f"${value:.0f}"
 
@@ -450,24 +426,16 @@ def discover_tokens() -> List[str]:
 
     for endpoint in DISCOVERY_ENDPOINTS:
 
-        url = DEX_BASE + endpoint
+        data = http_get_json(
+            DEX_BASE + endpoint
+        )
 
-        data = http_get_json(url)
-
-        if not isinstance(
-            data,
-            list
-        ):
-
+        if not isinstance(data, list):
             continue
 
         for item in data:
 
-            if not isinstance(
-                item,
-                dict
-            ):
-
+            if not isinstance(item, dict):
                 continue
 
             chain_id = str(
@@ -482,28 +450,16 @@ def discover_tokens() -> List[str]:
 
             address = (
                 item.get("tokenAddress")
-                or
-                item.get("address")
+                or item.get("address")
             )
 
             if address:
+                found.add(address)
 
-                found.add(
-                    address
-                )
-
-            if (
-                len(found)
-                >= MAX_DISCOVERY_TOKENS
-            ):
-
+            if len(found) >= MAX_DISCOVERY_TOKENS:
                 break
 
-    result = list(found)
-
-    return result[
-        :MAX_DISCOVERY_TOKENS
-    ]
+    return list(found)[:MAX_DISCOVERY_TOKENS]
 
 
 # ============================================================
@@ -523,16 +479,13 @@ def get_token_pairs_batch(
     ):
 
         batch = token_addresses[
-            start:
-            start + DEX_BATCH_SIZE
+            start:start + DEX_BATCH_SIZE
         ]
 
         if not batch:
             continue
 
-        joined = ",".join(
-            batch
-        )
+        joined = ",".join(batch)
 
         url = (
             f"{DEX_BASE}"
@@ -540,15 +493,9 @@ def get_token_pairs_batch(
             f"{urllib.parse.quote(joined, safe=',')}"
         )
 
-        data = http_get_json(
-            url
-        )
+        data = http_get_json(url)
 
-        if not isinstance(
-            data,
-            dict
-        ):
-
+        if not isinstance(data, dict):
             continue
 
         pairs = data.get(
@@ -556,20 +503,12 @@ def get_token_pairs_batch(
             []
         )
 
-        if not isinstance(
-            pairs,
-            list
-        ):
-
+        if not isinstance(pairs, list):
             continue
 
         for pair in pairs:
 
-            if not isinstance(
-                pair,
-                dict
-            ):
-
+            if not isinstance(pair, dict):
                 continue
 
             if str(
@@ -578,12 +517,9 @@ def get_token_pairs_batch(
                     ""
                 )
             ).lower() != "solana":
-
                 continue
 
-            all_pairs.append(
-                pair
-            )
+            all_pairs.append(pair)
 
     return all_pairs
 
@@ -600,12 +536,9 @@ def choose_best_pairs(
 
     for pair in pairs:
 
-        base = (
-            pair.get(
-                "baseToken"
-            )
-            or {}
-        )
+        base = pair.get(
+            "baseToken"
+        ) or {}
 
         address = base.get(
             "address"
@@ -616,43 +549,29 @@ def choose_best_pairs(
 
         liquidity = safe_float(
             (
-                pair.get(
-                    "liquidity"
-                )
+                pair.get("liquidity")
                 or {}
-            ).get(
-                "usd"
-            )
+            ).get("usd")
         )
 
-        current = best.get(
-            address
-        )
+        current = best.get(address)
 
         if current is None:
 
             best[address] = pair
-
             continue
 
         current_liq = safe_float(
             (
-                current.get(
-                    "liquidity"
-                )
+                current.get("liquidity")
                 or {}
-            ).get(
-                "usd"
-            )
+            ).get("usd")
         )
 
         if liquidity > current_liq:
-
             best[address] = pair
 
-    return list(
-        best.values()
-    )
+    return list(best.values())
 
 
 # ============================================================
@@ -663,12 +582,9 @@ def pair_to_snapshot(
     pair: Dict[str, Any]
 ) -> Dict[str, Any]:
 
-    base = (
-        pair.get(
-            "baseToken"
-        )
-        or {}
-    )
+    base = pair.get(
+        "baseToken"
+    ) or {}
 
     address = str(
         base.get(
@@ -693,100 +609,63 @@ def pair_to_snapshot(
 
     liquidity = safe_float(
         (
-            pair.get(
-                "liquidity"
-            )
+            pair.get("liquidity")
             or {}
-        ).get(
-            "usd"
-        )
+        ).get("usd")
     )
 
-    volume = (
-        pair.get(
-            "volume"
-        )
-        or {}
-    )
+    volume = pair.get(
+        "volume"
+    ) or {}
 
     volume_5m = safe_float(
-        volume.get(
-            "m5"
-        )
+        volume.get("m5")
     )
 
     volume_1h = safe_float(
-        volume.get(
-            "h1"
-        )
+        volume.get("h1")
     )
 
-    txns = (
-        pair.get(
-            "txns"
-        )
-        or {}
-    )
+    txns = pair.get(
+        "txns"
+    ) or {}
 
-    tx_5m = (
-        txns.get(
-            "m5"
-        )
-        or {}
-    )
+    tx_5m = txns.get(
+        "m5"
+    ) or {}
 
     buys = safe_int(
-        tx_5m.get(
-            "buys"
-        )
+        tx_5m.get("buys")
     )
 
     sells = safe_int(
-        tx_5m.get(
-            "sells"
-        )
+        tx_5m.get("sells")
     )
 
-    total_tx = (
-        buys
-        + sells
-    )
+    total_tx = buys + sells
 
     buy_pct = (
-        buys
-        / total_tx
-        * 100
+        buys / total_tx * 100
         if total_tx > 0
         else 0.0
     )
 
     sell_pct = (
-        sells
-        / total_tx
-        * 100
+        sells / total_tx * 100
         if total_tx > 0
         else 0.0
     )
 
     if sells > 0:
-
-        buy_sell_ratio = (
-            buys / sells
-        )
-
+        buy_sell_ratio = buys / sells
     elif buys > 0:
-
-        buy_sell_ratio = float(
-            buys
-        )
-
+        buy_sell_ratio = float(buys)
     else:
-
         buy_sell_ratio = 0.0
 
-    # --------------------------------------------------------
-    # FLOW PROXY
-    # --------------------------------------------------------
+    # ========================================================
+    # FLOW PRESSURE PROXY
+    # ========================================================
 
     if total_tx > 0:
 
@@ -799,66 +678,50 @@ def pair_to_snapshot(
         imbalance = 0.0
 
     flow_proxy_5m = (
-        volume_5m
-        * imbalance
+        volume_5m * imbalance
     )
+
+    market_cap = safe_float(
+        pair.get("marketCap")
+    )
+
+    fdv = safe_float(
+        pair.get("fdv")
+    )
+
+    if market_cap <= 0:
+        market_cap = fdv
 
     flow_pressure_pct = (
         flow_proxy_5m
-        / safe_float(
-            pair.get(
-                "marketCap"
-            )
-        )
+        / market_cap
         * 100
-        if safe_float(
-            pair.get(
-                "marketCap"
-            )
-        ) > 0
+        if market_cap > 0
+        else 0.0
+    )
+
+    volume_flow_ratio = (
+        volume_5m
+        / abs(flow_proxy_5m)
+        if abs(flow_proxy_5m) > 0
         else 0.0
     )
 
     price = safe_float(
-        pair.get(
-            "priceUsd"
-        )
+        pair.get("priceUsd")
     )
 
-    price_change = (
-        pair.get(
-            "priceChange"
-        )
-        or {}
-    )
+    price_change = pair.get(
+        "priceChange"
+    ) or {}
 
     change_5m = safe_float(
-        price_change.get(
-            "m5"
-        )
+        price_change.get("m5")
     )
 
     change_1h = safe_float(
-        price_change.get(
-            "h1"
-        )
+        price_change.get("h1")
     )
-
-    fdv = safe_float(
-        pair.get(
-            "fdv"
-        )
-    )
-
-    market_cap = safe_float(
-        pair.get(
-            "marketCap"
-        )
-    )
-
-    if market_cap <= 0:
-
-        market_cap = fdv
 
     liquidity_mc_ratio = (
         liquidity / market_cap
@@ -867,9 +730,7 @@ def pair_to_snapshot(
     )
 
     created_ms = safe_float(
-        pair.get(
-            "pairCreatedAt"
-        )
+        pair.get("pairCreatedAt")
     )
 
     if created_ms > 0:
@@ -877,8 +738,7 @@ def pair_to_snapshot(
         age_hours = (
             max(
                 0,
-                time.time() * 1000
-                - created_ms
+                time.time() * 1000 - created_ms
             )
             / 1000
             / 3600
@@ -891,17 +751,13 @@ def pair_to_snapshot(
     return {
 
         "timestamp": now_ts(),
-
         "timestamp_iso": iso_now(),
 
         "address": address,
-
         "symbol": symbol,
-
         "name": name,
 
         "mc": market_cap,
-
         "fdv": fdv,
 
         "liquidity": liquidity,
@@ -911,43 +767,25 @@ def pair_to_snapshot(
         ),
 
         "volume_5m": volume_5m,
-
         "volume_1h": volume_1h,
 
         "buys": buys,
-
         "sells": sells,
-
         "tx_5m": total_tx,
 
         "buy_pct": buy_pct,
-
         "sell_pct": sell_pct,
-
-        "buy_sell_ratio": (
-            buy_sell_ratio
-        ),
+        "buy_sell_ratio": buy_sell_ratio,
 
         "price": price,
 
         "change_5m": change_5m,
-
         "change_1h": change_1h,
 
-        "flow_proxy_5m": (
-            flow_proxy_5m
-        ),
+        "flow_proxy_5m": flow_proxy_5m,
+        "flow_pressure_pct": flow_pressure_pct,
 
-        "flow_pressure_pct": (
-            flow_pressure_pct
-        ),
-
-        "volume_flow_ratio": (
-            volume_5m
-            / abs(flow_proxy_5m)
-            if abs(flow_proxy_5m) > 0
-            else 0.0
-        ),
+        "volume_flow_ratio": volume_flow_ratio,
 
         "age_hours": age_hours,
 
@@ -966,9 +804,7 @@ def get_token_state(
     address: str
 ) -> Dict[str, Any]:
 
-    tokens = state[
-        "tokens"
-    ]
+    tokens = state["tokens"]
 
     if address not in tokens:
 
@@ -977,89 +813,61 @@ def get_token_state(
             "history": [],
         }
 
-    return tokens[
-        address
-    ]
+    return tokens[address]
 
 
 def record_snapshot(
     snapshot: Dict[str, Any]
 ) -> None:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
-    token = get_token_state(
-        address
-    )
+    token = get_token_state(address)
 
-    token[
-        "symbol"
-    ] = snapshot[
-        "symbol"
-    ]
+    token["symbol"] = snapshot["symbol"]
 
     history = token.setdefault(
         "history",
         []
     )
 
-    history.append(
-        snapshot
-    )
+    history.append(snapshot)
 
-    if (
-        len(history)
-        > MAX_HISTORY_PER_TOKEN
-    ):
+    if len(history) > MAX_HISTORY_PER_TOKEN:
 
         del history[
             :-MAX_HISTORY_PER_TOKEN
         ]
 
-    if (
-        len(state["tokens"])
-        > MAX_STORED_TOKENS
-    ):
+    if len(state["tokens"]) > MAX_STORED_TOKENS:
 
         oldest_address = None
+        oldest_time = float("inf")
 
-        oldest_time = float(
-            "inf"
-        )
+        for addr, item in state["tokens"].items():
 
-        for addr, item in (
-            state[
-                "tokens"
-            ].items()
-        ):
-
-            h = item.get(
+            history_item = item.get(
                 "history",
                 []
             )
 
-            if not h:
+            if not history_item:
                 continue
 
-            t = safe_float(
-                h[-1].get(
+            timestamp = safe_float(
+                history_item[-1].get(
                     "timestamp"
                 )
             )
 
-            if t < oldest_time:
+            if timestamp < oldest_time:
 
-                oldest_time = t
-
+                oldest_time = timestamp
                 oldest_address = addr
 
         if oldest_address:
 
-            del state[
-                "tokens"
-            ][
+            del state["tokens"][
                 oldest_address
             ]
 
@@ -1072,10 +880,7 @@ def calculate_structure(
     history: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
 
-    if (
-        len(history)
-        < MIN_OBSERVATIONS
-    ):
+    if len(history) < MIN_OBSERVATIONS:
 
         return {
             "breakout": False,
@@ -1084,18 +889,12 @@ def calculate_structure(
             "higher_high": False,
         }
 
-    recent = history[
-        -6:
-    ]
+    recent = history[-6:]
 
     prices = [
-        safe_float(
-            x.get("price")
-        )
+        safe_float(x.get("price"))
         for x in recent
-        if safe_float(
-            x.get("price")
-        ) > 0
+        if safe_float(x.get("price")) > 0
     ]
 
     if len(prices) < 3:
@@ -1111,46 +910,22 @@ def calculate_structure(
 
     previous = prices[:-1]
 
-    previous_max = max(
-        previous
+    previous_max = max(previous)
+    previous_min = min(previous)
+
+    breakout = current > previous_max
+    higher_high = current > previous[-1]
+
+    lowest = min(prices)
+    highest = max(prices)
+
+    range_pct = (
+        (highest - lowest)
+        / lowest
+        * 100
+        if lowest > 0
+        else 0.0
     )
-
-    previous_min = min(
-        previous
-    )
-
-    breakout = (
-        current
-        > previous_max
-    )
-
-    higher_high = (
-        current
-        > previous[-1]
-    )
-
-    lowest = min(
-        prices
-    )
-
-    highest = max(
-        prices
-    )
-
-    if lowest > 0:
-
-        range_pct = (
-            (
-                highest
-                - lowest
-            )
-            / lowest
-            * 100
-        )
-
-    else:
-
-        range_pct = 0.0
 
     consolidation = (
         range_pct
@@ -1177,18 +952,14 @@ def find_previous_snapshot(
 ) -> Optional[Dict[str, Any]]:
 
     if len(history) < 2:
-
         return None
 
     current_time = safe_float(
-        history[-1].get(
-            "timestamp"
-        )
+        history[-1].get("timestamp")
     )
 
     target_time = (
-        current_time
-        - seconds_back
+        current_time - seconds_back
     )
 
     for item in reversed(
@@ -1196,16 +967,10 @@ def find_previous_snapshot(
     ):
 
         item_time = safe_float(
-            item.get(
-                "timestamp"
-            )
+            item.get("timestamp")
         )
 
-        if (
-            item_time
-            <= target_time
-        ):
-
+        if item_time <= target_time:
             return item
 
     return None
@@ -1225,67 +990,46 @@ def activity_expanding(
     )
 
     if previous is None:
-
         return False
 
     current = history[-1]
 
     old_volume = safe_float(
-        previous.get(
-            "volume_5m"
-        )
+        previous.get("volume_5m")
     )
 
     old_tx = safe_float(
-        previous.get(
-            "tx_5m"
-        )
+        previous.get("tx_5m")
     )
 
     new_volume = safe_float(
-        current.get(
-            "volume_5m"
-        )
+        current.get("volume_5m")
     )
 
     new_tx = safe_float(
-        current.get(
-            "tx_5m"
-        )
+        current.get("tx_5m")
     )
 
-    volume_growth = 0.0
+    volume_growth = (
+        (new_volume - old_volume)
+        / old_volume
+        * 100
+        if old_volume > 0
+        else 0.0
+    )
 
-    tx_growth = 0.0
-
-    if old_volume > 0:
-
-        volume_growth = (
-            (
-                new_volume
-                - old_volume
-            )
-            / old_volume
-            * 100
-        )
-
-    if old_tx > 0:
-
-        tx_growth = (
-            (
-                new_tx
-                - old_tx
-            )
-            / old_tx
-            * 100
-        )
+    tx_growth = (
+        (new_tx - old_tx)
+        / old_tx
+        * 100
+        if old_tx > 0
+        else 0.0
+    )
 
     return (
-        volume_growth
-        >= ACTIVITY_EXPANSION_PCT
+        volume_growth >= ACTIVITY_EXPANSION_PCT
         or
-        tx_growth
-        >= ACTIVITY_EXPANSION_PCT
+        tx_growth >= ACTIVITY_EXPANSION_PCT
     )
 
 
@@ -1303,43 +1047,29 @@ def flow_accelerating(
     )
 
     if previous is None:
-
         return False
 
     current = history[-1]
 
     old_flow = safe_float(
-        previous.get(
-            "flow_proxy_5m"
-        )
+        previous.get("flow_proxy_5m")
     )
 
     new_flow = safe_float(
-        current.get(
-            "flow_proxy_5m"
-        )
+        current.get("flow_proxy_5m")
     )
 
     if old_flow <= 0:
 
-        return (
-            new_flow
-            >= MIN_FLOW_PROXY_USD
-        )
+        return new_flow >= MIN_FLOW_PROXY_USD
 
     growth = (
-        (
-            new_flow
-            - old_flow
-        )
+        (new_flow - old_flow)
         / old_flow
         * 100
     )
 
-    return (
-        growth
-        >= FLOW_ACCELERATION_PCT
-    )
+    return growth >= FLOW_ACCELERATION_PCT
 
 
 # ============================================================
@@ -1350,18 +1080,9 @@ def safety_checks(
     snapshot: Dict[str, Any]
 ) -> Dict[str, Any]:
 
-    liquidity = snapshot[
-        "liquidity"
-    ]
-
-    mc = snapshot[
-        "mc"
-    ]
-
-    age = snapshot[
-        "age_hours"
-    ]
-
+    liquidity = snapshot["liquidity"]
+    mc = snapshot["mc"]
+    age = snapshot["age_hours"]
     liquidity_ratio = snapshot[
         "liquidity_mc_ratio"
     ]
@@ -1369,8 +1090,7 @@ def safety_checks(
     checks = {
 
         "liquidity": (
-            liquidity
-            >= MIN_LIQUIDITY
+            liquidity >= MIN_LIQUIDITY
         ),
 
         "liquidity_ratio": (
@@ -1379,25 +1099,20 @@ def safety_checks(
         ),
 
         "age": (
-            age
-            <= MAX_PAIR_AGE_HOURS
+            age <= MAX_PAIR_AGE_HOURS
         ),
 
         "market_cap": (
-            mc
-            >= IDEAL_MIN_MC
+            mc >= IDEAL_MIN_MC
             and
-            mc
-            <= MAX_MC
+            mc <= MAX_MC
         ),
     }
 
-    hard_pass = all(
-        checks.values()
-    )
-
     return {
-        "hard_pass": hard_pass,
+        "hard_pass": all(
+            checks.values()
+        ),
         "checks": checks,
     }
 
@@ -1415,270 +1130,117 @@ def score_token(
 
     score = 0
 
-    mc = snapshot[
-        "mc"
-    ]
+    mc = snapshot["mc"]
+    liquidity = snapshot["liquidity"]
+    volume = snapshot["volume_5m"]
+    flow = snapshot["flow_proxy_5m"]
+    flow_pct = snapshot["flow_pressure_pct"]
+    ratio = snapshot["buy_sell_ratio"]
+    tx = snapshot["tx_5m"]
+    age = snapshot["age_hours"]
+    change_5m = snapshot["change_5m"]
 
-    liquidity = snapshot[
-        "liquidity"
-    ]
-
-    volume = snapshot[
-        "volume_5m"
-    ]
-
-    flow = snapshot[
-        "flow_proxy_5m"
-    ]
-
-    flow_pct = snapshot[
-        "flow_pressure_pct"
-    ]
-
-    ratio = snapshot[
-        "buy_sell_ratio"
-    ]
-
-    tx = snapshot[
-        "tx_5m"
-    ]
-
-    age = snapshot[
-        "age_hours"
-    ]
-
-    change_5m = snapshot[
-        "change_5m"
-    ]
-
-    # --------------------------------------------------------
-    # FLOW / MC - highest weight
-    # --------------------------------------------------------
-
+    # FLOW / MC
     if flow_pct >= FLOW_MC_HOT_PCT:
-
         score += 25
-
     elif flow_pct >= FLOW_MC_STRONG_PCT:
-
         score += 20
-
     elif flow_pct >= FLOW_MC_QUALIFY_PCT:
-
         score += 15
-
     elif flow_pct >= FLOW_MC_WATCH_PCT:
-
         score += 8
 
-    # --------------------------------------------------------
     # ABSOLUTE FLOW
-    # --------------------------------------------------------
-
     if flow >= 5_000:
-
         score += 15
-
     elif flow >= 3_000:
-
         score += 12
-
     elif flow >= MIN_FLOW_PROXY_USD:
-
         score += 8
 
-    # --------------------------------------------------------
     # MARKET CAP
-    # --------------------------------------------------------
-
-    if (
-        IDEAL_MIN_MC
-        <= mc
-        <= IDEAL_MAX_MC
-    ):
-
+    if IDEAL_MIN_MC <= mc <= IDEAL_MAX_MC:
         score += 10
-
-    elif (
-        mc
-        <= MAX_MC
-    ):
-
+    elif mc <= MAX_MC:
         score += 5
 
-    # --------------------------------------------------------
     # LIQUIDITY
-    # --------------------------------------------------------
-
     if liquidity >= 15_000:
-
         score += 10
-
     elif liquidity >= 10_000:
-
         score += 8
-
     elif liquidity >= MIN_LIQUIDITY:
-
         score += 5
 
-    # --------------------------------------------------------
-    # VOLUME / FLOW QUALITY
-    # --------------------------------------------------------
-
+    # VOLUME / FLOW
     volume_flow_ratio = snapshot[
         "volume_flow_ratio"
     ]
 
-    if (
-        volume_flow_ratio
-        >= 2.5
-    ):
-
+    if volume_flow_ratio >= 2.5:
         score += 8
-
-    elif (
-        volume_flow_ratio
-        >= 2.0
-    ):
-
+    elif volume_flow_ratio >= 2.0:
         score += 6
-
-    elif (
-        volume_flow_ratio
-        >= MIN_VOLUME_TO_FLOW_RATIO
-    ):
-
+    elif volume_flow_ratio >= MIN_VOLUME_TO_FLOW_RATIO:
         score += 4
 
-    # --------------------------------------------------------
     # FLOW ACCELERATION
-    # --------------------------------------------------------
-
     if flow_acceleration:
-
         score += 8
 
-    # --------------------------------------------------------
-    # BUY / SELL RATIO
-    # --------------------------------------------------------
-
+    # BUY / SELL
     if ratio >= 2.5:
-
         score += 8
-
     elif ratio >= 2.0:
-
         score += 6
-
     elif ratio >= 1.5:
-
         score += 4
-
     elif ratio >= 1.2:
-
         score += 2
 
-    # --------------------------------------------------------
-    # TRANSACTION ACTIVITY
-    # --------------------------------------------------------
-
+    # TRANSACTIONS
     if tx >= 50:
-
         score += 5
-
     elif tx >= 25:
-
         score += 3
-
     elif tx >= MIN_TX_5M:
-
         score += 1
 
-    # --------------------------------------------------------
     # AGE
-    # --------------------------------------------------------
-
     if age <= 12:
-
         score += 5
-
     elif age <= 24:
-
         score += 4
-
     elif age <= 48:
-
         score += 2
 
-    # --------------------------------------------------------
     # BREAKOUT
-    # --------------------------------------------------------
-
-    if structure[
-        "breakout"
-    ]:
-
+    if structure["breakout"]:
         score += 10
 
-    # --------------------------------------------------------
     # ACTIVITY
-    # --------------------------------------------------------
-
     if activity:
-
         score += 10
 
-    # --------------------------------------------------------
     # MOMENTUM
-    # --------------------------------------------------------
-
-    if (
-        5
-        <= change_5m
-        <= 35
-    ):
-
+    if 5 <= change_5m <= 35:
         score += 5
-
-    elif (
-        change_5m
-        > 35
-    ):
-
-        # Extremely parabolic.
-        # Don't reward it as strongly.
+    elif change_5m > 35:
+        score += 2
+    elif change_5m >= 0:
         score += 2
 
-    elif (
-        change_5m
-        >= 0
-    ):
-
-        score += 2
-
-    # --------------------------------------------------------
-    # PRICE WEAKNESS
-    # --------------------------------------------------------
-
+    # WEAKNESS PENALTY
     if change_5m <= -10:
-
         score -= 20
-
     elif change_5m <= -5:
-
         score -= 10
-
     elif change_5m < 0:
-
         score -= 5
 
     return max(
         0,
-        min(
-            100,
-            score
-        )
+        min(100, score)
     )
 
 
@@ -1690,13 +1252,9 @@ def analyze(
     snapshot: Dict[str, Any]
 ) -> Dict[str, Any]:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
-    token = get_token_state(
-        address
-    )
+    token = get_token_state(address)
 
     history = token.get(
         "history",
@@ -1727,58 +1285,38 @@ def analyze(
     )
 
     flow_qualified = (
-        snapshot[
-            "flow_proxy_5m"
-        ]
+        snapshot["flow_proxy_5m"]
         >= MIN_FLOW_PROXY_USD
+
         and
-        snapshot[
-            "flow_pressure_pct"
-        ]
+
+        snapshot["flow_pressure_pct"]
         >= FLOW_MC_QUALIFY_PCT
+
         and
-        snapshot[
-            "volume_flow_ratio"
-        ]
+
+        snapshot["volume_flow_ratio"]
         >= MIN_VOLUME_TO_FLOW_RATIO
     )
 
-    # --------------------------------------------------------
-    # Runner setup
-    # --------------------------------------------------------
-
     if (
-        len(history)
-        >= MIN_OBSERVATIONS
-
+        len(history) >= MIN_OBSERVATIONS
         and score >= 70
-
         and flow_qualified
-
         and (
-            structure[
-                "breakout"
-            ]
-            or
-            activity
+            structure["breakout"]
+            or activity
         )
-
-        and snapshot[
-            "change_5m"
-        ] > MAX_IGNITION_DRAWDOWN_PCT
-
-        and safety[
-            "hard_pass"
-        ]
+        and snapshot["change_5m"]
+        > MAX_IGNITION_DRAWDOWN_PCT
+        and safety["hard_pass"]
     ):
 
         setup = "IGNITION"
 
     elif (
         flow_qualified
-        and structure[
-            "breakout"
-        ]
+        and structure["breakout"]
     ):
 
         setup = "FLOW BREAKOUT"
@@ -1790,9 +1328,7 @@ def analyze(
 
         setup = "FLOW EXPANSION"
 
-    elif (
-        flow_qualified
-    ):
+    elif flow_qualified:
 
         setup = "FLOW WATCH"
 
@@ -1800,9 +1336,7 @@ def analyze(
 
         setup = "EXPANSION"
 
-    elif structure[
-        "consolidation"
-    ]:
+    elif structure["consolidation"]:
 
         setup = "CONSOLIDATION"
 
@@ -1816,37 +1350,21 @@ def analyze(
 
         "setup": setup,
 
-        "breakout": structure[
-            "breakout"
-        ],
+        "breakout": structure["breakout"],
 
-        "consolidation": structure[
-            "consolidation"
-        ],
+        "consolidation": structure["consolidation"],
 
-        "range_pct": structure[
-            "range_pct"
-        ],
+        "range_pct": structure["range_pct"],
 
         "activity": activity,
 
-        "flow_acceleration": (
-            flow_acceleration
-        ),
+        "flow_acceleration": flow_acceleration,
 
-        "flow_qualified": (
-            flow_qualified
-        ),
+        "flow_qualified": flow_qualified,
 
-        "safety_pass": (
-            safety[
-                "hard_pass"
-            ]
-        ),
+        "safety_pass": safety["hard_pass"],
 
-        "history_count": len(
-            history
-        ),
+        "history_count": len(history),
     }
 
 
@@ -1860,32 +1378,19 @@ def valid_current_ignition(
 ) -> bool:
 
     return (
+        analysis["score"] >= 70
 
-        analysis[
-            "score"
-        ] >= 70
-
-        and analysis[
-            "flow_qualified"
-        ]
+        and analysis["flow_qualified"]
 
         and (
-            analysis[
-                "breakout"
-            ]
-            or
-            analysis[
-                "activity"
-            ]
+            analysis["breakout"]
+            or analysis["activity"]
         )
 
-        and analysis[
-            "safety_pass"
-        ]
+        and analysis["safety_pass"]
 
-        and snapshot[
-            "change_5m"
-        ] > MAX_IGNITION_DRAWDOWN_PCT
+        and snapshot["change_5m"]
+        > MAX_IGNITION_DRAWDOWN_PCT
     )
 
 
@@ -1894,35 +1399,23 @@ def create_pending_ignition(
     analysis: Dict[str, Any]
 ) -> None:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
-    state[
-        "pending_ignitions"
-    ][address] = {
+    state["pending_ignitions"][address] = {
 
         "address": address,
 
-        "symbol": snapshot[
-            "symbol"
-        ],
+        "symbol": snapshot["symbol"],
 
         "ignition_time": now_ts(),
 
         "ignition_time_iso": iso_now(),
 
-        "ignition_mc": snapshot[
-            "mc"
-        ],
+        "ignition_mc": snapshot["mc"],
 
-        "ignition_liquidity": snapshot[
-            "liquidity"
-        ],
+        "ignition_liquidity": snapshot["liquidity"],
 
-        "ignition_volume_5m": snapshot[
-            "volume_5m"
-        ],
+        "ignition_volume_5m": snapshot["volume_5m"],
 
         "ignition_flow_proxy": snapshot[
             "flow_proxy_5m"
@@ -1932,9 +1425,7 @@ def create_pending_ignition(
             "flow_pressure_pct"
         ],
 
-        "ignition_score": analysis[
-            "score"
-        ],
+        "ignition_score": analysis["score"],
 
         "ignition_change_5m": snapshot[
             "change_5m"
@@ -1944,9 +1435,7 @@ def create_pending_ignition(
 
         "last_confirmation_time": now_ts(),
 
-        "pair_url": snapshot[
-            "pair_url"
-        ],
+        "pair_url": snapshot["pair_url"],
     }
 
     print(
@@ -1968,9 +1457,7 @@ def expire_pending_ignitions() -> None:
     expired = []
 
     for address, pending in (
-        state[
-            "pending_ignitions"
-        ].items()
+        state["pending_ignitions"].items()
     ):
 
         created = safe_float(
@@ -1980,14 +1467,11 @@ def expire_pending_ignitions() -> None:
         )
 
         if (
-            current_time
-            - created
+            current_time - created
             > PENDING_EXPIRY_SECONDS
         ):
 
-            expired.append(
-                address
-            )
+            expired.append(address)
 
     for address in expired:
 
@@ -2016,9 +1500,7 @@ def token_on_cooldown(
     address: str
 ) -> bool:
 
-    alert = state[
-        "alerts"
-    ].get(
+    alert = state["alerts"].get(
         address
     )
 
@@ -2026,14 +1508,11 @@ def token_on_cooldown(
         return False
 
     alert_time = safe_float(
-        alert.get(
-            "alert_time"
-        )
+        alert.get("alert_time")
     )
 
     return (
-        now_ts()
-        - alert_time
+        now_ts() - alert_time
         < ALERT_COOLDOWN_SECONDS
     )
 
@@ -2048,8 +1527,7 @@ def global_alert_on_cooldown() -> bool:
     )
 
     return (
-        now_ts()
-        - last_alert
+        now_ts() - last_alert
         < GLOBAL_ALERT_COOLDOWN_SECONDS
     )
 
@@ -2063,36 +1541,29 @@ def process_confirmation(
     analysis: Dict[str, Any]
 ) -> Optional[str]:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
+
+    current_valid = valid_current_ignition(
+        snapshot,
+        analysis
+    )
 
     # --------------------------------------------------------
-    # Existing confirmed alert
+    # IMPORTANT FIX:
+    #
+    # An old alert does NOT permanently block the token.
+    # It only blocks it during the configured cooldown.
     # --------------------------------------------------------
 
-    if address in state[
-        "alerts"
-    ]:
+    if token_on_cooldown(address):
 
-        update_alert_outcome(
-            snapshot
-        )
+        update_alert_outcome(snapshot)
 
         return None
 
     pending = state[
         "pending_ignitions"
-    ].get(
-        address
-    )
-
-    current_valid = (
-        valid_current_ignition(
-            snapshot,
-            analysis
-        )
-    )
+    ].get(address)
 
     # --------------------------------------------------------
     # No pending ignition
@@ -2119,9 +1590,7 @@ def process_confirmation(
         )
     )
 
-    current_mc = snapshot[
-        "mc"
-    ]
+    current_mc = snapshot["mc"]
 
     mc_growth = pct_change(
         ignition_mc,
@@ -2141,16 +1610,13 @@ def process_confirmation(
             1
         )
 
-        pending[
-            "confirmations"
-        ] = (
-            previous_confirmations
-            + 1
+        pending["confirmations"] = (
+            previous_confirmations + 1
         )
 
-        pending[
-            "last_confirmation_time"
-        ] = now_ts()
+        pending["last_confirmation_time"] = (
+            now_ts()
+        )
 
         confirmations = pending[
             "confirmations"
@@ -2180,19 +1646,13 @@ def process_confirmation(
             >= CONFIRMATION_REQUIRED_SCANS
         ):
 
-            if (
-                token_on_cooldown(
-                    address
-                )
-                or
-                global_alert_on_cooldown()
-            ):
+            if global_alert_on_cooldown():
 
                 print(
-                    f"[COOLDOWN] "
+                    f"[GLOBAL COOLDOWN] "
                     f"{snapshot['symbol']} | "
                     f"Confirmation valid but "
-                    f"alert cooldown active",
+                    f"global alert spacing active",
                     flush=True
                 )
 
@@ -2208,10 +1668,10 @@ def process_confirmation(
         return None
 
     # --------------------------------------------------------
-    # Secondary MC-growth path
+    # MC growth path
     #
     # Growth alone NEVER confirms.
-    # Current flow/structure must still qualify.
+    # Current flow + structure must still qualify.
     # --------------------------------------------------------
 
     secondary_valid = (
@@ -2219,48 +1679,30 @@ def process_confirmation(
         mc_growth
         >= CONFIRMATION_MC_GROWTH_PCT
 
-        and analysis[
-            "score"
-        ] >= 70
+        and analysis["score"] >= 70
 
-        and analysis[
-            "flow_qualified"
-        ]
+        and analysis["flow_qualified"]
 
         and (
-            analysis[
-                "breakout"
-            ]
-            or
-            analysis[
-                "activity"
-            ]
+            analysis["breakout"]
+            or analysis["activity"]
         )
 
-        and analysis[
-            "safety_pass"
-        ]
+        and analysis["safety_pass"]
 
-        and snapshot[
-            "change_5m"
-        ] > MAX_IGNITION_DRAWDOWN_PCT
+        and snapshot["change_5m"]
+        > MAX_IGNITION_DRAWDOWN_PCT
     )
 
     if secondary_valid:
 
-        if (
-            token_on_cooldown(
-                address
-            )
-            or
-            global_alert_on_cooldown()
-        ):
+        if global_alert_on_cooldown():
 
             print(
-                f"[COOLDOWN] "
+                f"[GLOBAL COOLDOWN] "
                 f"{snapshot['symbol']} | "
                 f"MC-growth confirmation valid "
-                f"but alert cooldown active",
+                f"but alert spacing active",
                 flush=True
             )
 
@@ -2311,19 +1753,19 @@ def register_alert(
     confirmation_type: str
 ) -> None:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
-    state[
+    # Preserve existing outcome history while replacing the
+    # active alert record after the cooldown expires.
+    previous = state[
         "alerts"
-    ][address] = {
+    ].get(address)
+
+    state["alerts"][address] = {
 
         "address": address,
 
-        "symbol": snapshot[
-            "symbol"
-        ],
+        "symbol": snapshot["symbol"],
 
         "alert_time": now_ts(),
 
@@ -2334,25 +1776,15 @@ def register_alert(
             snapshot["mc"]
         ),
 
-        "start_mc": snapshot[
-            "mc"
-        ],
+        "start_mc": snapshot["mc"],
 
-        "peak_mc": snapshot[
-            "mc"
-        ],
+        "peak_mc": snapshot["mc"],
 
-        "min_mc": snapshot[
-            "mc"
-        ],
+        "min_mc": snapshot["mc"],
 
-        "score": analysis[
-            "score"
-        ],
+        "score": analysis["score"],
 
-        "confirmation_type": (
-            confirmation_type
-        ),
+        "confirmation_type": confirmation_type,
 
         "flow_proxy": snapshot[
             "flow_proxy_5m"
@@ -2373,14 +1805,18 @@ def register_alert(
             "60m": None,
         },
 
-        "pair_url": snapshot[
-            "pair_url"
-        ],
+        "pair_url": snapshot["pair_url"],
     }
 
-    state[
-        "last_alert_time"
-    ] = now_ts()
+    if previous:
+
+        state["alerts"][address][
+            "previous_alert_time"
+        ] = previous.get(
+            "alert_time"
+        )
+
+    state["last_alert_time"] = now_ts()
 
 
 # ============================================================
@@ -2391,70 +1827,49 @@ def update_alert_outcome(
     snapshot: Dict[str, Any]
 ) -> None:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
-    alert = state[
-        "alerts"
-    ].get(
+    alert = state["alerts"].get(
         address
     )
 
     if not alert:
         return
 
-    current_mc = snapshot[
-        "mc"
-    ]
+    current_mc = snapshot["mc"]
 
-    alert[
-        "peak_mc"
-    ] = max(
+    alert["peak_mc"] = max(
         safe_float(
-            alert.get(
-                "peak_mc"
-            )
+            alert.get("peak_mc")
         ),
         current_mc
     )
 
     old_min = safe_float(
-        alert.get(
-            "min_mc"
-        )
+        alert.get("min_mc")
     )
 
     if old_min <= 0:
 
-        alert[
-            "min_mc"
-        ] = current_mc
+        alert["min_mc"] = current_mc
 
     else:
 
-        alert[
-            "min_mc"
-        ] = min(
+        alert["min_mc"] = min(
             old_min,
             current_mc
         )
 
     alert_time = safe_float(
-        alert.get(
-            "alert_time"
-        )
+        alert.get("alert_time")
     )
 
     elapsed = (
-        now_ts()
-        - alert_time
+        now_ts() - alert_time
     )
 
     start_mc = safe_float(
-        alert.get(
-            "start_mc"
-        )
+        alert.get("start_mc")
     )
 
     if start_mc <= 0:
@@ -2465,12 +1880,9 @@ def update_alert_outcome(
     ):
 
         if (
-            elapsed
-            >= seconds
+            elapsed >= seconds
             and
-            alert[
-                "checks"
-            ].get(label) is None
+            alert["checks"].get(label) is None
         ):
 
             current_growth = pct_change(
@@ -2481,65 +1893,40 @@ def update_alert_outcome(
             peak_growth = pct_change(
                 start_mc,
                 safe_float(
-                    alert.get(
-                        "peak_mc"
-                    )
+                    alert.get("peak_mc")
                 )
             )
 
             drawdown = pct_change(
                 safe_float(
-                    alert.get(
-                        "peak_mc"
-                    )
+                    alert.get("peak_mc")
                 ),
                 current_mc
             )
 
-            if (
-                current_growth
-                >= 20
-            ):
-
+            if current_growth >= 20:
                 outcome = "RUNNER"
 
-            elif (
-                current_growth
-                >= 5
-            ):
-
+            elif current_growth >= 5:
                 outcome = "FOLLOW_THROUGH"
 
-            elif (
-                current_growth
-                > -15
-            ):
-
+            elif current_growth > -15:
                 outcome = "UNCLEAR"
 
             else:
-
                 outcome = "FAILED"
 
-            alert[
-                "checks"
-            ][label] = {
+            alert["checks"][label] = {
 
                 "checked_at": iso_now(),
 
                 "mc": current_mc,
 
-                "growth_pct": (
-                    current_growth
-                ),
+                "growth_pct": current_growth,
 
-                "peak_growth_pct": (
-                    peak_growth
-                ),
+                "peak_growth_pct": peak_growth,
 
-                "drawdown_from_peak_pct": (
-                    drawdown
-                ),
+                "drawdown_from_peak_pct": drawdown,
 
                 "outcome": outcome,
             }
@@ -2571,9 +1958,7 @@ def confirm_runner(
     confirmation_type: str
 ) -> str:
 
-    address = snapshot[
-        "address"
-    ]
+    address = snapshot["address"]
 
     ignition_mc = safe_float(
         pending.get(
@@ -2582,9 +1967,7 @@ def confirm_runner(
         )
     )
 
-    current_mc = snapshot[
-        "mc"
-    ]
+    current_mc = snapshot["mc"]
 
     mc_growth = pct_change(
         ignition_mc,
@@ -2649,22 +2032,13 @@ def build_confirmation_message(
         "flow_pressure_pct"
     ]
 
-    if (
-        flow_pct
-        >= FLOW_MC_HOT_PCT
-    ):
-
+    if flow_pct >= FLOW_MC_HOT_PCT:
         flow_label = "🔥 HOT"
 
-    elif (
-        flow_pct
-        >= FLOW_MC_STRONG_PCT
-    ):
-
+    elif flow_pct >= FLOW_MC_STRONG_PCT:
         flow_label = "🟠 STRONG"
 
     else:
-
         flow_label = "🟢 QUALIFIED"
 
     safety = safety_checks(
@@ -2673,16 +2047,12 @@ def build_confirmation_message(
 
     safety_count = sum(
         1
-        for value in safety[
-            "checks"
-        ].values()
+        for value in safety["checks"].values()
         if value
     )
 
     safety_total = len(
-        safety[
-            "checks"
-        ]
+        safety["checks"]
     )
 
     return (
@@ -2753,9 +2123,9 @@ def build_confirmation_message(
         f"DEX Screener volume × "
         f"buy/sell imbalance.\n"
 
-        f"⚠️ Not true dollar net flow "
-        f"until a dedicated flow API "
-        f"is connected.\n\n"
+        f"⚠️ This is NOT true dollar "
+        f"net flow until a dedicated "
+        f"flow API is connected.\n\n"
 
         f"{snapshot['pair_url']}"
     )
@@ -2770,12 +2140,9 @@ def telegram_api(
     payload: Optional[
         Dict[str, Any]
     ] = None
-) -> Optional[
-    Dict[str, Any]
-]:
+) -> Optional[Dict[str, Any]]:
 
     if not TELEGRAM_BOT_TOKEN:
-
         return None
 
     url = (
@@ -2835,9 +2202,7 @@ def send_telegram(
 
     return bool(
         result
-        and result.get(
-            "ok"
-        )
+        and result.get("ok")
     )
 
 
@@ -2893,12 +2258,9 @@ def handle_update(
     if not message:
         return
 
-    chat = (
-        message.get(
-            "chat"
-        )
-        or {}
-    )
+    chat = message.get(
+        "chat"
+    ) or {}
 
     chat_id = chat.get(
         "id"
@@ -2914,17 +2276,11 @@ def handle_update(
         )
     ).strip()
 
-    if text.startswith(
-        "/start"
-    ):
+    if text.startswith("/start"):
 
-        if chat_id not in state[
-            "subscribers"
-        ]:
+        if chat_id not in state["subscribers"]:
 
-            state[
-                "subscribers"
-            ].append(
+            state["subscribers"].append(
                 chat_id
             )
 
@@ -2940,17 +2296,11 @@ def handle_update(
             )
         )
 
-    elif text.startswith(
-        "/stop"
-    ):
+    elif text.startswith("/stop"):
 
-        state[
-            "subscribers"
-        ] = [
+        state["subscribers"] = [
             x
-            for x in state[
-                "subscribers"
-            ]
+            for x in state["subscribers"]
             if x != chat_id
         ]
 
@@ -2961,26 +2311,18 @@ def handle_update(
             "Alerts stopped."
         )
 
-    elif text.startswith(
-        "/status"
-    ):
+    elif text.startswith("/status"):
 
         pending = len(
-            state[
-                "pending_ignitions"
-            ]
+            state["pending_ignitions"]
         )
 
         alerts = len(
-            state[
-                "alerts"
-            ]
+            state["alerts"]
         )
 
         tokens = len(
-            state[
-                "tokens"
-            ]
+            state["tokens"]
         )
 
         send_telegram(
@@ -2995,7 +2337,7 @@ def handle_update(
                 f"Pending ignitions: "
                 f"{pending}\n"
 
-                f"Confirmed alerts: "
+                f"Active alert records: "
                 f"{alerts}\n"
 
                 f"Scan interval: "
@@ -3030,9 +2372,7 @@ def handle_update(
             )
         )
 
-    elif text.startswith(
-        "/alerts"
-    ):
+    elif text.startswith("/alerts"):
 
         alerts = state.get(
             "alerts",
@@ -3057,9 +2397,7 @@ def handle_update(
         )[-10:]:
 
             start_mc = safe_float(
-                item.get(
-                    "start_mc"
-                )
+                item.get("start_mc")
             )
 
             score = item.get(
@@ -3082,14 +2420,10 @@ def handle_update(
 
         send_telegram(
             str(chat_id),
-            "\n".join(
-                lines
-            )
+            "\n".join(lines)
         )
 
-    elif text.startswith(
-        "/scan"
-    ):
+    elif text.startswith("/scan"):
 
         send_telegram(
             str(chat_id),
@@ -3106,7 +2440,6 @@ def handle_update(
 def telegram_poll() -> None:
 
     if not TELEGRAM_BOT_TOKEN:
-
         return
 
     offset = state.get(
@@ -3125,10 +2458,7 @@ def telegram_poll() -> None:
     if not result:
         return
 
-    if not result.get(
-        "ok"
-    ):
-
+    if not result.get("ok"):
         return
 
     updates = result.get(
@@ -3144,17 +2474,13 @@ def telegram_poll() -> None:
 
         if update_id is not None:
 
-            state[
-                "telegram_offset"
-            ] = (
+            state["telegram_offset"] = (
                 update_id + 1
             )
 
         try:
 
-            handle_update(
-                update
-            )
+            handle_update(update)
 
         except Exception as exc:
 
@@ -3175,46 +2501,19 @@ def print_filter_reason(
     snapshot: Dict[str, Any]
 ) -> bool:
 
-    symbol = snapshot[
-        "symbol"
-    ]
-
-    mc = snapshot[
-        "mc"
-    ]
-
-    liquidity = snapshot[
-        "liquidity"
-    ]
-
-    age = snapshot[
-        "age_hours"
-    ]
-
-    flow = snapshot[
-        "flow_proxy_5m"
-    ]
-
-    flow_pct = snapshot[
-        "flow_pressure_pct"
-    ]
-
-    volume = snapshot[
-        "volume_5m"
-    ]
-
-    ratio = snapshot[
-        "buy_sell_ratio"
-    ]
-
+    symbol = snapshot["symbol"]
+    mc = snapshot["mc"]
+    liquidity = snapshot["liquidity"]
+    age = snapshot["age_hours"]
+    flow = snapshot["flow_proxy_5m"]
+    flow_pct = snapshot["flow_pressure_pct"]
+    volume = snapshot["volume_5m"]
+    ratio = snapshot["buy_sell_ratio"]
     liquidity_ratio = snapshot[
         "liquidity_mc_ratio"
     ]
 
-    if (
-        mc
-        < OBSERVE_MIN_MC
-    ):
+    if mc < OBSERVE_MIN_MC:
 
         print(
             f"[FILTER] "
@@ -3225,10 +2524,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        mc
-        > OBSERVE_MAX_MC
-    ):
+    if mc > OBSERVE_MAX_MC:
 
         print(
             f"[FILTER] "
@@ -3239,10 +2535,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        mc
-        > MAX_MC
-    ):
+    if mc > MAX_MC:
 
         print(
             f"[FILTER] "
@@ -3253,10 +2546,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        liquidity
-        < MIN_LIQUIDITY
-    ):
+    if liquidity < MIN_LIQUIDITY:
 
         print(
             f"[FILTER] "
@@ -3268,10 +2558,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        liquidity_ratio
-        > MAX_LIQUIDITY_MC_RATIO
-    ):
+    if liquidity_ratio > MAX_LIQUIDITY_MC_RATIO:
 
         print(
             f"[FILTER] "
@@ -3283,10 +2570,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        age
-        > MAX_PAIR_AGE_HOURS
-    ):
+    if age > MAX_PAIR_AGE_HOURS:
 
         print(
             f"[FILTER] "
@@ -3298,10 +2582,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        flow
-        < MIN_FLOW_PROXY_USD
-    ):
+    if flow < MIN_FLOW_PROXY_USD:
 
         print(
             f"[FLOW WAIT] "
@@ -3317,10 +2598,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        flow_pct
-        < FLOW_MC_QUALIFY_PCT
-    ):
+    if flow_pct < FLOW_MC_QUALIFY_PCT:
 
         print(
             f"[FLOW WAIT] "
@@ -3334,10 +2612,7 @@ def print_filter_reason(
 
         return False
 
-    if (
-        volume
-        < MIN_VOLUME_5M
-    ):
+    if volume < MIN_VOLUME_5M:
 
         print(
             f"[FLOW WAIT] "
@@ -3388,16 +2663,15 @@ def scan_once() -> None:
         flush=True
     )
 
+    current_time = now_ts()
+
     # --------------------------------------------------------
     # Discovery
     # --------------------------------------------------------
 
-    current_time = now_ts()
-
     if (
         current_time
-        -
-        safe_float(
+        - safe_float(
             state.get(
                 "last_discovery",
                 0
@@ -3456,10 +2730,6 @@ def scan_once() -> None:
         f"{len(strongest)} strongest pools selected",
         flush=True
     )
-
-    # --------------------------------------------------------
-    # Expire pending
-    # --------------------------------------------------------
 
     expire_pending_ignitions()
 
@@ -3525,13 +2795,10 @@ def scan_once() -> None:
                 continue
 
             # ------------------------------------------------
-            # History
+            # Observation requirement
             # ------------------------------------------------
 
-            if (
-                observations
-                < MIN_OBSERVATIONS
-            ):
+            if observations < MIN_OBSERVATIONS:
 
                 print(
                     f"[WAIT] "
@@ -3545,7 +2812,7 @@ def scan_once() -> None:
                 continue
 
             # ------------------------------------------------
-            # Analyze
+            # Analysis
             # ------------------------------------------------
 
             analysis = analyze(
@@ -3612,10 +2879,7 @@ def scan_once() -> None:
             )
 
             if message:
-
-                broadcast(
-                    message
-                )
+                broadcast(message)
 
             save_state()
 
@@ -3719,7 +2983,7 @@ def main() -> None:
     )
 
     print(
-        f"Strict confirmation: ON",
+        "Strict confirmation: ON",
         flush=True
     )
 
@@ -3763,8 +3027,7 @@ def main() -> None:
             current = now_ts()
 
             if (
-                current
-                - last_scan
+                current - last_scan
                 >= SCAN_INTERVAL_SECONDS
             ):
 
@@ -3799,5 +3062,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-
     main()
