@@ -9,16 +9,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
-# RUNNER BOT V4.5
-# BALANCED FLOW-PRESSURE DECISION TREE
+# RUNNER BOT V4.6
+# EARLY MC BIAS + PERSISTENT REJECTION TRACKING
 # ============================================================
 
-BOT_VERSION = "V4.5-BALANCED-FLOW"
+BOT_VERSION = "V4.6-EARLY-MC-TRACKING"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-STATE_FILE = "runner_state_v42.json"
+STATE_FILE = "runner_state_v46.json"
 
 
 # ============================================================
@@ -47,7 +47,7 @@ SCAN_INTERVAL_SECONDS = int(
 
 
 # ============================================================
-# EXACT V4.5 DECISION-TREE SETTINGS
+# EXACT V4.6 DECISION-TREE SETTINGS
 # ============================================================
 
 # ------------------------------------------------------------
@@ -78,16 +78,17 @@ MAX_AGE_HOURS = 48.0
 
 
 # ------------------------------------------------------------
-# 4. MARKET CAP
+# 4. MARKET CAP — V4.6 EARLY BIAS
 # ------------------------------------------------------------
 
-MIN_MC = 6_000
-MAX_MC_NORMAL = 150_000
-MAX_MC_EXTENDED = 250_000
+MIN_MC = 7_000
 
-# IMPORTANT:
-# This is the canonical V4.5 name.
-EXTENDED_MC_MIN_FLOW_PCT = 11.0
+MAX_MC_NORMAL = 90_000
+
+MAX_MC_EXTENDED = 140_000
+
+# Extended MC now requires stronger flow pressure.
+EXTENDED_MC_MIN_FLOW_PCT = 14.0
 
 
 # ------------------------------------------------------------
@@ -143,6 +144,17 @@ DEX_BATCH_SIZE = 25
 
 
 # ============================================================
+# TRACKING
+# ============================================================
+
+# Persistent rejection history.
+MAX_REJECTION_HISTORY = 5000
+
+# Persistent scan-level history.
+MAX_SCAN_TRACKING_HISTORY = 1000
+
+
+# ============================================================
 # DEBUGGING
 # ============================================================
 
@@ -186,7 +198,7 @@ def http_get_json(
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "RunnerBot/4.5",
+                "User-Agent": "RunnerBot/4.6",
                 "Accept": "application/json",
             },
         )
@@ -276,6 +288,37 @@ def pct_change(
 # STATE
 # ============================================================
 
+def default_tracking_state() -> Dict[str, Any]:
+
+    return {
+        "total_scans": 0,
+
+        "total_discovered": 0,
+
+        "total_prefiltered": 0,
+
+        "total_processed": 0,
+
+        "total_rejected": 0,
+
+        "total_qualified": 0,
+
+        "rejection_counts": {},
+
+        "qualification_counts": {},
+
+        "recent_rejections": [],
+
+        "recent_qualifications": [],
+
+        "recent_scans": [],
+
+        "created_at": iso_now(),
+
+        "updated_at": iso_now(),
+    }
+
+
 def default_state() -> Dict[str, Any]:
 
     return {
@@ -290,6 +333,9 @@ def default_state() -> Dict[str, Any]:
         "offset": 0,
         "created_at": iso_now(),
         "updated_at": iso_now(),
+
+        # Persistent V4.6 tracking.
+        "tracking": default_tracking_state(),
     }
 
 
@@ -317,6 +363,87 @@ def load_state() -> Dict[str, Any]:
             if key not in state:
                 state[key] = value
 
+        # ----------------------------------------------------
+        # Ensure tracking exists.
+        # ----------------------------------------------------
+
+        if not isinstance(
+            state.get("tracking"),
+            dict,
+        ):
+
+            state["tracking"] = (
+                default_tracking_state()
+            )
+
+        tracking_base = (
+            default_tracking_state()
+        )
+
+        for key, value in tracking_base.items():
+
+            if key not in state["tracking"]:
+                state["tracking"][key] = value
+
+        # ----------------------------------------------------
+        # Compatibility cleanup.
+        # ----------------------------------------------------
+
+        if not isinstance(
+            state["tracking"].get(
+                "rejection_counts"
+            ),
+            dict,
+        ):
+
+            state["tracking"][
+                "rejection_counts"
+            ] = {}
+
+        if not isinstance(
+            state["tracking"].get(
+                "qualification_counts"
+            ),
+            dict,
+        ):
+
+            state["tracking"][
+                "qualification_counts"
+            ] = {}
+
+        if not isinstance(
+            state["tracking"].get(
+                "recent_rejections"
+            ),
+            list,
+        ):
+
+            state["tracking"][
+                "recent_rejections"
+            ] = []
+
+        if not isinstance(
+            state["tracking"].get(
+                "recent_qualifications"
+            ),
+            list,
+        ):
+
+            state["tracking"][
+                "recent_qualifications"
+            ] = []
+
+        if not isinstance(
+            state["tracking"].get(
+                "recent_scans"
+            ),
+            list,
+        ):
+
+            state["tracking"][
+                "recent_scans"
+            ] = []
+
         state["version"] = BOT_VERSION
 
         return state
@@ -337,6 +464,15 @@ def save_state() -> None:
 
     STATE["version"] = BOT_VERSION
     STATE["updated_at"] = iso_now()
+
+    if isinstance(
+        STATE.get("tracking"),
+        dict,
+    ):
+
+        STATE["tracking"][
+            "updated_at"
+        ] = iso_now()
 
     try:
 
@@ -368,6 +504,772 @@ def save_state() -> None:
         print(
             f"[STATE] Save error: {exc}"
         )
+
+
+# ============================================================
+# PERSISTENT TRACKING
+# ============================================================
+
+def tracking_state() -> Dict[str, Any]:
+
+    tracking = STATE.setdefault(
+        "tracking",
+        default_tracking_state(),
+    )
+
+    return tracking
+
+
+def increment_tracking_counter(
+    key: str,
+    amount: int = 1,
+) -> None:
+
+    tracking = tracking_state()
+
+    tracking[key] = (
+        safe_int(
+            tracking.get(key),
+            0,
+        )
+        + amount
+    )
+
+
+def increment_rejection_reason(
+    reason: str,
+) -> None:
+
+    tracking = tracking_state()
+
+    counts = tracking.setdefault(
+        "rejection_counts",
+        {},
+    )
+
+    counts[reason] = (
+        safe_int(
+            counts.get(reason),
+            0,
+        )
+        + 1
+    )
+
+
+def increment_qualification_reason(
+    strength: str,
+) -> None:
+
+    tracking = tracking_state()
+
+    counts = tracking.setdefault(
+        "qualification_counts",
+        {},
+    )
+
+    counts[strength] = (
+        safe_int(
+            counts.get(strength),
+            0,
+        )
+        + 1
+    )
+
+
+def add_rejection_tracking(
+    snapshot: Dict[str, Any],
+    reason: str,
+) -> None:
+
+    tracking = tracking_state()
+
+    record = {
+        "timestamp": now_ts(),
+        "iso_time": iso_now(),
+
+        "symbol": snapshot.get(
+            "symbol",
+            "UNKNOWN",
+        ),
+
+        "address": snapshot.get(
+            "address",
+            "",
+        ),
+
+        "reason": reason,
+
+        "market_cap": safe_float(
+            snapshot.get(
+                "market_cap"
+            ),
+            0.0,
+        ),
+
+        "liquidity": (
+            safe_float(
+                snapshot.get(
+                    "liquidity"
+                ),
+                0.0,
+            )
+            if snapshot.get(
+                "liquidity"
+            ) is not None
+            else None
+        ),
+
+        "liquidity_valid": bool(
+            snapshot.get(
+                "liquidity_data_valid",
+                False,
+            )
+        ),
+
+        "age_hours": (
+            safe_float(
+                snapshot.get(
+                    "age_hours"
+                ),
+                0.0,
+            )
+            if snapshot.get(
+                "age_hours"
+            ) is not None
+            else None
+        ),
+
+        "volume_5m": safe_float(
+            snapshot.get(
+                "volume_5m"
+            ),
+            0.0,
+        ),
+
+        "flow_proxy_5m": safe_float(
+            snapshot.get(
+                "flow_proxy_5m"
+            ),
+            0.0,
+        ),
+
+        "flow_mc_pct": safe_float(
+            snapshot.get(
+                "flow_pressure_pct"
+            ),
+            0.0,
+        ),
+
+        "volume_flow_ratio": safe_float(
+            snapshot.get(
+                "volume_flow_ratio"
+            ),
+            0.0,
+        ),
+
+        "buy_sell_ratio": safe_float(
+            snapshot.get(
+                "buy_sell_ratio"
+            ),
+            0.0,
+        ),
+
+        "buys_5m": safe_int(
+            snapshot.get(
+                "buys_5m"
+            ),
+            0,
+        ),
+
+        "sells_5m": safe_int(
+            snapshot.get(
+                "sells_5m"
+            ),
+            0,
+        ),
+
+        "tx_5m": safe_int(
+            snapshot.get(
+                "tx_5m"
+            ),
+            0,
+        ),
+
+        "price_change_5m": safe_float(
+            snapshot.get(
+                "price_change_5m"
+            ),
+            0.0,
+        ),
+
+        "dex": snapshot.get(
+            "dex_id",
+            "unknown",
+        ),
+
+        "pair_address": snapshot.get(
+            "pair_address",
+            "",
+        ),
+
+        "url": snapshot.get(
+            "url",
+            "",
+        ),
+    }
+
+    history = tracking.setdefault(
+        "recent_rejections",
+        [],
+    )
+
+    history.append(record)
+
+    if (
+        len(history)
+        > MAX_REJECTION_HISTORY
+    ):
+
+        del history[
+            :-MAX_REJECTION_HISTORY
+        ]
+
+    increment_tracking_counter(
+        "total_rejected"
+    )
+
+    increment_rejection_reason(
+        reason
+    )
+
+
+def add_qualification_tracking(
+    snapshot: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> None:
+
+    tracking = tracking_state()
+
+    strength = str(
+        analysis.get(
+            "signal_strength",
+            "NORMAL",
+        )
+    )
+
+    record = {
+        "timestamp": now_ts(),
+        "iso_time": iso_now(),
+
+        "symbol": snapshot.get(
+            "symbol",
+            "UNKNOWN",
+        ),
+
+        "address": snapshot.get(
+            "address",
+            "",
+        ),
+
+        "strength": strength,
+
+        "market_cap": safe_float(
+            snapshot.get(
+                "market_cap"
+            ),
+            0.0,
+        ),
+
+        "liquidity": (
+            safe_float(
+                snapshot.get(
+                    "liquidity"
+                ),
+                0.0,
+            )
+            if snapshot.get(
+                "liquidity"
+            ) is not None
+            else None
+        ),
+
+        "age_hours": (
+            safe_float(
+                snapshot.get(
+                    "age_hours"
+                ),
+                0.0,
+            )
+            if snapshot.get(
+                "age_hours"
+            ) is not None
+            else None
+        ),
+
+        "volume_5m": safe_float(
+            snapshot.get(
+                "volume_5m"
+            ),
+            0.0,
+        ),
+
+        "flow_proxy_5m": safe_float(
+            snapshot.get(
+                "flow_proxy_5m"
+            ),
+            0.0,
+        ),
+
+        "flow_mc_pct": safe_float(
+            snapshot.get(
+                "flow_pressure_pct"
+            ),
+            0.0,
+        ),
+
+        "volume_flow_ratio": safe_float(
+            snapshot.get(
+                "volume_flow_ratio"
+            ),
+            0.0,
+        ),
+
+        "buy_sell_ratio": safe_float(
+            snapshot.get(
+                "buy_sell_ratio"
+            ),
+            0.0,
+        ),
+
+        "extended_mc": bool(
+            analysis.get(
+                "extended_mc",
+                False,
+            )
+        ),
+
+        "liquidity_fallback": bool(
+            analysis.get(
+                "liquidity_fallback",
+                False,
+            )
+        ),
+
+        "score": safe_int(
+            analysis.get(
+                "score"
+            ),
+            0,
+        ),
+    }
+
+    history = tracking.setdefault(
+        "recent_qualifications",
+        [],
+    )
+
+    history.append(record)
+
+    if (
+        len(history)
+        > MAX_REJECTION_HISTORY
+    ):
+
+        del history[
+            :-MAX_REJECTION_HISTORY
+        ]
+
+    increment_tracking_counter(
+        "total_qualified"
+    )
+
+    increment_qualification_reason(
+        strength
+    )
+
+
+def record_prefiltered_count(
+    count: int,
+) -> None:
+
+    if count <= 0:
+        return
+
+    increment_tracking_counter(
+        "total_prefiltered",
+        count,
+    )
+
+
+def record_discovered_count(
+    count: int,
+) -> None:
+
+    if count <= 0:
+        return
+
+    increment_tracking_counter(
+        "total_discovered",
+        count,
+    )
+
+
+def record_processed_count(
+    count: int,
+) -> None:
+
+    if count <= 0:
+        return
+
+    increment_tracking_counter(
+        "total_processed",
+        count,
+    )
+
+
+def record_scan_summary(
+    discovered: int,
+    prefiltered: int,
+    processed: int,
+    rejected: int,
+    qualified: int,
+) -> None:
+
+    tracking = tracking_state()
+
+    increment_tracking_counter(
+        "total_scans"
+    )
+
+    record = {
+        "timestamp": now_ts(),
+        "iso_time": iso_now(),
+
+        "discovered": discovered,
+        "prefiltered": prefiltered,
+        "processed": processed,
+        "rejected": rejected,
+        "qualified": qualified,
+    }
+
+    history = tracking.setdefault(
+        "recent_scans",
+        [],
+    )
+
+    history.append(record)
+
+    if (
+        len(history)
+        > MAX_SCAN_TRACKING_HISTORY
+    ):
+
+        del history[
+            :-MAX_SCAN_TRACKING_HISTORY
+        ]
+
+
+def print_tracking_summary() -> None:
+
+    tracking = tracking_state()
+
+    total_discovered = safe_int(
+        tracking.get(
+            "total_discovered"
+        ),
+        0,
+    )
+
+    total_prefiltered = safe_int(
+        tracking.get(
+            "total_prefiltered"
+        ),
+        0,
+    )
+
+    total_processed = safe_int(
+        tracking.get(
+            "total_processed"
+        ),
+        0,
+    )
+
+    total_rejected = safe_int(
+        tracking.get(
+            "total_rejected"
+        ),
+        0,
+    )
+
+    total_qualified = safe_int(
+        tracking.get(
+            "total_qualified"
+        ),
+        0,
+    )
+
+    print(
+        "\n"
+        + "=" * 75
+    )
+
+    print(
+        "[V4.6 PERSISTENT TRACKING]"
+    )
+
+    print(
+        f"Scans:       "
+        f"{safe_int(tracking.get('total_scans'), 0):,}"
+    )
+
+    print(
+        f"Discovered:  "
+        f"{total_discovered:,}"
+    )
+
+    print(
+        f"Pre-filtered:"
+        f" {total_prefiltered:,}"
+    )
+
+    print(
+        f"Processed:   "
+        f"{total_processed:,}"
+    )
+
+    print(
+        f"Rejected:    "
+        f"{total_rejected:,}"
+    )
+
+    print(
+        f"Qualified:   "
+        f"{total_qualified:,}"
+    )
+
+    if total_processed > 0:
+
+        rejection_rate = (
+            total_rejected
+            / total_processed
+        ) * 100.0
+
+        qualification_rate = (
+            total_qualified
+            / total_processed
+        ) * 100.0
+
+        print(
+            f"Rejection rate:    "
+            f"{rejection_rate:.2f}%"
+        )
+
+        print(
+            f"Qualification rate:"
+            f" {qualification_rate:.2f}%"
+        )
+
+    print(
+        "\nREJECTION BREAKDOWN"
+    )
+
+    counts = tracking.get(
+        "rejection_counts",
+        {},
+    )
+
+    if counts:
+
+        sorted_counts = sorted(
+            counts.items(),
+            key=lambda item:
+                item[1],
+            reverse=True,
+        )
+
+        for reason, count in sorted_counts:
+
+            percentage = (
+                (
+                    count
+                    / total_rejected
+                ) * 100.0
+                if total_rejected > 0
+                else 0.0
+            )
+
+            print(
+                f"{reason:<40} "
+                f"{count:>7,} "
+                f"({percentage:>5.1f}%)"
+            )
+
+    else:
+
+        print(
+            "No rejection data yet."
+        )
+
+    print(
+        "\nQUALIFICATION BREAKDOWN"
+    )
+
+    qualification_counts = (
+        tracking.get(
+            "qualification_counts",
+            {},
+        )
+    )
+
+    if qualification_counts:
+
+        sorted_qualifications = sorted(
+            qualification_counts.items(),
+            key=lambda item:
+                item[1],
+            reverse=True,
+        )
+
+        for strength, count in (
+            sorted_qualifications
+        ):
+
+            print(
+                f"{strength:<40} "
+                f"{count:>7,}"
+            )
+
+    else:
+
+        print(
+            "No qualified tokens yet."
+        )
+
+    print(
+        "=" * 75
+    )
+
+
+def tracking_text() -> str:
+
+    tracking = tracking_state()
+
+    total_discovered = safe_int(
+        tracking.get(
+            "total_discovered"
+        ),
+        0,
+    )
+
+    total_prefiltered = safe_int(
+        tracking.get(
+            "total_prefiltered"
+        ),
+        0,
+    )
+
+    total_processed = safe_int(
+        tracking.get(
+            "total_processed"
+        ),
+        0,
+    )
+
+    total_rejected = safe_int(
+        tracking.get(
+            "total_rejected"
+        ),
+        0,
+    )
+
+    total_qualified = safe_int(
+        tracking.get(
+            "total_qualified"
+        ),
+        0,
+    )
+
+    rejection_rate = (
+        (
+            total_rejected
+            / total_processed
+        ) * 100.0
+        if total_processed > 0
+        else 0.0
+    )
+
+    qualification_rate = (
+        (
+            total_qualified
+            / total_processed
+        ) * 100.0
+        if total_processed > 0
+        else 0.0
+    )
+
+    lines = [
+        f"📊 Runner Bot {BOT_VERSION}",
+        "",
+        f"Scans: {safe_int(tracking.get('total_scans'), 0):,}",
+        f"Discovered: {total_discovered:,}",
+        f"Pre-filtered: {total_prefiltered:,}",
+        f"Decision-tree processed: {total_processed:,}",
+        f"Rejected: {total_rejected:,}",
+        f"Qualified: {total_qualified:,}",
+        "",
+        f"Rejection rate: {rejection_rate:.2f}%",
+        f"Qualification rate: {qualification_rate:.2f}%",
+        "",
+        "TOP REJECTION REASONS:",
+    ]
+
+    counts = tracking.get(
+        "rejection_counts",
+        {},
+    )
+
+    sorted_counts = sorted(
+        counts.items(),
+        key=lambda item:
+            item[1],
+        reverse=True,
+    )
+
+    for reason, count in sorted_counts[:10]:
+
+        percentage = (
+            (
+                count
+                / total_rejected
+            ) * 100.0
+            if total_rejected > 0
+            else 0.0
+        )
+
+        lines.append(
+            f"• {reason}: "
+            f"{count:,} "
+            f"({percentage:.1f}%)"
+        )
+
+    if not sorted_counts:
+
+        lines.append(
+            "• No rejection data yet."
+        )
+
+    lines.extend(
+        [
+            "",
+            "V4.6 MC:",
+            "• Min: $7K",
+            "• Normal max: $90K",
+            "• Extended max: $140K",
+            "• Extended Flow/MC: 14%",
+        ]
+    )
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -1185,7 +2087,7 @@ def build_decision_token(
 
 
 # ============================================================
-# EXACT V4.5 QUALIFICATION ENGINE
+# EXACT V4.6 QUALIFICATION ENGINE
 # ============================================================
 
 def evaluate_token(
@@ -1315,7 +2217,7 @@ def evaluate_token(
         )
 
     # --------------------------------------------------------
-    # 4. MARKET CAP
+    # 4. MARKET CAP — V4.6
     # --------------------------------------------------------
 
     if mc < MIN_MC:
@@ -1323,7 +2225,7 @@ def evaluate_token(
         return (
             False,
             None,
-            "MC_BELOW_6K",
+            "MC_BELOW_7K",
             0,
         )
 
@@ -1332,7 +2234,7 @@ def evaluate_token(
         return (
             False,
             None,
-            "MC_ABOVE_250K",
+            "MC_ABOVE_140K",
             0,
         )
 
@@ -1348,7 +2250,7 @@ def evaluate_token(
         return (
             False,
             None,
-            "MC_EXTENDED_BUT_FLOWMC_TOO_LOW",
+            "MC_EXTENDED_BUT_FLOWMC_BELOW_14PCT",
             0,
         )
 
@@ -1374,7 +2276,7 @@ def evaluate_token(
             0,
         )
 
-    # Volume/Flow and Buy/Sell are deliberately SOFT.
+    # Volume/Flow and Buy/Sell remain SOFT.
 
     # --------------------------------------------------------
     # 6. STRENGTH
@@ -1508,7 +2410,8 @@ def print_near_misses(
 
     print(
         f"\n[REJECTIONS] "
-        f"Top {limit} of {len(near_misses)} processed rejected candidates"
+        f"Top {limit} of {len(near_misses)} "
+        f"processed rejected candidates"
     )
 
     for index, (
@@ -1730,9 +2633,6 @@ def analyze(
         )
     )
 
-    # IMPORTANT:
-    # This is TRUE only when the token actually qualified
-    # through the early pump.fun liquidity fallback.
     liquidity_fallback = (
         "EARLY_PUMPFUN_FALLBACK"
         in reason
@@ -1938,7 +2838,7 @@ def telegram_api(
             url,
             data=data,
             headers={
-                "User-Agent": "RunnerBot/4.5",
+                "User-Agent": "RunnerBot/4.6",
             },
         )
 
@@ -1957,10 +2857,6 @@ def telegram_api(
 
     except urllib.error.HTTPError as exc:
 
-        # IMPORTANT:
-        # Telegram's 409 response is an HTTP error.
-        # Read the JSON body so telegram_poll() can
-        # identify the conflict correctly.
         try:
 
             raw = exc.read().decode(
@@ -2481,8 +3377,6 @@ def process_confirmation(
             f"{strength}"
         )
 
-        # ULTRA has required=1, so its first observation
-        # immediately satisfies confirmation.
         if required == 1:
 
             if global_on_cooldown():
@@ -2713,11 +3607,11 @@ def status_text() -> str:
         f"3. Age:\n"
         f"• ≤48h\n\n"
 
-        f"4. Market Cap:\n"
-        f"• ≥$6K\n"
-        f"• ≤$150K normal\n"
-        f"• ≤$250K extended\n"
-        f"• Extended requires Flow/MC ≥11%\n\n"
+        f"4. Market Cap — V4.6:\n"
+        f"• ≥$7K\n"
+        f"• ≤$90K normal\n"
+        f"• ≤$140K extended\n"
+        f"• Extended requires Flow/MC ≥14%\n\n"
 
         f"5. Core Flow:\n"
         f"• Flow ≥$1.5K\n"
@@ -2835,6 +3729,15 @@ def handle_command(
         telegram_send(
             chat_id,
             status_text(),
+        )
+
+        return
+
+    if command == "/tracking":
+
+        telegram_send(
+            chat_id,
+            tracking_text(),
         )
 
         return
@@ -3002,6 +3905,14 @@ def scan_once() -> None:
 
         return
 
+    discovered_count = len(
+        addresses
+    )
+
+    record_discovered_count(
+        discovered_count
+    )
+
     pairs = get_token_pairs_batch(
         addresses
     )
@@ -3039,6 +3950,7 @@ def scan_once() -> None:
     ] = []
 
     processed_count = 0
+    prefiltered_count = 0
 
     # --------------------------------------------------------
     # BUILD CANDIDATES
@@ -3050,13 +3962,19 @@ def scan_once() -> None:
             pair
         )
 
-        # Performance filter.
+        # ----------------------------------------------------
+        # PERFORMANCE PRE-FILTER
         #
-        # Tokens rejected here are not considered "processed"
-        # candidates because the full decision tree is never run.
+        # These are deliberately NOT counted as decision-tree
+        # rejections.
+        # ----------------------------------------------------
+
         if not passes_pre_filter(
             snapshot
         ):
+
+            prefiltered_count += 1
+
             continue
 
         processed_count += 1
@@ -3098,9 +4016,15 @@ def scan_once() -> None:
                 "UNKNOWN",
             )
 
-            # IMPORTANT:
-            # Every candidate that reaches the decision tree
-            # is recorded with its exact rejection reason.
+            # ------------------------------------------------
+            # PERSISTENT REJECTION TRACKING
+            # ------------------------------------------------
+
+            add_rejection_tracking(
+                snapshot,
+                reason,
+            )
+
             rejected_candidates.append(
                 (
                     reason,
@@ -3110,12 +4034,33 @@ def scan_once() -> None:
 
             continue
 
+        # ----------------------------------------------------
+        # PERSISTENT QUALIFICATION TRACKING
+        # ----------------------------------------------------
+
+        add_qualification_tracking(
+            snapshot,
+            analysis,
+        )
+
         qualified_tokens.append(
             (
                 snapshot,
                 analysis,
             )
         )
+
+    # --------------------------------------------------------
+    # PERSISTENT SCAN COUNTERS
+    # --------------------------------------------------------
+
+    record_prefiltered_count(
+        prefiltered_count
+    )
+
+    record_processed_count(
+        processed_count
+    )
 
     # --------------------------------------------------------
     # RANK QUALIFIED TOKENS
@@ -3206,14 +4151,38 @@ def scan_once() -> None:
 
     update_outcomes()
 
+    # --------------------------------------------------------
+    # SCAN SUMMARY
+    # --------------------------------------------------------
+
+    record_scan_summary(
+        discovered=discovered_count,
+        prefiltered=prefiltered_count,
+        processed=processed_count,
+        rejected=len(
+            rejected_candidates
+        ),
+        qualified=len(
+            qualified_tokens
+        ),
+    )
+
     save_state()
 
     print(
         f"[SCAN SUMMARY] "
+        f"Discovered={discovered_count} | "
+        f"PreFiltered={prefiltered_count} | "
         f"Processed={processed_count} | "
         f"Qualified={len(qualified_tokens)} | "
         f"Rejected={len(rejected_candidates)}"
     )
+
+    # --------------------------------------------------------
+    # PERSISTENT TRACKING SUMMARY
+    # --------------------------------------------------------
+
+    print_tracking_summary()
 
 
 # ============================================================
@@ -3257,7 +4226,7 @@ def main() -> None:
     )
 
     print(
-        "MC: "
+        "MC V4.6 EARLY BIAS: "
         f"${MIN_MC:,} - "
         f"${MAX_MC_NORMAL:,} normal / "
         f"${MAX_MC_EXTENDED:,} extended"
@@ -3293,6 +4262,16 @@ def main() -> None:
     )
 
     print(
+        "Tracking: "
+        "PERSISTENT"
+    )
+
+    print(
+        f"Rejection history: "
+        f"{MAX_REJECTION_HISTORY:,}"
+    )
+
+    print(
         "=" * 75
     )
 
@@ -3305,7 +4284,6 @@ def main() -> None:
 
     else:
 
-        # Remove webhook so polling can work.
         telegram_delete_webhook()
 
     last_scan = 0
