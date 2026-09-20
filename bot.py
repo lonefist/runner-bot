@@ -362,6 +362,8 @@ def load_state() -> None:
 
 
 def save_state() -> None:
+    global histories
+
     try:
         # Keep memory bounded.
         if len(histories) > MAX_STORED_TOKENS:
