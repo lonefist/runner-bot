@@ -2,41 +2,25 @@ name: Runner Bot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
-
-permissions:
-  contents: write
 
 jobs:
-  run-bot:
+  runner-bot:
     runs-on: ubuntu-latest
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      HEATING_ALERTS_ENABLED: "true"
+      SCAN_INTERVAL_SECONDS: "15"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          HEATING_ALERTS_ENABLED: "true"
-          DEX_SCAN_INTERVAL_SECONDS: "15"
-        run: timeout 270s python3 bot.py || true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Save runner state
+      - name: Run Runner Bot
         run: |
-          if [ -f runner_state.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-            git add runner_state.json
-
-            if git diff --cached --quiet; then
-              echo "No state changes to commit"
-            else
-              git commit -m "Update runner state"
-              git push
-            fi
-          else
-            echo "runner_state.json not found"
-          fi
+          python3 -u bot.py
