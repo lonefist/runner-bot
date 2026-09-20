@@ -2054,11 +2054,7 @@ def analyze(
     # We require actual structural/activity confirmation.
     # --------------------------------------------------------
 
-    if (
-        score >= 70
-        and breakout
-        and activity_expansion
-        and buy_percentage >= 50
+    if score >= 70 and breakout and activity_expansion:
     ):
 
         setup_state = (
