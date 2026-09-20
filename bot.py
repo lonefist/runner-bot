@@ -1,381 +1,89 @@
-import os
 import json
+import os
 import time
-import signal
-import urllib.request
 import urllib.parse
+import urllib.request
 import urllib.error
 from dataclasses import dataclass, asdict
-from typing import Optional
-
+from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
-# RUNNER BOT v3.6
+# RUNNER BOT V3.7.1
 # ============================================================
 
-BOT_VERSION = "v3.6"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_VERSION = "v3.7.1"
 
 DEX_BASE = "https://api.dexscreener.com"
+TELEGRAM_BASE = "https://api.telegram.org"
 
-# ------------------------------------------------------------
-# Scanner settings
-# ------------------------------------------------------------
+STATE_FILE = "runner_state.json"
 
-SCAN_INTERVAL_SECONDS = float(
-    os.getenv("DEX_SCAN_INTERVAL_SECONDS", "15")
-)
+# -----------------------------
+# Runner range
+# -----------------------------
 
-MAX_TOKENS_PER_SCAN = int(
-    os.getenv("DEX_MAX_TOKENS_PER_SCAN", "250")
-)
-
-# Observation band.
-# We watch a wider band than the actual runner range so that
-# we can see tokens before they enter the target range.
-OBSERVE_MIN_MC = 10_000
-OBSERVE_MAX_MC = 250_000
-
-# Actual runner range.
 MIN_MC = 20_000
 MAX_MC = 200_000
 
 MIN_LIQUIDITY = 10_000
 
-# 5m volume is NOT a hard gate.
-# It remains a scoring/context feature.
+# 5m volume is a FEATURE, not a hard gate.
 REFERENCE_VOLUME_5M = 5_000
 
-# ------------------------------------------------------------
-# History
-# ------------------------------------------------------------
+# -----------------------------
+# Observation range
+# -----------------------------
 
-STATE_FILE = "runner_state.json"
+OBSERVE_MIN_MC = 10_000
+OBSERVE_MAX_MC = 250_000
+
+# -----------------------------
+# History
+# -----------------------------
 
 MAX_STORED_TOKENS = 750
 MAX_HISTORY_PER_TOKEN = 120
 MIN_OBSERVATIONS = 6
 
-# ------------------------------------------------------------
-# Ignition outcome tracking
-# ------------------------------------------------------------
+# -----------------------------
+# Consolidation activity gate
+# -----------------------------
 
-OUTCOME_WINDOWS = {
-    "5m": 5 * 60,
-    "15m": 15 * 60,
-    "30m": 30 * 60,
-}
+MIN_CONSOLIDATION_VOLUME_5M = 500
+MIN_CONSOLIDATION_TX = 5
+MIN_CONSOLIDATION_ACTIVE_OBS = 3
 
-# These are deliberately modest because this is research mode.
-# We are NOT claiming these are optimal thresholds.
-CONTINUATION_MC_CHANGE = 10.0
-FAILURE_MC_CHANGE = -15.0
+# -----------------------------
+# Timing
+# -----------------------------
 
-MAX_IGNITION_EVENTS_PER_TOKEN = 20
+SCAN_INTERVAL_SECONDS = float(
+    os.getenv("DEX_SCAN_INTERVAL_SECONDS", "15")
+)
 
-# ------------------------------------------------------------
+# Discovery is much heavier than analysing cached tokens.
+# Do not rediscover the entire universe every 15 seconds.
+DISCOVERY_INTERVAL_SECONDS = 60
+
+# HTTP retry/backoff
+HTTP_TIMEOUT = 12
+HTTP_MAX_RETRIES = 3
+HTTP_BACKOFF_BASE = 2.0
+
+# -----------------------------
 # Telegram
-# ------------------------------------------------------------
+# -----------------------------
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 HEATING_ALERTS_ENABLED = (
     os.getenv("HEATING_ALERTS_ENABLED", "false").lower()
     == "true"
 )
 
-# Subscribers are persisted so separate GitHub Actions runs
-# can continue using the same Telegram subscribers.
-TELEGRAM_STATE_FILE = "telegram_state.json"
-
-
-# ============================================================
-# DATA STRUCTURES
-# ============================================================
-
-@dataclass
-class TokenSnapshot:
-    timestamp: float
-    address: str
-    symbol: str
-
-    market_cap: float
-    liquidity: float
-    volume_5m: float
-    volume_1h: float
-
-    price: float
-
-    price_change_5m: float
-    price_change_1h: float
-
-    buys_5m: int
-    sells_5m: int
-
-    pair_created_at: int
-
-
-@dataclass
-class IgnitionEvent:
-    ignition_timestamp: float
-    address: str
-    symbol: str
-
-    ignition_mc: float
-    ignition_liquidity: float
-    ignition_volume_5m: float
-
-    score: int
-
-    outcome_5m: str = "PENDING"
-    outcome_15m: str = "PENDING"
-    outcome_30m: str = "PENDING"
-
-    mc_5m: Optional[float] = None
-    mc_15m: Optional[float] = None
-    mc_30m: Optional[float] = None
-
-    change_5m: Optional[float] = None
-    change_15m: Optional[float] = None
-    change_30m: Optional[float] = None
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-histories = {}
-ignition_events = []
-telegram_chats = set()
-
-running = True
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def http_get_json(url, timeout=12):
-    try:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "RunnerBot/3.6",
-                "Accept": "application/json",
-            },
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=timeout,
-        ) as response:
-            raw = response.read().decode("utf-8")
-
-        return json.loads(raw)
-
-    except Exception as e:
-        print(f"HTTP error: {e}")
-        return None
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def telegram_api(method, payload=None):
-    if not TELEGRAM_BOT_TOKEN:
-        return None
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
-    )
-
-    try:
-        data = None
-
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "RunnerBot/3.6",
-            },
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=15,
-        ) as response:
-            return json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except Exception as e:
-        print(f"Telegram error: {e}")
-        return None
-
-
-def load_telegram_state():
-    global telegram_chats
-
-    try:
-        with open(
-            TELEGRAM_STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
-            data = json.load(f)
-
-        telegram_chats = set(
-            str(x)
-            for x in data.get("chat_ids", [])
-        )
-
-        print(
-            f"Telegram subscribers loaded: "
-            f"{len(telegram_chats)}"
-        )
-
-    except Exception:
-        telegram_chats = set()
-
-
-def save_telegram_state():
-    try:
-        with open(
-            TELEGRAM_STATE_FILE,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                {
-                    "chat_ids": sorted(
-                        telegram_chats
-                    )
-                },
-                f,
-                indent=2,
-            )
-    except Exception as e:
-        print(f"Telegram state save error: {e}")
-
-
-def send_telegram_message(text):
-    if not HEATING_ALERTS_ENABLED:
-        return
-
-    if not telegram_chats:
-        return
-
-    for chat_id in list(telegram_chats):
-        result = telegram_api(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-        )
-
-        if not result or not result.get("ok"):
-            print(
-                f"Telegram send failed for {chat_id}"
-            )
-
-
-def process_telegram_updates():
-    """
-    Uses long polling.
-
-    /start subscribes the chat.
-    /stop removes the chat.
-    """
-
-    offset = 0
-
-    while running:
-
-        result = telegram_api(
-            "getUpdates",
-            {
-                "timeout": 1,
-                "offset": offset,
-            },
-        )
-
-        if not result or not result.get("ok"):
-            time.sleep(2)
-            continue
-
-        updates = result.get("result", [])
-
-        for update in updates:
-
-            offset = (
-                int(update.get("update_id", 0))
-                + 1
-            )
-
-            message = update.get("message") or {}
-
-            chat = message.get("chat") or {}
-            chat_id = chat.get("id")
-
-            text = (
-                message.get("text")
-                or ""
-            ).strip().lower()
-
-            if chat_id is None:
-                continue
-
-            if text == "/start":
-
-                telegram_chats.add(
-                    str(chat_id)
-                )
-
-                save_telegram_state()
-
-                telegram_api(
-                    "sendMessage",
-                    {
-                        "chat_id": chat_id,
-                        "text": (
-                            "Runner bot is online.\n\n"
-                            "You are subscribed to "
-                            "runner alerts."
-                        ),
-                    },
-                )
-
-            elif text == "/stop":
-
-                telegram_chats.discard(
-                    str(chat_id)
-                )
-
-                save_telegram_state()
-
-                telegram_api(
-                    "sendMessage",
-                    {
-                        "chat_id": chat_id,
-                        "text": (
-                            "Runner alerts disabled."
-                        ),
-                    },
-                )
-
-        time.sleep(1)
-
-
-# ============================================================
-# DEX DISCOVERY
-# ============================================================
+# -----------------------------
+# Discovery
+# -----------------------------
 
 SEARCH_TERMS = [
     "SOL",
@@ -390,685 +98,926 @@ SEARCH_TERMS = [
     "inu",
     "pepe",
     "coin",
-    "doge",
-    "frog",
-    "trump",
-    "elon",
-    "baby",
 ]
 
+# Keep discovery bounded.
+MAX_DISCOVERY_PAIRS = 300
 
-def discover_addresses():
-    addresses = set()
+# -----------------------------
+# Outcome tracking
+# -----------------------------
+
+OUTCOME_WINDOWS = {
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "30m": 30 * 60,
+}
+
+CONTINUING_MC_CHANGE = 10.0
+FAILED_MC_CHANGE = -15.0
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def now_ts() -> float:
+    return time.time()
+
+
+def numeric(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def safe_symbol(symbol: Any) -> str:
+    if symbol is None:
+        return "?"
+    value = str(symbol).strip()
+    return value[:32] if value else "?"
+
+
+def format_usd(value: float) -> str:
+    value = numeric(value)
+
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+        return f"${value / 1_000:.2f}K"
+
+    return f"${value:.2f}"
+
+
+def shorten_address(address: str) -> str:
+    if not address:
+        return "?"
+    if len(address) <= 14:
+        return address
+    return f"{address[:6]}...{address[-6:]}"
+
+
+def pct_change(old: float, new: float) -> float:
+    if old <= 0:
+        return 0.0
+    return ((new - old) / old) * 100.0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+def http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: Optional[bytes] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+
+    request_headers = {
+        "User-Agent": "runner-bot/3.7.1",
+        "Accept": "application/json",
+    }
+
+    if headers:
+        request_headers.update(headers)
+
+    for attempt in range(HTTP_MAX_RETRIES):
+
+        try:
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                headers=request_headers,
+                method=method,
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=HTTP_TIMEOUT,
+            ) as response:
+
+                raw = response.read()
+
+                if not raw:
+                    return None
+
+                return json.loads(raw.decode("utf-8"))
+
+        except urllib.error.HTTPError as exc:
+
+            if exc.code == 429:
+                retry_after = exc.headers.get("Retry-After")
+
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except Exception:
+                        wait = HTTP_BACKOFF_BASE * (2 ** attempt)
+                else:
+                    wait = HTTP_BACKOFF_BASE * (2 ** attempt)
+
+                wait = clamp(wait, 1.0, 30.0)
+
+                print(
+                    f"HTTP 429 rate limit | waiting {wait:.1f}s | "
+                    f"attempt {attempt + 1}/{HTTP_MAX_RETRIES}"
+                )
+
+                time.sleep(wait)
+                continue
+
+            print(f"HTTP error {exc.code}: {url}")
+            return None
+
+        except Exception as exc:
+
+            print(f"HTTP error: {exc}")
+
+            if attempt < HTTP_MAX_RETRIES - 1:
+                time.sleep(
+                    HTTP_BACKOFF_BASE * (2 ** attempt)
+                )
+                continue
+
+            return None
+
+    return None
+
+
+# ============================================================
+# Data model
+# ============================================================
+
+@dataclass
+class TokenSnapshot:
+    timestamp: float
+    address: str
+    symbol: str
+
+    market_cap: float
+    liquidity: float
+    price: float
+
+    volume_5m: float
+    volume_1h: float
+
+    buys_5m: int
+    sells_5m: int
+
+    buys_1h: int
+    sells_1h: int
+
+    price_change_5m: float
+    price_change_1h: float
+
+    pair_created_at: int
+
+
+# ============================================================
+# Global state
+# ============================================================
+
+histories: Dict[str, List[Dict[str, Any]]] = {}
+
+ignition_events: List[Dict[str, Any]] = []
+
+telegram_subscribers: List[int] = []
+
+discovery_cache: List[Dict[str, Any]] = []
+
+last_discovery_time = 0.0
+
+last_update_id = 0
+
+
+# ============================================================
+# Persistence
+# ============================================================
+
+def load_state() -> None:
+    global histories
+    global ignition_events
+    global telegram_subscribers
+
+    if not os.path.exists(STATE_FILE):
+        print("No persistent state found. Starting fresh.")
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        histories = data.get("histories", {}) or {}
+
+        ignition_events = data.get("ignition_events", []) or []
+
+        telegram_subscribers = [
+            int(x)
+            for x in (data.get("telegram_subscribers", []) or [])
+        ]
+
+        # Remove historical ignition events that were outside
+        # the intended runner range.
+        before = len(ignition_events)
+
+        ignition_events = [
+            event
+            for event in ignition_events
+            if MIN_MC
+            <= numeric(event.get("ignition_mc"))
+            <= MAX_MC
+            and numeric(event.get("ignition_liquidity"))
+            >= MIN_LIQUIDITY
+        ]
+
+        removed = before - len(ignition_events)
+
+        if removed:
+            print(
+                f"Removed {removed} out-of-range historical "
+                f"ignition event(s)"
+            )
+
+        print(
+            f"Persistent state loaded: "
+            f"{len(histories)} tokens | "
+            f"{len(ignition_events)} ignition events"
+        )
+
+    except Exception as exc:
+        print(f"State load error: {exc}")
+        histories = {}
+        ignition_events = []
+        telegram_subscribers = []
+
+
+def save_state() -> None:
+    try:
+        # Keep memory bounded.
+        if len(histories) > MAX_STORED_TOKENS:
+            ranked = sorted(
+                histories.items(),
+                key=lambda item: (
+                    item[1][-1]["timestamp"]
+                    if item[1]
+                    else 0
+                ),
+                reverse=True,
+            )
+
+            histories = dict(
+                ranked[:MAX_STORED_TOKENS]
+            )
+
+        data = {
+            "version": BOT_VERSION,
+            "saved_at": now_ts(),
+            "histories": histories,
+            "ignition_events": ignition_events,
+            "telegram_subscribers": telegram_subscribers,
+        }
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                data,
+                file,
+                separators=(",", ":"),
+            )
+
+        print(
+            f"Persistent state saved: "
+            f"{len(histories)} tokens | "
+            f"{len(ignition_events)} ignition events"
+        )
+
+    except Exception as exc:
+        print(f"State save error: {exc}")
+
+
+# ============================================================
+# Pair extraction
+# ============================================================
+
+def pair_to_snapshot(
+    pair: Dict[str, Any],
+) -> Optional[TokenSnapshot]:
+
+    try:
+        chain_id = str(pair.get("chainId", "")).lower()
+
+        if chain_id != "solana":
+            return None
+
+        base_token = pair.get("baseToken") or {}
+
+        address = str(
+            base_token.get("address", "")
+        ).strip()
+
+        if not address:
+            return None
+
+        symbol = safe_symbol(
+            base_token.get("symbol")
+        )
+
+        market_cap = numeric(
+            pair.get("marketCap")
+        )
+
+        if market_cap <= 0:
+            market_cap = numeric(
+                pair.get("fdv")
+            )
+
+        liquidity_obj = pair.get("liquidity") or {}
+
+        liquidity = numeric(
+            liquidity_obj.get("usd")
+        )
+
+        volume_obj = pair.get("volume") or {}
+
+        volume_5m = numeric(
+            volume_obj.get("m5")
+        )
+
+        volume_1h = numeric(
+            volume_obj.get("h1")
+        )
+
+        txns = pair.get("txns") or {}
+
+        tx_5m = txns.get("m5") or {}
+        tx_1h = txns.get("h1") or {}
+
+        buys_5m = int(
+            numeric(tx_5m.get("buys"))
+        )
+
+        sells_5m = int(
+            numeric(tx_5m.get("sells"))
+        )
+
+        buys_1h = int(
+            numeric(tx_1h.get("buys"))
+        )
+
+        sells_1h = int(
+            numeric(tx_1h.get("sells"))
+        )
+
+        price = numeric(
+            pair.get("priceUsd")
+        )
+
+        changes = pair.get("priceChange") or {}
+
+        price_change_5m = numeric(
+            changes.get("m5")
+        )
+
+        price_change_1h = numeric(
+            changes.get("h1")
+        )
+
+        pair_created_at = int(
+            numeric(
+                pair.get("pairCreatedAt")
+            )
+        )
+
+        return TokenSnapshot(
+            timestamp=now_ts(),
+            address=address,
+            symbol=symbol,
+            market_cap=market_cap,
+            liquidity=liquidity,
+            price=price,
+            volume_5m=volume_5m,
+            volume_1h=volume_1h,
+            buys_5m=buys_5m,
+            sells_5m=sells_5m,
+            buys_1h=buys_1h,
+            sells_1h=sells_1h,
+            price_change_5m=price_change_5m,
+            price_change_1h=price_change_1h,
+            pair_created_at=pair_created_at,
+        )
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# Discovery
+# ============================================================
+
+def extract_pairs(data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not data:
+        return []
+
+    pairs = data.get("pairs")
+
+    if not pairs:
+        return []
+
+    if not isinstance(pairs, list):
+        return []
+
+    return pairs
+
+
+def discover_pairs(force: bool = False) -> List[Dict[str, Any]]:
+    global discovery_cache
+    global last_discovery_time
+
+    current_time = now_ts()
+
+    if (
+        not force
+        and discovery_cache
+        and current_time - last_discovery_time
+        < DISCOVERY_INTERVAL_SECONDS
+    ):
+        return discovery_cache
+
+    discovered: Dict[str, Dict[str, Any]] = {}
+
+    request_count = 0
+
+    # --------------------------------
+    # Latest profiles
+    # --------------------------------
 
     endpoints = [
-        "/token-profiles/latest/v1",
-        "/token-boosts/latest/v1",
-        "/token-boosts/top/v1",
+        f"{DEX_BASE}/token-profiles/latest/v1",
+        f"{DEX_BASE}/token-boosts/latest/v1",
+        f"{DEX_BASE}/token-boosts/top/v1",
     ]
+
+    profile_addresses: List[str] = []
 
     for endpoint in endpoints:
 
-        data = http_get_json(
-            DEX_BASE + endpoint
-        )
+        data = http_json(endpoint)
+        request_count += 1
 
-        if not isinstance(data, list):
+        if not data:
             continue
 
-        for item in data:
+        items = (
+            data
+            if isinstance(data, list)
+            else data.get("tokens", [])
+        )
+
+        if not isinstance(items, list):
+            continue
+
+        for item in items:
 
             if not isinstance(item, dict):
                 continue
 
-            chain = str(
+            chain_id = str(
                 item.get("chainId", "")
             ).lower()
 
-            if chain != "solana":
+            if chain_id != "solana":
                 continue
 
-            address = (
-                item.get("tokenAddress")
-                or item.get("address")
-            )
+            address = str(
+                item.get("tokenAddress", "")
+            ).strip()
 
             if address:
-                addresses.add(
-                    str(address)
-                )
+                profile_addresses.append(address)
 
-    # Search API
+    # --------------------------------
+    # Search endpoints
+    # --------------------------------
+
     for term in SEARCH_TERMS:
 
-        encoded = urllib.parse.quote(
-            term
-        )
+        encoded = urllib.parse.quote(term)
 
         url = (
             f"{DEX_BASE}/latest/dex/search"
             f"?q={encoded}"
         )
 
-        data = http_get_json(url)
+        data = http_json(url)
+        request_count += 1
 
-        if not isinstance(data, dict):
-            continue
-
-        pairs = data.get("pairs") or []
-
-        for pair in pairs:
+        for pair in extract_pairs(data):
 
             if not isinstance(pair, dict):
                 continue
 
-            if (
-                str(
-                    pair.get("chainId", "")
-                ).lower()
-                != "solana"
-            ):
+            if str(
+                pair.get("chainId", "")
+            ).lower() != "solana":
                 continue
 
-            base = (
-                pair.get("baseToken")
-                or {}
+            base = pair.get("baseToken") or {}
+
+            address = str(
+                base.get("address", "")
+            ).strip()
+
+            if not address:
+                continue
+
+            liquidity = numeric(
+                (pair.get("liquidity") or {}).get("usd")
             )
 
-            address = base.get(
-                "address"
-            )
+            # Keep the highest-liquidity pair for each token.
+            existing = discovered.get(address)
 
-            if address:
-                addresses.add(
-                    str(address)
+            if (
+                existing is None
+                or liquidity
+                > numeric(
+                    (existing.get("liquidity") or {}).get("usd")
                 )
+            ):
+                discovered[address] = pair
 
-    return list(addresses)
+        # Small pause between search requests.
+        time.sleep(0.15)
 
+    # --------------------------------
+    # Profile/boost addresses
+    #
+    # Fetch them in batches rather than
+    # one request per token.
+    # --------------------------------
 
-def get_token_pairs(address):
-
-    encoded = urllib.parse.quote(
-        address,
-        safe=""
+    unique_profile_addresses = list(
+        dict.fromkeys(profile_addresses)
     )
 
-    url = (
-        f"{DEX_BASE}/latest/dex/tokens/"
-        f"{encoded}"
-    )
+    batch_size = 25
 
-    data = http_get_json(url)
+    for start in range(
+        0,
+        len(unique_profile_addresses),
+        batch_size,
+    ):
 
-    if not isinstance(data, dict):
-        return []
+        batch = unique_profile_addresses[
+            start:start + batch_size
+        ]
 
-    pairs = data.get("pairs") or []
-
-    return [
-        pair
-        for pair in pairs
-        if isinstance(pair, dict)
-        and str(
-            pair.get("chainId", "")
-        ).lower()
-        == "solana"
-    ]
-
-
-def discover_pairs():
-
-    addresses = discover_addresses()
-
-    all_pairs = []
-
-    for address in addresses:
-
-        pairs = get_token_pairs(
-            address
-        )
-
-        all_pairs.extend(pairs)
-
-        if len(all_pairs) >= (
-            MAX_TOKENS_PER_SCAN * 3
-        ):
-            break
-
-    print(
-        f"{len(all_pairs)} Solana pairs discovered"
-    )
-
-    return all_pairs
-
-
-# ============================================================
-# PAIR SELECTION
-# ============================================================
-
-def numeric(value):
-
-    try:
-        if value is None:
-            return 0.0
-
-        return float(value)
-
-    except Exception:
-        return 0.0
-
-
-def select_best_pairs(pairs):
-
-    best = {}
-
-    for pair in pairs:
-
-        base = (
-            pair.get("baseToken")
-            or {}
-        )
-
-        address = base.get(
-            "address"
-        )
-
-        if not address:
+        if not batch:
             continue
 
-        liquidity = numeric(
-            (
-                pair.get("liquidity")
-                or {}
-            ).get("usd")
+        joined = ",".join(batch)
+
+        url = (
+            f"{DEX_BASE}/latest/dex/tokens/"
+            f"{urllib.parse.quote(joined)}"
         )
 
-        if (
-            address not in best
-            or liquidity
-            > best[address][1]
-        ):
-            best[address] = (
-                pair,
-                liquidity,
+        data = http_json(url)
+        request_count += 1
+
+        for pair in extract_pairs(data):
+
+            if not isinstance(pair, dict):
+                continue
+
+            if str(
+                pair.get("chainId", "")
+            ).lower() != "solana":
+                continue
+
+            base = pair.get("baseToken") or {}
+
+            address = str(
+                base.get("address", "")
+            ).strip()
+
+            if not address:
+                continue
+
+            liquidity = numeric(
+                (pair.get("liquidity") or {}).get("usd")
             )
 
-    return [
-        pair
-        for pair, _ in best.values()
-    ]
+            existing = discovered.get(address)
+
+            if (
+                existing is None
+                or liquidity
+                > numeric(
+                    (existing.get("liquidity") or {}).get("usd")
+                )
+            ):
+                discovered[address] = pair
+
+        time.sleep(0.2)
+
+    pairs = list(discovered.values())
+
+    # Highest liquidity first.
+    pairs.sort(
+        key=lambda pair: numeric(
+            (pair.get("liquidity") or {}).get("usd")
+        ),
+        reverse=True,
+    )
+
+    pairs = pairs[:MAX_DISCOVERY_PAIRS]
+
+    discovery_cache = pairs
+    last_discovery_time = current_time
+
+    print(
+        f"{len(pairs)} Solana pairs discovered "
+        f"| discovery HTTP requests={request_count}"
+    )
+
+    return pairs
 
 
 # ============================================================
-# SNAPSHOT
+# Snapshot recording
 # ============================================================
 
-def snapshot_from_pair(pair):
-
-    base = (
-        pair.get("baseToken")
-        or {}
-    )
-
-    address = base.get(
-        "address"
-    )
-
-    symbol = (
-        base.get("symbol")
-        or "UNKNOWN"
-    )
-
-    market_cap = numeric(
-        pair.get("marketCap")
-    )
-
-    if market_cap <= 0:
-        market_cap = numeric(
-            pair.get("fdv")
-        )
-
-    liquidity = numeric(
-        (
-            pair.get("liquidity")
-            or {}
-        ).get("usd")
-    )
-
-    volume = (
-        pair.get("volume")
-        or {}
-    )
-
-    price_change = (
-        pair.get("priceChange")
-        or {}
-    )
-
-    transactions = (
-        pair.get("txns")
-        or {}
-    )
-
-    tx5 = (
-        transactions.get("m5")
-        or {}
-    )
-
-    pair_created = int(
-        numeric(
-            pair.get(
-                "pairCreatedAt"
-            )
-        )
-    )
-
-    return TokenSnapshot(
-        timestamp=time.time(),
-
-        address=str(address),
-
-        symbol=str(symbol),
-
-        market_cap=market_cap,
-
-        liquidity=liquidity,
-
-        volume_5m=numeric(
-            volume.get("m5")
-        ),
-
-        volume_1h=numeric(
-            volume.get("h1")
-        ),
-
-        price=numeric(
-            pair.get("priceUsd")
-        ),
-
-        price_change_5m=numeric(
-            price_change.get("m5")
-        ),
-
-        price_change_1h=numeric(
-            price_change.get("h1")
-        ),
-
-        buys_5m=int(
-            numeric(
-                tx5.get("buys")
-            )
-        ),
-
-        sells_5m=int(
-            numeric(
-                tx5.get("sells")
-            )
-        ),
-
-        pair_created_at=pair_created,
-    )
+def snapshot_dict(snapshot: TokenSnapshot) -> Dict[str, Any]:
+    return asdict(snapshot)
 
 
-# ============================================================
-# HISTORY
-# ============================================================
+def record_snapshot(
+    snapshot: TokenSnapshot,
+) -> bool:
 
-def record_snapshot(snapshot):
-
-    address = snapshot.address
-
-    # Ignore invalid MC.
-    if (
-        snapshot.market_cap
-        < OBSERVE_MIN_MC
-        or snapshot.market_cap
-        > OBSERVE_MAX_MC
+    # Only observe tokens inside our wider observation band.
+    if not (
+        OBSERVE_MIN_MC
+        <= snapshot.market_cap
+        <= OBSERVE_MAX_MC
     ):
         return False
 
-    history = histories.setdefault(
-        address,
-        []
-    )
-
-    # --------------------------------------------------------
-    # IMPORTANT v3.6:
-    # Do not create artificial observations when DEX data
-    # contains no actual activity.
-    # --------------------------------------------------------
-
-    activity = (
+    # IMPORTANT:
+    # Do not store completely dead/stale observations.
+    has_activity = (
         snapshot.volume_5m > 0
         or snapshot.buys_5m > 0
         or snapshot.sells_5m > 0
     )
 
-    if not activity:
-
-        # If we already have history, do not append
-        # another identical zero-activity snapshot.
+    if not has_activity:
         return False
 
+    address = snapshot.address
+
+    history = histories.setdefault(
+        address,
+        [],
+    )
+
     history.append(
-        asdict(snapshot)
+        snapshot_dict(snapshot)
     )
 
     if len(history) > MAX_HISTORY_PER_TOKEN:
         del history[
-            :len(history)
-            - MAX_HISTORY_PER_TOKEN
+            :len(history) - MAX_HISTORY_PER_TOKEN
         ]
 
     return True
 
 
 # ============================================================
-# HELPERS
+# Analysis
 # ============================================================
 
-def pct_change(old, new):
+def analyze(
+    snapshot: TokenSnapshot,
+) -> Dict[str, Any]:
 
-    if old <= 0:
-        return 0.0
+    address = snapshot.address
 
-    return (
-        (new - old)
-        / old
-    ) * 100.0
-
-
-def address_short(address):
-
-    if len(address) <= 12:
-        return address
-
-    return (
-        address[:6]
-        + "..."
-        + address[-6:]
-    )
-
-
-def latest_snapshot(address):
-
-    history = histories.get(
-        address,
-        []
-    )
-
-    if not history:
-        return None
-
-    return history[-1]
-
-
-# ============================================================
-# RUNNER ANALYSIS
-# ============================================================
-
-def analyze(address):
-
-    history = histories.get(
-        address,
-        []
-    )
+    history = histories.get(address, [])
 
     if len(history) < MIN_OBSERVATIONS:
-        return None
-
-    recent = history[
-        -MIN_OBSERVATIONS:
-    ]
-
-    current = recent[-1]
-
-    previous = recent[-2]
-
-    recent_3 = recent[-3:]
-
-    recent_5 = recent[-5:]
-
-    # --------------------------------------------------------
-    # Activity
-    # --------------------------------------------------------
-
-    previous_volume = previous[
-        "volume_5m"
-    ]
-
-    current_volume = current[
-        "volume_5m"
-    ]
-
-    volume_change = pct_change(
-        previous_volume,
-        current_volume,
-    )
-
-    previous_tx = (
-        previous["buys_5m"]
-        + previous["sells_5m"]
-    )
-
-    current_tx = (
-        current["buys_5m"]
-        + current["sells_5m"]
-    )
-
-    transaction_change = pct_change(
-        previous_tx,
-        current_tx,
-    )
-
-    # --------------------------------------------------------
-    # MC movement
-    # --------------------------------------------------------
-
-    mc_change = pct_change(
-        previous["market_cap"],
-        current["market_cap"],
-    )
-
-    mc_change_3 = pct_change(
-        recent_3[0]["market_cap"],
-        current["market_cap"],
-    )
-
-    liquidity_change = pct_change(
-        previous["liquidity"],
-        current["liquidity"],
-    )
-
-    # --------------------------------------------------------
-    # Buy pressure
-    # --------------------------------------------------------
-
-    buys = current["buys_5m"]
-    sells = current["sells_5m"]
-
-    total_tx = buys + sells
-
-    buy_share = (
-        buys / total_tx
-        if total_tx > 0
-        else 0.0
-    )
-
-    buy_sell_ratio = (
-        buys / sells
-        if sells > 0
-        else (
-            float("inf")
-            if buys > 0
-            else 0.0
-        )
-    )
-
-    # --------------------------------------------------------
-    # Recent MC range
-    # --------------------------------------------------------
-
-    mc_values = [
-        x["market_cap"]
-        for x in recent_5
-        if x["market_cap"] > 0
-    ]
-
-    if mc_values:
-
-        low_mc = min(mc_values)
-        high_mc = max(mc_values)
-
-        range_pct = (
-            (high_mc - low_mc)
-            / low_mc
-            * 100
-            if low_mc > 0
-            else 0
-        )
-
-    else:
-        range_pct = 0.0
-
-    # --------------------------------------------------------
-    # True recent activity check
-    # --------------------------------------------------------
-
-    active_observations = 0
-
-    for x in recent_5:
-
-        if (
-            x["volume_5m"] > 0
-            or x["buys_5m"] > 0
-            or x["sells_5m"] > 0
-        ):
-            active_observations += 1
-
-    # Need actual trading observations.
-    if active_observations < 3:
         return {
             "state": "OBSERVING",
             "score": 0,
-            "reasons": ["insufficient activity"],
+            "reasons": ["insufficient observations"],
             "breakout": False,
             "activity_expansion": False,
-            "price_expansion": False,
-            "buy_pressure": False,
-            "liquidity_healthy": False,
-            "range_pct": range_pct,
-            "mc_change": mc_change,
-            "volume_change": volume_change,
-            "transaction_change": transaction_change,
-            "liquidity_change": liquidity_change,
-            "buy_sell_ratio": buy_sell_ratio,
-            "buy_share": buy_share,
-            "current": current,
+            "mc_move": 0.0,
+            "liq_move": 0.0,
+            "range": 0.0,
+            "vol_change": 0.0,
+            "tx_change": 0.0,
         }
 
-    # --------------------------------------------------------
-    # Breakout
-    # --------------------------------------------------------
+    recent = history[-MIN_OBSERVATIONS:]
 
-    previous_mcs = [
-        x["market_cap"]
-        for x in recent_5[:-1]
-        if x["market_cap"] > 0
+    recent_5 = history[-5:]
+
+    # --------------------------------
+    # Basic values
+    # --------------------------------
+
+    oldest = recent[0]
+
+    mc_move = pct_change(
+        numeric(oldest.get("market_cap")),
+        snapshot.market_cap,
+    )
+
+    liq_move = pct_change(
+        numeric(oldest.get("liquidity")),
+        snapshot.liquidity,
+    )
+
+    # --------------------------------
+    # Range
+    # --------------------------------
+
+    mcs = [
+        numeric(x.get("market_cap"))
+        for x in recent
+        if numeric(x.get("market_cap")) > 0
     ]
 
-    breakout = False
+    if mcs:
+        low_mc = min(mcs)
+        high_mc = max(mcs)
 
-    if previous_mcs:
+        if low_mc > 0:
+            range_pct = (
+                (high_mc - low_mc)
+                / low_mc
+            ) * 100.0
+        else:
+            range_pct = 0.0
+    else:
+        range_pct = 0.0
 
-        previous_high = max(
-            previous_mcs
-        )
+    # --------------------------------
+    # Volume / transaction acceleration
+    # --------------------------------
 
-        breakout = (
-            current["market_cap"]
-            > previous_high * 1.03
-        )
+    previous = recent[-2]
 
-    # --------------------------------------------------------
-    # Consolidation
-    #
-    # IMPORTANT:
-    # A token with no actual trading activity cannot qualify.
-    # --------------------------------------------------------
-
-    consolidation = (
-        active_observations >= 4
-        and len(recent_5) >= 5
-        and range_pct <= 18
-        and abs(mc_change_3) <= 18
+    previous_volume = numeric(
+        previous.get("volume_5m")
     )
 
-    # --------------------------------------------------------
+    previous_tx = (
+        int(
+            numeric(
+                previous.get("buys_5m")
+            )
+        )
+        + int(
+            numeric(
+                previous.get("sells_5m")
+            )
+        )
+    )
+
+    current_tx = (
+        snapshot.buys_5m
+        + snapshot.sells_5m
+    )
+
+    if previous_volume > 0:
+        vol_change = pct_change(
+            previous_volume,
+            snapshot.volume_5m,
+        )
+    else:
+        vol_change = 0.0
+
+    if previous_tx > 0:
+        tx_change = pct_change(
+            previous_tx,
+            current_tx,
+        )
+    else:
+        tx_change = 0.0
+
+    # --------------------------------
     # Activity expansion
-    # --------------------------------------------------------
+    # --------------------------------
 
     activity_expansion = (
-        volume_change >= 20
-        or transaction_change >= 20
+        vol_change >= 20.0
+        or tx_change >= 20.0
     )
 
-    # --------------------------------------------------------
-    # Price expansion
-    # --------------------------------------------------------
+    # --------------------------------
+    # Local breakout
+    #
+    # Compare current MC against the
+    # previous 5 observations.
+    # --------------------------------
 
-    price_expansion = (
-        mc_change >= 5
-        or mc_change_3 >= 10
+    prior_mcs = [
+        numeric(x.get("market_cap"))
+        for x in recent[:-1]
+        if numeric(x.get("market_cap")) > 0
+    ]
+
+    prior_high = (
+        max(prior_mcs)
+        if prior_mcs
+        else 0.0
     )
 
-    # --------------------------------------------------------
+    breakout = (
+        prior_high > 0
+        and snapshot.market_cap
+        > prior_high * 1.02
+    )
+
+    # --------------------------------
     # Buy pressure
-    # --------------------------------------------------------
+    # --------------------------------
+
+    total_tx = (
+        snapshot.buys_5m
+        + snapshot.sells_5m
+    )
+
+    if snapshot.sells_5m > 0:
+        buy_sell_ratio = (
+            snapshot.buys_5m
+            / snapshot.sells_5m
+        )
+    elif snapshot.buys_5m > 0:
+        buy_sell_ratio = float(
+            snapshot.buys_5m
+        )
+    else:
+        buy_sell_ratio = 0.0
 
     buy_pressure = (
-        buys > sells
-        and buy_sell_ratio >= 1.20
+        snapshot.buys_5m
+        > snapshot.sells_5m
     )
 
     strong_buy_pressure = (
-        buys > sells
-        and buy_sell_ratio >= 1.50
+        buy_sell_ratio >= 1.5
     )
 
-    # --------------------------------------------------------
-    # Liquidity
-    # --------------------------------------------------------
+    # --------------------------------
+    # Liquidity behavior
+    # --------------------------------
 
-    liquidity_healthy = (
-        current["liquidity"]
-        >= MIN_LIQUIDITY
-        and liquidity_change >= -15
+    liquidity_stable = (
+        liq_move >= -15.0
     )
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
+    # --------------------------------
+    # Score
+    #
+    # KEEPING THE EXISTING SCORING
+    # --------------------------------
 
     score = 0
-    reasons = []
+    reasons: List[str] = []
 
-    if consolidation:
+    # Base / consolidation
+    if (
+        len(recent_5) >= 5
+        and range_pct <= 18.0
+        and abs(mc_move) <= 18.0
+    ):
         score += 2
         reasons.append("base")
 
     if activity_expansion:
         score += 2
-        reasons.append(
-            "activity expansion"
-        )
+        reasons.append("activity expansion")
 
-    if price_expansion:
+    if mc_move >= 5.0:
         score += 2
-        reasons.append(
-            "MC expansion"
-        )
+        reasons.append("MC expansion")
 
     if breakout:
         score += 3
@@ -1076,77 +1025,117 @@ def analyze(address):
 
     if buy_pressure:
         score += 1
-        reasons.append(
-            "buy pressure"
-        )
+        reasons.append("buy pressure")
 
     if strong_buy_pressure:
-        score += 1
-        reasons.append(
-            "strong buy pressure"
-        )
+        score += 2
+        reasons.append("strong buy pressure")
 
-    if liquidity_healthy:
+    if liquidity_stable:
         score += 1
-        reasons.append(
-            "liquidity stable"
-        )
+        reasons.append("liquidity stable")
+
+    if snapshot.volume_5m >= REFERENCE_VOLUME_5M:
+        score += 1
+        reasons.append("5m volume > $5K")
 
     if (
-        current["volume_5m"]
-        >= REFERENCE_VOLUME_5M
-    ):
-        score += 1
-        reasons.append(
-            "5m volume > $5K"
-        )
-
-    # --------------------------------------------------------
-    # PENALTIES
-    # --------------------------------------------------------
-
-    if liquidity_change <= -20:
-        score -= 2
-        reasons.append(
-            "liquidity falling"
-        )
-
-    if (
-        mc_change > 40
-        and volume_change < 0
-    ):
-        score -= 2
-        reasons.append(
-            "MC up but activity falling"
-        )
-
-    if (
-        buy_sell_ratio < 0.8
+        snapshot.sells_5m > snapshot.buys_5m
         and total_tx > 0
     ):
-        score -= 2
-        reasons.append(
-            "sell pressure"
+        reasons.append("sell pressure")
+
+    # --------------------------------
+    # V3.7.1 consolidation activity gate
+    # --------------------------------
+
+    def meaningful_activity(
+        item: Dict[str, Any]
+    ) -> bool:
+
+        volume = numeric(
+            item.get("volume_5m")
         )
 
-    # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
+        buys = int(
+            numeric(
+                item.get("buys_5m")
+            )
+        )
 
-    if (
-        breakout
+        sells = int(
+            numeric(
+                item.get("sells_5m")
+            )
+        )
+
+        return (
+            volume
+            >= MIN_CONSOLIDATION_VOLUME_5M
+            and
+            buys + sells
+            >= MIN_CONSOLIDATION_TX
+        )
+
+    meaningful_recent = [
+        item
+        for item in recent_5
+        if meaningful_activity(item)
+    ]
+
+    consolidation = (
+        len(recent_5) >= 5
+        and len(meaningful_recent)
+        >= MIN_CONSOLIDATION_ACTIVE_OBS
+        and meaningful_activity(
+            snapshot_dict(snapshot)
+        )
+        and range_pct <= 18.0
+        and abs(mc_move) <= 18.0
+    )
+
+    # --------------------------------
+    # Hard runner-range gate
+    #
+    # This is the important V3.7.1 fix.
+    # --------------------------------
+
+    runner_market_cap = (
+        MIN_MC
+        <= snapshot.market_cap
+        <= MAX_MC
+    )
+
+    runner_liquidity = (
+        snapshot.liquidity
+        >= MIN_LIQUIDITY
+    )
+
+    # --------------------------------
+    # Ignition
+    #
+    # DO NOT change score threshold.
+    # --------------------------------
+
+    ignition = (
+        runner_market_cap
+        and runner_liquidity
+        and breakout
         and activity_expansion
         and score >= 7
-    ):
+    )
+
+    # --------------------------------
+    # State
+    # --------------------------------
+
+    if ignition:
         state = "IGNITION"
 
-    elif breakout:
+    elif breakout and runner_market_cap:
         state = "STRUCTURE BREAK"
 
-    elif (
-        activity_expansion
-        and price_expansion
-    ):
+    elif activity_expansion:
         state = "EXPANSION"
 
     elif consolidation:
@@ -1155,40 +1144,60 @@ def analyze(address):
     else:
         state = "OBSERVING"
 
+    # If the token has almost no meaningful
+    # activity, never call it consolidation.
+    if (
+        state == "CONSOLIDATION"
+        and not meaningful_activity(
+            snapshot_dict(snapshot)
+        )
+    ):
+        state = "OBSERVING"
+
+        if "insufficient activity" not in reasons:
+            reasons.append("insufficient activity")
+
     return {
         "state": state,
         "score": score,
         "reasons": reasons,
         "breakout": breakout,
         "activity_expansion": activity_expansion,
-        "price_expansion": price_expansion,
-        "buy_pressure": buy_pressure,
-        "liquidity_healthy": liquidity_healthy,
-        "range_pct": range_pct,
-        "mc_change": mc_change,
-        "volume_change": volume_change,
-        "transaction_change": transaction_change,
-        "liquidity_change": liquidity_change,
+        "mc_move": mc_move,
+        "liq_move": liq_move,
+        "range": range_pct,
+        "vol_change": vol_change,
+        "tx_change": tx_change,
         "buy_sell_ratio": buy_sell_ratio,
-        "buy_share": buy_share,
-        "current": current,
+        "runner_market_cap": runner_market_cap,
+        "runner_liquidity": runner_liquidity,
+        "consolidation": consolidation,
     }
 
 
 # ============================================================
-# IGNITION EVENTS
+# Ignition event handling
 # ============================================================
 
-def has_recent_ignition(address):
+def ignition_already_exists(
+    address: str,
+    timestamp: float,
+) -> bool:
 
-    now = time.time()
-
+    # Prevent repeated ignition events for the same
+    # token inside a 30-minute period.
     for event in ignition_events:
 
+        if event.get("address") != address:
+            continue
+
+        previous = numeric(
+            event.get("ignition_timestamp")
+        )
+
         if (
-            event["address"] == address
-            and now
-            - event["ignition_timestamp"]
+            previous > 0
+            and timestamp - previous
             < 30 * 60
         ):
             return True
@@ -1197,564 +1206,490 @@ def has_recent_ignition(address):
 
 
 def create_ignition_event(
-    address,
-    analysis,
-):
+    snapshot: TokenSnapshot,
+    analysis: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
 
-    if has_recent_ignition(address):
-        return
+    if not (
+        MIN_MC
+        <= snapshot.market_cap
+        <= MAX_MC
+    ):
+        return None
 
-    current = analysis["current"]
+    if snapshot.liquidity < MIN_LIQUIDITY:
+        return None
 
-    event = IgnitionEvent(
-        ignition_timestamp=time.time(),
+    timestamp = snapshot.timestamp
 
-        address=address,
+    if ignition_already_exists(
+        snapshot.address,
+        timestamp,
+    ):
+        return None
 
-        symbol=current["symbol"],
+    event = {
+        "event_id": (
+            f"{snapshot.address}:"
+            f"{int(timestamp)}"
+        ),
 
-        ignition_mc=current[
-            "market_cap"
-        ],
+        "address": snapshot.address,
+        "symbol": snapshot.symbol,
 
-        ignition_liquidity=current[
-            "liquidity"
-        ],
+        "ignition_timestamp": timestamp,
 
-        ignition_volume_5m=current[
-            "volume_5m"
-        ],
+        "ignition_mc": snapshot.market_cap,
+        "ignition_liquidity": snapshot.liquidity,
+        "ignition_volume_5m": snapshot.volume_5m,
 
-        score=analysis["score"],
-    )
+        "ignition_buys_5m": snapshot.buys_5m,
+        "ignition_sells_5m": snapshot.sells_5m,
 
-    ignition_events.append(
-        asdict(event)
-    )
+        "ignition_score": analysis["score"],
 
-    # Limit total memory.
-    if len(ignition_events) > 500:
-        del ignition_events[
-            :-500
-        ]
+        "outcomes": {},
+    }
+
+    ignition_events.append(event)
 
     print(
-        "IGNITION EVENT CREATED | "
-        f"{current['symbol']} | "
-        f"CA={address_short(address)} | "
-        f"MC=${current['market_cap']:,.0f} | "
+        f"🔥 IGNITION DETECTED | "
+        f"{snapshot.symbol} | "
+        f"CA={shorten_address(snapshot.address)} | "
+        f"MC={format_usd(snapshot.market_cap)} | "
+        f"5mVol={format_usd(snapshot.volume_5m)} | "
+        f"buys/sells="
+        f"{snapshot.buys_5m}/"
+        f"{snapshot.sells_5m} | "
         f"score={analysis['score']}"
     )
 
-    send_telegram_message(
-        "🔥 RUNNER IGNITION DETECTED\n\n"
-        f"Token: {current['symbol']}\n"
-        f"CA: {address}\n"
-        f"MC: ${current['market_cap']:,.0f}\n"
-        f"Liquidity: ${current['liquidity']:,.0f}\n"
-        f"5m Volume: ${current['volume_5m']:,.0f}\n"
-        f"Buys/Sells: "
-        f"{current['buys_5m']}/"
-        f"{current['sells_5m']}\n"
-        f"Score: {analysis['score']}\n\n"
-        "Research signal — not a guarantee."
-    )
+    return event
 
 
 # ============================================================
-# OUTCOME TRACKER
+# Outcome tracking
 # ============================================================
 
-def evaluate_outcome(
-    baseline_mc,
-    current_mc,
-):
+def classify_outcome(
+    ignition_mc: float,
+    current_mc: float,
+) -> str:
 
     change = pct_change(
-        baseline_mc,
+        ignition_mc,
         current_mc,
     )
 
-    if change >= CONTINUATION_MC_CHANGE:
-        return (
-            "CONTINUING",
-            change,
-        )
+    if change >= CONTINUING_MC_CHANGE:
+        return "CONTINUING"
 
-    if change <= FAILURE_MC_CHANGE:
-        return (
-            "FAILED",
-            change,
-        )
+    if change <= FAILED_MC_CHANGE:
+        return "FAILED"
 
-    return (
-        "UNCLEAR",
-        change,
-    )
+    return "UNCLEAR"
 
 
-def update_ignition_outcomes():
+def update_ignition_outcomes() -> None:
 
-    now = time.time()
+    current_time = now_ts()
+
+    changed = False
 
     for event in ignition_events:
 
-        address = event["address"]
+        address = event.get("address")
 
-        elapsed = (
-            now
-            - event["ignition_timestamp"]
+        ignition_time = numeric(
+            event.get("ignition_timestamp")
         )
+
+        ignition_mc = numeric(
+            event.get("ignition_mc")
+        )
+
+        if not address or ignition_time <= 0:
+            continue
 
         history = histories.get(
             address,
-            []
+            [],
         )
 
         if not history:
             continue
 
-        baseline = event[
-            "ignition_mc"
-        ]
-
         latest = history[-1]
 
-        current_mc = latest[
-            "market_cap"
-        ]
+        current_mc = numeric(
+            latest.get("market_cap")
+        )
 
-        # ----------------------------------------------------
-        # +5 MIN
-        # ----------------------------------------------------
+        if current_mc <= 0:
+            continue
 
-        if (
-            elapsed >= OUTCOME_WINDOWS["5m"]
-            and event["outcome_5m"]
-            == "PENDING"
-        ):
+        outcomes = event.setdefault(
+            "outcomes",
+            {},
+        )
 
-            status, change = (
-                evaluate_outcome(
-                    baseline,
-                    current_mc,
-                )
+        for label, seconds in OUTCOME_WINDOWS.items():
+
+            if label in outcomes:
+                continue
+
+            elapsed = (
+                current_time
+                - ignition_time
             )
 
-            event["outcome_5m"] = status
-            event["mc_5m"] = current_mc
-            event["change_5m"] = change
+            if elapsed < seconds:
+                continue
+
+            change = pct_change(
+                ignition_mc,
+                current_mc,
+            )
+
+            status = classify_outcome(
+                ignition_mc,
+                current_mc,
+            )
+
+            outcomes[label] = {
+                "timestamp": current_time,
+                "mc": current_mc,
+                "mc_change_pct": change,
+                "status": status,
+            }
 
             print(
-                "IGNITION +5M | "
-                f"{event['symbol']} | "
-                f"CA={address_short(address)} | "
-                f"MC=${current_mc:,.0f} | "
+                f"📊 OUTCOME {label} | "
+                f"{event.get('symbol', '?')} | "
+                f"MC={format_usd(current_mc)} | "
                 f"change={change:+.1f}% | "
                 f"{status}"
             )
 
-        # ----------------------------------------------------
-        # +15 MIN
-        # ----------------------------------------------------
+            changed = True
 
-        if (
-            elapsed >= OUTCOME_WINDOWS["15m"]
-            and event["outcome_15m"]
-            == "PENDING"
-        ):
-
-            status, change = (
-                evaluate_outcome(
-                    baseline,
-                    current_mc,
-                )
-            )
-
-            event["outcome_15m"] = status
-            event["mc_15m"] = current_mc
-            event["change_15m"] = change
-
-            print(
-                "IGNITION +15M | "
-                f"{event['symbol']} | "
-                f"CA={address_short(address)} | "
-                f"MC=${current_mc:,.0f} | "
-                f"change={change:+.1f}% | "
-                f"{status}"
-            )
-
-        # ----------------------------------------------------
-        # +30 MIN
-        # ----------------------------------------------------
-
-        if (
-            elapsed >= OUTCOME_WINDOWS["30m"]
-            and event["outcome_30m"]
-            == "PENDING"
-        ):
-
-            status, change = (
-                evaluate_outcome(
-                    baseline,
-                    current_mc,
-                )
-            )
-
-            event["outcome_30m"] = status
-            event["mc_30m"] = current_mc
-            event["change_30m"] = change
-
-            print(
-                "IGNITION +30M | "
-                f"{event['symbol']} | "
-                f"CA={address_short(address)} | "
-                f"MC=${current_mc:,.0f} | "
-                f"change={change:+.1f}% | "
-                f"{status}"
-            )
+    if changed:
+        save_state()
 
 
 # ============================================================
-# TRACKING OUTPUT
+# Telegram
 # ============================================================
 
-def print_tracking(
-    address,
-    analysis,
-):
+def telegram_request(
+    method: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
 
-    current = analysis["current"]
+    if not TELEGRAM_BOT_TOKEN:
+        return None
 
-    symbol = current["symbol"]
+    url = (
+        f"{TELEGRAM_BASE}/bot"
+        f"{TELEGRAM_BOT_TOKEN}/"
+        f"{method}"
+    )
 
-    print(
-        "TRACKING "
-        f"{symbol} | "
-        f"CA={address_short(address)} | "
-        f"state={analysis['state']} | "
-        f"obs={len(histories[address])} | "
-        f"MC=${current['market_cap']/1000:.2f}K | "
-        f"5mVol=${current['volume_5m']/1000:.2f}K | "
-        f"buys/sells="
-        f"{current['buys_5m']}/"
-        f"{current['sells_5m']} | "
-        f"volChange="
-        f"{analysis['volume_change']:.1f}% | "
-        f"txChange="
-        f"{analysis['transaction_change']:.1f}% | "
-        f"MCmove="
-        f"{analysis['mc_change']:.1f}% | "
-        f"liqMove="
-        f"{analysis['liquidity_change']:.1f}% | "
-        f"range="
-        f"{analysis['range_pct']:.1f}% | "
-        f"breakout="
-        f"{analysis['breakout']} | "
-        f"score="
-        f"{analysis['score']} | "
-        f"reasons="
-        f"{','.join(analysis['reasons'])}"
+    if params:
+        query = urllib.parse.urlencode(
+            params
+        )
+        url = f"{url}?{query}"
+
+    return http_json(url)
+
+
+def send_telegram_message(
+    chat_id: int,
+    text: str,
+) -> bool:
+
+    result = telegram_request(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+        },
+    )
+
+    return bool(
+        result
+        and result.get("ok")
     )
 
 
-# ============================================================
-# PERSISTENCE
-# ============================================================
+def send_alert(
+    snapshot: TokenSnapshot,
+    analysis: Dict[str, Any],
+) -> None:
 
-def save_state():
+    if not HEATING_ALERTS_ENABLED:
+        return
 
-    try:
+    if not telegram_subscribers:
+        return
 
-        data = {
-            "version": BOT_VERSION,
+    message = (
+        "🔥 IGNITION DETECTED\n\n"
+        f"{snapshot.symbol}\n"
+        f"MC: {format_usd(snapshot.market_cap)}\n"
+        f"Liquidity: {format_usd(snapshot.liquidity)}\n"
+        f"5m Volume: {format_usd(snapshot.volume_5m)}\n"
+        f"Buys/Sells: "
+        f"{snapshot.buys_5m}/"
+        f"{snapshot.sells_5m}\n"
+        f"Score: {analysis['score']}\n"
+        f"CA: {snapshot.address}\n\n"
+        "Research signal only. "
+        "Always verify the token yourself."
+    )
 
-            "histories": histories,
+    for chat_id in list(
+        telegram_subscribers
+    ):
 
-            "ignition_events": ignition_events,
-        }
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                separators=(",", ":"),
+        try:
+            send_telegram_message(
+                chat_id,
+                message,
+            )
+        except Exception as exc:
+            print(
+                f"Telegram alert error: {exc}"
             )
 
-        print(
-            "Persistent state saved: "
-            f"{len(histories)} tokens | "
-            f"{len(ignition_events)} ignition events"
+
+def process_telegram_updates() -> None:
+
+    global last_update_id
+    global telegram_subscribers
+
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    result = telegram_request(
+        "getUpdates",
+        {
+            "offset": last_update_id + 1,
+            "timeout": 1,
+        },
+    )
+
+    if not result or not result.get("ok"):
+        return
+
+    updates = result.get("result", [])
+
+    for update in updates:
+
+        update_id = int(
+            update.get("update_id", 0)
         )
 
-    except Exception as e:
-        print(
-            f"State save error: {e}"
-        )
+        if update_id > last_update_id:
+            last_update_id = update_id
 
+        message = update.get("message") or {}
 
-def load_state():
+        chat = message.get("chat") or {}
 
-    global histories
-    global ignition_events
+        chat_id = chat.get("id")
 
-    try:
+        if chat_id is None:
+            continue
 
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        text = str(
+            message.get("text", "")
+        ).strip()
 
-            data = json.load(f)
+        if text.startswith("/start"):
 
-        histories = data.get(
-            "histories",
-            {}
-        )
+            if chat_id not in telegram_subscribers:
+                telegram_subscribers.append(
+                    int(chat_id)
+                )
 
-        ignition_events = data.get(
-            "ignition_events",
-            []
-        )
+                save_state()
 
-        print(
-            "Persistent state loaded: "
-            f"{len(histories)} tokens | "
-            f"{len(ignition_events)} ignition events"
-        )
-
-    except FileNotFoundError:
-
-        histories = {}
-        ignition_events = []
-
-        print(
-            "No previous runner state found."
-        )
-
-    except Exception as e:
-
-        print(
-            f"State load error: {e}"
-        )
-
-        histories = {}
-        ignition_events = []
+            send_telegram_message(
+                int(chat_id),
+                (
+                    "Runner bot is online.\n"
+                    "You are subscribed to runner alerts."
+                ),
+            )
 
 
 # ============================================================
-# SCAN
+# Main scan
 # ============================================================
 
-def scan_once():
+def scan_once() -> None:
+
+    global discovery_cache
 
     pairs = discover_pairs()
 
-    best_pairs = select_best_pairs(
-        pairs
-    )
-
-    if len(best_pairs) > MAX_TOKENS_PER_SCAN:
-        best_pairs = best_pairs[
-            :MAX_TOKENS_PER_SCAN
-        ]
-
-    unique_tokens = len(best_pairs)
+    unique_tokens: Dict[
+        str,
+        TokenSnapshot
+    ] = {}
 
     histories_recorded = 0
 
     in_runner_range = 0
-
     reached_liquidity = 0
 
     mc_reject = 0
-
     liquidity_reject = 0
-
-    volume_reference = 0
-
+    volume_reference_count = 0
     missing_data = 0
-
     ignition_count = 0
 
-    for pair in best_pairs:
+    for pair in pairs:
 
-        try:
+        snapshot = pair_to_snapshot(
+            pair
+        )
 
-            snapshot = snapshot_from_pair(
-                pair
-            )
+        if snapshot is None:
+            missing_data += 1
+            continue
 
-            if not snapshot.address:
-                missing_data += 1
-                continue
+        existing = unique_tokens.get(
+            snapshot.address
+        )
 
-            # --------------------------------------------
-            # Record history BEFORE runner filters.
-            # --------------------------------------------
-
-            recorded = record_snapshot(
-                snapshot
-            )
-
-            if recorded:
-                histories_recorded += 1
-
-            # --------------------------------------------
-            # Observation band
-            # --------------------------------------------
-
-            if (
-                snapshot.market_cap
-                < OBSERVE_MIN_MC
-                or snapshot.market_cap
-                > OBSERVE_MAX_MC
-            ):
-                mc_reject += 1
-                continue
-
-            # --------------------------------------------
-            # Runner MC range
-            # --------------------------------------------
-
-            if (
-                MIN_MC
-                <= snapshot.market_cap
-                <= MAX_MC
-            ):
-                in_runner_range += 1
-
-            # --------------------------------------------
-            # Liquidity
-            # --------------------------------------------
-
-            if (
-                snapshot.liquidity
-                < MIN_LIQUIDITY
-            ):
-                liquidity_reject += 1
-                continue
-
-            reached_liquidity += 1
-
-            # --------------------------------------------
-            # Volume is now ONLY a reference feature.
-            # --------------------------------------------
-
-            if (
-                snapshot.volume_5m
-                >= REFERENCE_VOLUME_5M
-            ):
-                volume_reference += 1
-
-            # --------------------------------------------
-            # Analyze
-            # --------------------------------------------
-
-            analysis = analyze(
+        # Keep the highest-liquidity pair
+        # for the same token.
+        if (
+            existing is None
+            or snapshot.liquidity
+            > existing.liquidity
+        ):
+            unique_tokens[
                 snapshot.address
+            ] = snapshot
+
+    for snapshot in unique_tokens.values():
+
+        # Record historical observation first.
+        if record_snapshot(snapshot):
+            histories_recorded += 1
+
+        if not (
+            MIN_MC
+            <= snapshot.market_cap
+            <= MAX_MC
+        ):
+            mc_reject += 1
+            continue
+
+        in_runner_range += 1
+
+        if snapshot.liquidity < MIN_LIQUIDITY:
+            liquidity_reject += 1
+            continue
+
+        reached_liquidity += 1
+
+        if (
+            snapshot.volume_5m
+            >= REFERENCE_VOLUME_5M
+        ):
+            volume_reference_count += 1
+
+        analysis = analyze(
+            snapshot
+        )
+
+        history = histories.get(
+            snapshot.address,
+            [],
+        )
+
+        # Only print tokens that have enough history.
+        if len(history) < MIN_OBSERVATIONS:
+            continue
+
+        reasons = ",".join(
+            analysis["reasons"]
+        )
+
+        print(
+            f"TRACKING {snapshot.symbol} | "
+            f"CA={shorten_address(snapshot.address)} | "
+            f"state={analysis['state']} | "
+            f"obs={len(history)} | "
+            f"MC={format_usd(snapshot.market_cap)} | "
+            f"5mVol={format_usd(snapshot.volume_5m)} | "
+            f"buys/sells="
+            f"{snapshot.buys_5m}/"
+            f"{snapshot.sells_5m} | "
+            f"volChange="
+            f"{analysis['vol_change']:.1f}% | "
+            f"txChange="
+            f"{analysis['tx_change']:.1f}% | "
+            f"MCmove="
+            f"{analysis['mc_move']:.1f}% | "
+            f"liqMove="
+            f"{analysis['liq_move']:.1f}% | "
+            f"range="
+            f"{analysis['range']:.1f}% | "
+            f"breakout="
+            f"{analysis['breakout']} | "
+            f"score="
+            f"{analysis['score']} | "
+            f"reasons={reasons}"
+        )
+
+        if analysis["state"] == "IGNITION":
+
+            event = create_ignition_event(
+                snapshot,
+                analysis,
             )
 
-            if analysis is None:
-                continue
+            if event:
+                ignition_count += 1
 
-            # Only print meaningful histories.
-            if len(
-                histories.get(
-                    snapshot.address,
-                    []
-                )
-            ) >= MIN_OBSERVATIONS:
-
-                print_tracking(
-                    snapshot.address,
+                send_alert(
+                    snapshot,
                     analysis,
                 )
-
-            # --------------------------------------------
-            # Ignition
-            # --------------------------------------------
-
-            if (
-                analysis["state"]
-                == "IGNITION"
-            ):
-
-                if not has_recent_ignition(
-                    snapshot.address
-                ):
-
-                    create_ignition_event(
-                        snapshot.address,
-                        analysis,
-                    )
-
-                    ignition_count += 1
-
-        except Exception as e:
-
-            print(
-                "Token processing error: "
-                f"{e}"
-            )
-
-    # --------------------------------------------------------
-    # Update old ignition events.
-    # --------------------------------------------------------
-
-    update_ignition_outcomes()
 
     print(
         "DEX scan complete: "
         f"{len(pairs)} Solana pairs discovered | "
-        f"{unique_tokens} unique tokens | "
+        f"{len(unique_tokens)} unique tokens | "
         f"{histories_recorded} histories recorded | "
         f"{in_runner_range} in runner range | "
         f"{reached_liquidity} reached liquidity filter | "
         f"MC outside range={mc_reject} | "
-        f"liquidity below minimum={liquidity_reject} | "
-        f"volume >= reference={volume_reference} | "
+        f"liquidity below minimum="
+        f"{liquidity_reject} | "
+        f"volume >= reference="
+        f"{volume_reference_count} | "
         f"missing data={missing_data} | "
         f"ignition={ignition_count}"
     )
 
-
-# ============================================================
-# SHUTDOWN
-# ============================================================
-
-def handle_shutdown(
-    signum=None,
-    frame=None,
-):
-
-    global running
-
-    if not running:
-        return
-
-    print(
-        "Shutdown requested..."
-    )
-
-    running = False
+    update_ignition_outcomes()
 
     save_state()
 
-    save_telegram_state()
-
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 
-def main():
+def main() -> None:
 
     print(
         f"Runner Engine {BOT_VERSION} is online"
@@ -1762,20 +1697,28 @@ def main():
 
     print(
         "Runner range: "
-        f"MC=${MIN_MC/1000:.2f}K-"
-        f"${MAX_MC/1000:.0f}K | "
+        f"MC={format_usd(MIN_MC)}-"
+        f"{format_usd(MAX_MC)} | "
         f"minimum liquidity="
-        f"${MIN_LIQUIDITY/1000:.0f}K | "
-        f"5m volume is a FEATURE, "
-        f"not a hard gate | "
-        f"scan interval="
-        f"{SCAN_INTERVAL_SECONDS}s"
+        f"{format_usd(MIN_LIQUIDITY)} | "
+        "5m volume is a FEATURE, not a hard gate | "
+        f"scan interval={SCAN_INTERVAL_SECONDS:.1f}s"
     )
 
     print(
         "Observation band: "
-        f"${OBSERVE_MIN_MC/1000:.0f}K-"
-        f"${OBSERVE_MAX_MC/1000:.0f}K"
+        f"{format_usd(OBSERVE_MIN_MC)}-"
+        f"{format_usd(OBSERVE_MAX_MC)}"
+    )
+
+    print(
+        "Consolidation activity gate: "
+        f"5m volume >= "
+        f"{format_usd(MIN_CONSOLIDATION_VOLUME_5M)} | "
+        f"transactions >= "
+        f"{MIN_CONSOLIDATION_TX} | "
+        f"{MIN_CONSOLIDATION_ACTIVE_OBS}/5 "
+        "recent observations"
     )
 
     print(
@@ -1784,78 +1727,52 @@ def main():
     )
 
     print(
-        "Telegram alerts enabled: "
+        f"Telegram alerts enabled: "
         f"{HEATING_ALERTS_ENABLED}"
     )
 
     load_state()
 
-    load_telegram_state()
+    # Force initial discovery.
+    discover_pairs(force=True)
 
-    signal.signal(
-        signal.SIGTERM,
-        handle_shutdown,
-    )
+    while True:
 
-    signal.signal(
-        signal.SIGINT,
-        handle_shutdown,
-    )
-
-    # --------------------------------------------------------
-    # Telegram polling runs in a separate thread.
-    # --------------------------------------------------------
-
-    import threading
-
-    telegram_thread = threading.Thread(
-        target=process_telegram_updates,
-        daemon=True,
-    )
-
-    telegram_thread.start()
-
-    # --------------------------------------------------------
-    # Main scan loop
-    # --------------------------------------------------------
-
-    while running:
-
-        started = time.time()
+        cycle_start = now_ts()
 
         try:
-
-            scan_once()
-
-        except Exception as e:
-
+            process_telegram_updates()
+        except Exception as exc:
             print(
-                f"Scan error: {e}"
+                f"Telegram polling error: {exc}"
             )
 
-        # Save after every scan.
-        save_state()
+        try:
+            scan_once()
+        except Exception as exc:
+            print(
+                f"Scan error: {exc}"
+            )
+
+        try:
+            process_telegram_updates()
+        except Exception as exc:
+            print(
+                f"Telegram polling error: {exc}"
+            )
 
         elapsed = (
-            time.time()
-            - started
+            now_ts()
+            - cycle_start
         )
 
         sleep_for = max(
-            1,
+            1.0,
             SCAN_INTERVAL_SECONDS
             - elapsed,
         )
 
-        if running:
-
-            time.sleep(
-                sleep_for
-            )
-
-    print(
-        "Runner Engine stopped."
-    )
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
