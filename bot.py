@@ -1,20 +1,28 @@
 import json
 import os
-import re
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # ============================================================
-# RUNNER BOT V3.0
-# EVIDENCE RUNNER / LORE INTEGRATION
+# RUNNER BOT V6.0
+# MARKET EVOLUTION ENGINE
+#
+# NO LORE
+# NO X / TWITTER
+# NO GITHUB RESEARCH
+# NO AI RESEARCH
+#
+# IDEA:
+# Discover broadly -> observe -> build history ->
+# detect improvement -> signal only when market confirms
 # ============================================================
 
-BOT_VERSION = "V3.0-EVIDENCE-RUNNER"
+BOT_VERSION = "V6.0-MARKET-EVOLUTION"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
@@ -22,152 +30,98 @@ TELEGRAM_BASE = "https://api.telegram.org"
 CHAIN = "solana"
 
 # ------------------------------------------------------------
-# MARKET LIMITS
+# MARKET RANGE
 # ------------------------------------------------------------
 
 MIN_MC = 20_000
-MAX_MC = 150_000
+MAX_SIGNAL_MC = 150_000
 
-# Primary early-runner zone
-EARLY_MIN_MC = 20_000
+# Preferred early zone
 EARLY_MAX_MC = 80_000
 
 MIN_LIQUIDITY = 5_000
-EARLY_MIN_LIQUIDITY = 10_000
 
-SCAN_INTERVAL_SECONDS = int(
+# ------------------------------------------------------------
+# SIGNAL CONDITIONS
+# ------------------------------------------------------------
+
+# Current market
+MIN_CURRENT_BS = 1.35
+MIN_PREVIOUS_BS = 1.20
+
+MIN_PRICE_CHANGE = 2.0
+MAX_PRICE_CHANGE = 50.0
+
+MIN_VOLUME_MC = 3.5
+
+MIN_TX = 50
+
+# ------------------------------------------------------------
+# MOMENTUM / EVOLUTION
+# ------------------------------------------------------------
+
+MIN_OBSERVATIONS = 3
+
+# Number of consecutive/improving observations needed
+MIN_IMPROVING_STEPS = 2
+
+# How many of the major metrics must improve
+MIN_IMPROVING_METRICS = 2
+
+# ------------------------------------------------------------
+# RISK FILTERS
+# ------------------------------------------------------------
+
+MAX_DECAY_SCORE = 2
+MAX_WEAKENING_SCORE = 2
+
+# ------------------------------------------------------------
+# SCANNER
+# ------------------------------------------------------------
+
+SCAN_INTERVAL = int(
     os.getenv("SCAN_INTERVAL_SECONDS", "15")
 )
 
-DISCOVERY_INTERVAL_SECONDS = int(
+DISCOVERY_INTERVAL = int(
     os.getenv("DISCOVERY_INTERVAL_SECONDS", "300")
 )
 
-# ------------------------------------------------------------
-# RUNNER RULES
-# ------------------------------------------------------------
-
-RUNNER_SCORE = 72
-IDEAL_SCORE = 85
-
-RUNNER_BS = 1.20
-IDEAL_BS = 1.50
-
-MAX_HISTORY = 20
-
-TRACKING_TTL_SECONDS = 8 * 60 * 60
-ALERT_TRACKING_TTL_SECONDS = 48 * 60 * 60
-
-# ------------------------------------------------------------
-# EARLY NARRATIVE RULES
-# ------------------------------------------------------------
-
-EARLY_MIN_PRICE = 5.0
-EARLY_MIN_BS = 1.20
-EARLY_MIN_TX = 100
-EARLY_MIN_VOLUME_MC = 10.0
-
-EARLY_MIN_LORE_SCORE = 21
-EARLY_MIN_EVIDENCE = 2
-EARLY_MIN_SOURCE_TYPES = 2
-
-# Normal lore runner
-NORMAL_MIN_LORE_SCORE = 18
-NORMAL_MIN_EVIDENCE = 2
-NORMAL_MIN_SOURCE_TYPES = 2
-
-# ------------------------------------------------------------
-# HTTP
-# ------------------------------------------------------------
-
-HTTP_TIMEOUT = 12
-LORE_HTTP_TIMEOUT = 10
-
-USER_AGENT = (
-    "Mozilla/5.0 "
-    "(compatible; RunnerBot/3.0; +https://dexscreener.com)"
-)
-
-# ------------------------------------------------------------
-# TELEGRAM
-# ------------------------------------------------------------
-
-TELEGRAM_BOT_TOKEN = os.getenv(
+TELEGRAM_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
     ""
 )
 
 HEATING_ALERTS_ENABLED = (
-    os.getenv(
-        "HEATING_ALERTS_ENABLED",
-        "true"
-    ).lower() == "true"
+    os.getenv("HEATING_ALERTS_ENABLED", "true").lower()
+    == "true"
 )
 
-# ------------------------------------------------------------
-# OPTIONAL X API
-# ------------------------------------------------------------
+HTTP_TIMEOUT = 15
 
-X_BEARER_TOKEN = os.getenv(
-    "X_BEARER_TOKEN",
-    ""
-)
+# Keep history for this many observations.
+MAX_HISTORY = 12
 
-X_BASE = "https://api.x.com/2"
+# Avoid repeating the same alert too often.
+ALERT_COOLDOWN_SECONDS = 30 * 60
 
 # ------------------------------------------------------------
-# OPTIONAL LORE AI
-#
-# This is NOT required.
-#
-# If configured, the bot can use an OpenAI-compatible
-# endpoint for a final narrative interpretation.
-# The deterministic evidence engine remains the authority.
+# STORAGE
 # ------------------------------------------------------------
 
-LORE_AI_BASE_URL = os.getenv(
-    "LORE_AI_BASE_URL",
-    ""
-)
+STATE_FILE = "runner_state.json"
 
-LORE_AI_MODEL = os.getenv(
-    "LORE_AI_MODEL",
-    ""
-)
 
-LORE_AI_API_KEY = os.getenv(
-    "LORE_AI_API_KEY",
-    ""
-)
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
-LORE_AI_TIMEOUT = 20
-
-# ------------------------------------------------------------
-# DISCOVERY
-# ------------------------------------------------------------
-
-DISCOVERY_ENDPOINTS = [
-    "/token-profiles/latest/v1",
-    "/token-boosts/latest/v1",
-    "/token-boosts/top/v1",
-    "/community-takeovers/latest/v1",
-]
-
-# ------------------------------------------------------------
-# STATE
-# ------------------------------------------------------------
-
-SUBSCRIBERS = set()
-
-TOKEN_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-
-DISCOVERED_TOKENS: Dict[str, Dict[str, Any]] = {}
-
-LAST_ALERT_STATUS: Dict[str, str] = {}
-
-LAST_DISCOVERY = 0.0
-
-LORE_CACHE: Dict[str, Dict[str, Any]] = {}
+STATE: Dict[str, Any] = {
+    "subscribers": [],
+    "tokens": {},
+    "last_discovery": 0,
+    "last_update_id": 0,
+}
 
 
 # ============================================================
@@ -178,223 +132,125 @@ def now_ts() -> int:
     return int(time.time())
 
 
-def safe_float(
-    value: Any,
-    default: float = 0.0
-) -> float:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-
         return float(value)
-
     except Exception:
         return default
 
 
-def safe_int(
-    value: Any,
-    default: int = 0
-) -> int:
-
+def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
             return default
-
-        return int(float(value))
-
+        return int(value)
     except Exception:
         return default
 
 
-def clamp(
-    value: float,
-    minimum: float,
-    maximum: float
-) -> float:
-
-    return max(
-        minimum,
-        min(maximum, value)
-    )
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-def truncate(
-    text: str,
-    maximum: int
-) -> str:
+def fmt_money(value: float) -> str:
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
 
-    if not text:
-        return ""
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
 
-    text = str(text)
-
-    if len(text) <= maximum:
-        return text
-
-    return text[:maximum] + "..."
+    return f"${value:.0f}"
 
 
-def clean_text(
-    text: Any
-) -> str:
-
-    if text is None:
-        return ""
-
-    text = str(text)
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
+def fmt_ratio(value: float) -> str:
+    if value >= 999:
+        return "∞"
+    return f"{value:.2f}"
 
 
-def normalize_url(
-    url: str
-) -> str:
+def load_state() -> None:
+    global STATE
 
-    if not url:
-        return ""
-
-    url = url.strip()
-
-    if not url.startswith(
-        ("http://", "https://")
-    ):
-        url = "https://" + url
-
-    return url
-
-
-def domain_from_url(
-    url: str
-) -> str:
+    if not os.path.exists(STATE_FILE):
+        return
 
     try:
-        parsed = urllib.parse.urlparse(
-            url
-        )
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
 
-        return parsed.netloc.lower()
+        if isinstance(loaded, dict):
+            STATE.update(loaded)
 
-    except Exception:
-        return ""
+    except Exception as e:
+        print(f"[STATE] Load error: {e}")
 
 
-def same_origin(
-    url_a: str,
-    url_b: str
-) -> bool:
+def save_state() -> None:
+    try:
+        tmp = STATE_FILE + ".tmp"
 
-    a = domain_from_url(url_a)
-    b = domain_from_url(url_b)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, indent=2)
 
-    if not a or not b:
-        return False
+        os.replace(tmp, STATE_FILE)
 
-    return a == b
+    except Exception as e:
+        print(f"[STATE] Save error: {e}")
 
 
 # ============================================================
 # HTTP
 # ============================================================
 
-def http_request(
+def http_get_json(
     url: str,
-    headers: Optional[Dict[str, str]] = None,
     timeout: int = HTTP_TIMEOUT
-) -> Optional[bytes]:
-
-    request_headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-    }
-
-    if headers:
-        request_headers.update(
-            headers
-        )
-
-    request = urllib.request.Request(
-        url,
-        headers=request_headers
-    )
+) -> Optional[Any]:
 
     try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "RunnerBot/6.0 "
+                    "(market scanner)"
+                ),
+                "Accept": "application/json",
+            },
+        )
 
         with urllib.request.urlopen(
-            request,
+            req,
             timeout=timeout
         ) as response:
 
-            return response.read()
-
-    except Exception as exc:
-
-        print(
-            f"[HTTP ERROR] {url} -> {exc}"
-        )
-
-        return None
-
-
-def http_get_json(
-    url: str,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: int = HTTP_TIMEOUT
-) -> Any:
-
-    raw = http_request(
-        url,
-        headers=headers,
-        timeout=timeout
-    )
-
-    if raw is None:
-        return None
-
-    try:
-
-        return json.loads(
-            raw.decode(
+            body = response.read().decode(
                 "utf-8",
-                errors="ignore"
+                errors="replace"
             )
-        )
 
-    except Exception as exc:
+            return json.loads(body)
+
+    except urllib.error.HTTPError as e:
 
         print(
-            f"[JSON ERROR] {url} -> {exc}"
+            f"[HTTP ERROR] {url} -> "
+            f"HTTP {e.code}"
         )
 
-        return None
+    except Exception as e:
 
+        print(
+            f"[HTTP ERROR] {url} -> {e}"
+        )
 
-def http_get_text(
-    url: str,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: int = LORE_HTTP_TIMEOUT
-) -> str:
-
-    raw = http_request(
-        url,
-        headers=headers,
-        timeout=timeout
-    )
-
-    if raw is None:
-        return ""
-
-    return raw.decode(
-        "utf-8",
-        errors="ignore"
-    )
+    return None
 
 
 # ============================================================
@@ -403,56 +259,55 @@ def http_get_text(
 
 def telegram_api(
     method: str,
-    payload: Optional[Dict[str, Any]] = None
-) -> Any:
+    params: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
 
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_TOKEN:
         return None
 
     url = (
         f"{TELEGRAM_BASE}/bot"
-        f"{TELEGRAM_BOT_TOKEN}/"
-        f"{method}"
-    )
-
-    data = urllib.parse.urlencode(
-        payload or {}
-    ).encode()
-
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "User-Agent": USER_AGENT
-        }
+        f"{TELEGRAM_TOKEN}/{method}"
     )
 
     try:
 
+        encoded = urllib.parse.urlencode(
+            params or {}
+        ).encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=encoded,
+            method="POST",
+            headers={
+                "User-Agent": "RunnerBot/6.0"
+            },
+        )
+
         with urllib.request.urlopen(
-            request,
+            req,
             timeout=HTTP_TIMEOUT
         ) as response:
 
-            raw = response.read()
-
-        return json.loads(
-            raw.decode(
+            body = response.read().decode(
                 "utf-8",
-                errors="ignore"
+                errors="replace"
             )
-        )
 
-    except Exception as exc:
+            return json.loads(body)
+
+    except Exception as e:
 
         print(
-            f"[TELEGRAM ERROR] {exc}"
+            f"[TELEGRAM ERROR] "
+            f"{method}: {e}"
         )
 
         return None
 
 
-def send_telegram(
+def telegram_send(
     chat_id: int,
     text: str
 ) -> bool:
@@ -460,518 +315,425 @@ def send_telegram(
     result = telegram_api(
         "sendMessage",
         {
-            "chat_id": str(chat_id),
+            "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview": "true",
-        }
+            "disable_web_page_preview": True,
+        },
     )
 
-    if isinstance(result, dict):
-        return bool(
-            result.get("ok")
-        )
-
-    return False
+    return bool(
+        result and result.get("ok")
+    )
 
 
-def broadcast(
-    text: str
-) -> None:
+def telegram_startup_test() -> bool:
 
-    if not HEATING_ALERTS_ENABLED:
+    print("[STARTUP] Testing Telegram...")
+
+    result = telegram_api("getMe")
+
+    if not result or not result.get("ok"):
+        print("[TELEGRAM] Connection failed")
+        return False
+
+    username = (
+        result
+        .get("result", {})
+        .get("username", "unknown")
+    )
+
+    print(
+        f"[TELEGRAM] Connected @{username}"
+    )
+
+    return True
+
+
+def telegram_poll() -> None:
+
+    if not TELEGRAM_TOKEN:
         return
 
-    for chat_id in list(
-        SUBSCRIBERS
-    ):
-
-        send_telegram(
-            chat_id,
-            text
-        )
-
-
-def telegram_poll(
-    offset: Optional[int]
-) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-
-    payload = {
-        "timeout": "1",
-        "allowed_updates": json.dumps(
-            ["message"]
-        )
-    }
-
-    if offset is not None:
-        payload["offset"] = str(
-            offset
-        )
+    offset = STATE.get(
+        "last_update_id",
+        0
+    )
 
     result = telegram_api(
         "getUpdates",
-        payload
+        {
+            "offset": offset + 1,
+            "timeout": 1,
+            "allowed_updates": (
+                '["message"]'
+            ),
+        },
     )
 
-    if not isinstance(
-        result,
-        dict
-    ):
-        return [], offset
-
-    if not result.get("ok"):
-        return [], offset
+    if not result or not result.get("ok"):
+        return
 
     updates = result.get(
         "result",
         []
     )
 
-    if not isinstance(
-        updates,
-        list
-    ):
-        return [], offset
-
-    new_offset = offset
-
     for update in updates:
 
         update_id = safe_int(
-            update.get(
-                "update_id"
-            )
+            update.get("update_id")
         )
 
-        if new_offset is None:
-            new_offset = (
-                update_id + 1
-            )
-
-        else:
-            new_offset = max(
-                new_offset,
-                update_id + 1
-            )
-
-    return updates, new_offset
-
-
-def handle_telegram_updates(
-    updates: List[Dict[str, Any]]
-) -> None:
-
-    for update in updates:
+        STATE["last_update_id"] = (
+            update_id
+        )
 
         message = update.get(
-            "message"
+            "message",
+            {}
         )
-
-        if not isinstance(
-            message,
-            dict
-        ):
-            continue
 
         chat = message.get(
             "chat",
             {}
         )
 
-        chat_id = chat.get(
-            "id"
+        chat_id = chat.get("id")
+
+        text = (
+            message
+            .get("text", "")
+            .strip()
         )
 
-        if chat_id is None:
+        if not chat_id:
             continue
 
-        text = clean_text(
-            message.get(
-                "text",
-                ""
-            )
-        )
+        if text == "/start":
 
-        if text.startswith(
-            "/start"
-        ):
+            if chat_id not in STATE[
+                "subscribers"
+            ]:
 
-            SUBSCRIBERS.add(
-                int(chat_id)
-            )
+                STATE[
+                    "subscribers"
+                ].append(chat_id)
 
-            send_telegram(
-                int(chat_id),
+            telegram_send(
+                chat_id,
                 (
-                    "🔥 Runner Bot V3.0 is online.\n\n"
-                    "Market scanner: ACTIVE\n"
-                    "Evidence engine: ACTIVE\n"
-                    "Lore verification: ACTIVE\n\n"
-                    "Use /status for scanner status."
-                )
+                    "🚀 Runner Bot V6 is online.\n\n"
+                    "Market Evolution Engine active.\n"
+                    "No lore/X filtering.\n"
+                    "The bot watches market improvement "
+                    "before signalling."
+                ),
             )
 
             print(
-                f"[TELEGRAM] /start from {chat_id}"
+                f"[TELEGRAM] /start from "
+                f"{chat_id}"
             )
 
-        elif text.startswith(
-            "/status"
-        ):
+        elif text == "/status":
 
-            send_telegram(
-                int(chat_id),
-                build_status_message()
+            tokens = STATE.get(
+                "tokens",
+                {}
             )
 
+            telegram_send(
+                chat_id,
+                (
+                    "RUNNER BOT V6 STATUS\n\n"
+                    f"Tracked tokens: {len(tokens)}\n"
+                    f"Subscribers: "
+                    f"{len(STATE['subscribers'])}\n"
+                    f"Scanner: ACTIVE"
+                ),
+            )
 
-def build_status_message() -> str:
+        elif text == "/clear":
 
-    return (
-        "🔥 RUNNER BOT V3.0\n\n"
-        f"Discovered tokens: {len(DISCOVERED_TOKENS)}\n"
-        f"Tracked tokens: {len(TOKEN_HISTORY)}\n"
-        f"Subscribers: {len(SUBSCRIBERS)}\n"
-        f"Lore cache: {len(LORE_CACHE)}\n\n"
-        "Market engine: ACTIVE\n"
-        "Evidence engine: ACTIVE\n"
-        "Lore engine: ACTIVE"
-    )
+            STATE["tokens"] = {}
+
+            telegram_send(
+                chat_id,
+                "Tracked-token history cleared."
+            )
+
+            save_state()
+
+    save_state()
 
 
 # ============================================================
 # DEXSCREENER DISCOVERY
 # ============================================================
 
-def get_discovery_candidates() -> List[str]:
+DISCOVERY_ENDPOINTS = [
+    "/token-profiles/latest/v1",
+    "/token-boosts/latest/v1",
+    "/token-boosts/top/v1",
+    "/community-takeovers/latest/v1",
+]
+
+
+def discover_token_addresses() -> List[str]:
 
     addresses = set()
 
     for endpoint in DISCOVERY_ENDPOINTS:
 
-        url = (
-            f"{DEX_BASE}"
-            f"{endpoint}"
-        )
+        url = DEX_BASE + endpoint
 
-        data = http_get_json(
-            url
-        )
+        data = http_get_json(url)
 
-        if not isinstance(
-            data,
-            list
-        ):
+        if not isinstance(data, list):
             continue
 
         for item in data:
 
-            if not isinstance(
-                item,
-                dict
-            ):
+            if not isinstance(item, dict):
                 continue
 
-            chain_id = clean_text(
-                item.get(
-                    "chainId"
-                )
-            ).lower()
-
-            if chain_id != CHAIN:
+            if item.get("chainId") != CHAIN:
                 continue
 
-            address = clean_text(
-                item.get(
-                    "tokenAddress"
-                )
+            address = item.get(
+                "tokenAddress"
             )
 
             if address:
-                addresses.add(
-                    address
-                )
+                addresses.add(address)
 
-    return list(
-        addresses
-    )
+    return list(addresses)
 
 
 # ============================================================
-# TOKEN LOOKUP
+# DEX TOKEN LOOKUP
 # ============================================================
 
 def get_token_pairs(
-    token_address: str
+    addresses: List[str]
 ) -> List[Dict[str, Any]]:
 
-    url = (
-        f"{DEX_BASE}/token/"
-        f"{CHAIN}/{token_address}"
-    )
+    all_pairs = []
 
-    data = http_get_json(
-        url
-    )
+    # DexScreener supports batches.
+    batch_size = 30
 
-    if not isinstance(
-        data,
-        dict
+    for i in range(
+        0,
+        len(addresses),
+        batch_size
     ):
-        return []
 
-    pairs = data.get(
-        "pairs"
-    )
+        batch = addresses[
+            i:i + batch_size
+        ]
 
-    if not isinstance(
-        pairs,
-        list
-    ):
-        return []
+        encoded = ",".join(batch)
 
-    return pairs
+        url = (
+            f"{DEX_BASE}/latest/dex/tokens/"
+            f"{urllib.parse.quote(encoded)}"
+        )
 
+        data = http_get_json(url)
+
+        if not isinstance(data, dict):
+            continue
+
+        pairs = data.get(
+            "pairs",
+            []
+        )
+
+        if isinstance(pairs, list):
+
+            for pair in pairs:
+
+                if (
+                    isinstance(pair, dict)
+                    and pair.get("chainId")
+                    == CHAIN
+                ):
+                    all_pairs.append(pair)
+
+    return all_pairs
+
+
+# ============================================================
+# PAIR SELECTION
+# ============================================================
 
 def select_best_pair(
+    pairs: List[Dict[str, Any]],
     token_address: str
 ) -> Optional[Dict[str, Any]]:
 
-    pairs = get_token_pairs(
-        token_address
-    )
-
-    valid_pairs = []
+    matching = []
 
     for pair in pairs:
 
-        if not isinstance(
-            pair,
-            dict
+        base = pair.get(
+            "baseToken",
+            {}
+        )
+
+        if (
+            base.get("address")
+            == token_address
         ):
-            continue
 
-        if clean_text(
-            pair.get(
-                "chainId"
-            )
-        ).lower() != CHAIN:
-            continue
+            matching.append(pair)
 
-        liquidity = safe_float(
-            (
-                pair.get(
-                    "liquidity",
-                    {}
-                ) or {}
-            ).get(
-                "usd"
-            )
-        )
-
-        if liquidity <= 0:
-            continue
-
-        valid_pairs.append(
-            pair
-        )
-
-    if not valid_pairs:
+    if not matching:
         return None
 
-    valid_pairs.sort(
-        key=lambda item:
-        safe_float(
-            (
-                item.get(
-                    "liquidity",
-                    {}
-                ) or {}
-            ).get(
-                "usd"
-            )
+    matching.sort(
+        key=lambda x: safe_float(
+            x.get("liquidity", {})
+             .get("usd")
         ),
-        reverse=True
+        reverse=True,
     )
 
-    return valid_pairs[0]
+    return matching[0]
 
 
 # ============================================================
-# MARKET SNAPSHOT
+# SNAPSHOT
 # ============================================================
 
-def make_snapshot(
-    token_address: str,
+def build_snapshot(
     pair: Dict[str, Any]
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
 
     base = pair.get(
         "baseToken",
         {}
-    ) or {}
-
-    txns = pair.get(
-        "txns",
-        {}
-    ) or {}
-
-    m5 = txns.get(
-        "m5",
-        {}
-    ) or {}
-
-    buys = safe_int(
-        m5.get(
-            "buys"
-        )
     )
 
-    sells = safe_int(
-        m5.get(
-            "sells"
-        )
+    token_address = base.get(
+        "address"
     )
 
-    if sells > 0:
-        bs_ratio = (
-            buys / sells
-        )
-    elif buys > 0:
-        bs_ratio = 999.0
-    else:
-        bs_ratio = 0.0
+    if not token_address:
+        return None
+
+    liquidity = safe_float(
+        pair.get("liquidity", {})
+            .get("usd")
+    )
 
     market_cap = safe_float(
-        pair.get(
-            "marketCap"
-        )
+        pair.get("marketCap")
     )
 
     if market_cap <= 0:
+
         market_cap = safe_float(
-            pair.get(
-                "fdv"
-            )
+            pair.get("fdv")
         )
 
-    liquidity = safe_float(
-        (
-            pair.get(
-                "liquidity",
-                {}
-            ) or {}
-        ).get(
-            "usd"
-        )
+    volume_5m = safe_float(
+        pair.get("volume", {})
+            .get("m5")
     )
 
-    volume = safe_float(
-        (
-            pair.get(
-                "volume",
-                {}
-            ) or {}
-        ).get(
-            "m5"
-        )
+    txns_5m = pair.get(
+        "txns", {}
+    ).get("m5", {})
+
+    buys = safe_int(
+        txns_5m.get("buys")
     )
 
-    price_change = safe_float(
-        (
-            pair.get(
-                "priceChange",
-                {}
-            ) or {}
-        ).get(
-            "m5"
-        )
+    sells = safe_int(
+        txns_5m.get("sells")
     )
 
-    tx_count = (
-        buys + sells
-    )
+    if sells == 0:
+
+        bs_ratio = (
+            999.0
+            if buys > 0
+            else 0.0
+        )
+
+    else:
+
+        bs_ratio = (
+            buys / sells
+        )
 
     volume_mc = (
-        (volume / market_cap) * 100
+        volume_5m / market_cap * 100
         if market_cap > 0
-        else 0.0
+        else 0
     )
-
-    liquidity_mc = (
-        (liquidity / market_cap) * 100
-        if market_cap > 0
-        else 0.0
-    )
-
-    info = pair.get(
-        "info",
-        {}
-    ) or {}
-
-    websites = info.get(
-        "websites",
-        []
-    )
-
-    socials = info.get(
-        "socials",
-        []
-    )
-
-    if not isinstance(
-        websites,
-        list
-    ):
-        websites = []
-
-    if not isinstance(
-        socials,
-        list
-    ):
-        socials = []
 
     return {
         "timestamp": now_ts(),
+        "time": utc_now(),
+
         "address": token_address,
-        "symbol": clean_text(
-            base.get(
-                "symbol",
-                "UNKNOWN"
-            )
+
+        "symbol": base.get(
+            "symbol",
+            "UNKNOWN"
         ),
-        "name": clean_text(
-            base.get(
-                "name",
-                "Unknown"
-            )
+
+        "name": base.get(
+            "name",
+            "UNKNOWN"
         ),
+
         "market_cap": market_cap,
+
         "liquidity": liquidity,
-        "volume_5m": volume,
-        "buys_5m": buys,
-        "sells_5m": sells,
-        "bs_ratio": bs_ratio,
-        "tx_5m": tx_count,
-        "price_change_5m": price_change,
+
+        "volume_5m": volume_5m,
+
         "volume_mc": volume_mc,
-        "liquidity_mc": liquidity_mc,
-        "pair_address": clean_text(
-            pair.get(
-                "pairAddress"
-            )
+
+        "buys_5m": buys,
+
+        "sells_5m": sells,
+
+        "bs_ratio": bs_ratio,
+
+        "tx_5m": buys + sells,
+
+        "price_change_5m": safe_float(
+            pair.get("priceChange", {})
+                .get("m5")
         ),
-        "dex_id": clean_text(
-            pair.get(
-                "dexId"
-            )
+
+        "price_usd": safe_float(
+            pair.get("priceUsd")
         ),
-        "pair_url": clean_text(
-            pair.get(
-                "url"
-            )
+
+        "pair_address": pair.get(
+            "pairAddress",
+            ""
         ),
-        "websites": websites,
-        "socials": socials,
+
+        "dex": pair.get(
+            "dexId",
+            ""
+        ),
+
+        "url": pair.get(
+            "url",
+            ""
+        ),
+
+        "pair_created_at": safe_int(
+            pair.get("pairCreatedAt")
+        ),
     }
 
 
@@ -979,202 +741,179 @@ def make_snapshot(
 # HISTORY
 # ============================================================
 
-def add_history(
-    address: str,
-    snapshot: Dict[str, Any]
-) -> None:
+def get_token_state(
+    address: str
+) -> Dict[str, Any]:
 
-    history = TOKEN_HISTORY.setdefault(
-        address,
+    tokens = STATE.setdefault(
+        "tokens",
+        {}
+    )
+
+    if address not in tokens:
+
+        tokens[address] = {
+            "first_seen": now_ts(),
+            "last_seen": now_ts(),
+            "history": [],
+            "alerts": [],
+            "last_alert": 0,
+            "discovered": True,
+        }
+
+    return tokens[address]
+
+
+def add_observation(
+    snapshot: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    address = snapshot["address"]
+
+    state = get_token_state(
+        address
+    )
+
+    history = state.setdefault(
+        "history",
         []
     )
 
-    history.append(
-        snapshot
-    )
+    history.append(snapshot)
 
     if len(history) > MAX_HISTORY:
+
         del history[
             :-MAX_HISTORY
         ]
 
+    state["last_seen"] = now_ts()
 
-def get_previous_snapshot(
-    address: str
-) -> Optional[Dict[str, Any]]:
-
-    history = TOKEN_HISTORY.get(
-        address,
-        []
-    )
-
-    if len(history) < 2:
-        return None
-
-    return history[-2]
+    return state
 
 
 # ============================================================
-# DECAY
+# EVOLUTION ENGINE
 # ============================================================
 
-def calculate_decay(
+def metric_improvement(
     current: Dict[str, Any],
-    previous: Optional[Dict[str, Any]]
-) -> int:
+    previous: Dict[str, Any]
+) -> Dict[str, bool]:
 
-    decay = 0
+    return {
+        "bs": (
+            current["bs_ratio"]
+            > previous["bs_ratio"]
+        ),
 
-    if current[
-        "price_change_5m"
-    ] <= 0:
-        decay += 1
+        "volume_mc": (
+            current["volume_mc"]
+            > previous["volume_mc"]
+        ),
 
-    if current[
-        "bs_ratio"
-    ] < 1.0:
-        decay += 1
+        "transactions": (
+            current["tx_5m"]
+            > previous["tx_5m"]
+        ),
 
-    if current[
-        "tx_5m"
-    ] < 20:
-        decay += 1
+        "price": (
+            current["price_change_5m"]
+            > previous["price_change_5m"]
+        ),
 
-    if (
-        current["volume_mc"] >= 20
-        and current["price_change_5m"] < 0
-    ):
-        decay += 1
+        "liquidity": (
+            current["liquidity"]
+            >= previous["liquidity"]
+        ),
 
-    if previous:
+        "market_cap": (
+            current["market_cap"]
+            > previous["market_cap"]
+        ),
+    }
 
-        previous_liquidity = safe_float(
-            previous.get(
-                "liquidity"
-            )
-        )
-
-        current_liquidity = safe_float(
-            current.get(
-                "liquidity"
-            )
-        )
-
-        if (
-            previous_liquidity > 0
-            and current_liquidity
-            < previous_liquidity * 0.90
-        ):
-            decay += 1
-
-        previous_bs = safe_float(
-            previous.get(
-                "bs_ratio"
-            )
-        )
-
-        current_bs = safe_float(
-            current.get(
-                "bs_ratio"
-            )
-        )
-
-        if (
-            previous_bs > 0
-            and current_bs
-            < previous_bs * 0.70
-        ):
-            decay += 1
-
-    return decay
-
-
-# ============================================================
-# WEAKENING
-# ============================================================
 
 def calculate_weakening(
     current: Dict[str, Any],
-    previous: Optional[Dict[str, Any]]
+    previous: Dict[str, Any]
 ) -> int:
 
-    if not previous:
-        return 0
-
-    weakening = 0
+    score = 0
 
     if (
         current["bs_ratio"]
         < previous["bs_ratio"]
     ):
-        weakening += 1
+        score += 1
 
     if (
         current["price_change_5m"]
         < previous["price_change_5m"]
     ):
-        weakening += 1
+        score += 1
 
     if (
         current["volume_mc"]
         < previous["volume_mc"]
     ):
-        weakening += 1
+        score += 1
 
     if (
         current["tx_5m"]
         < previous["tx_5m"]
     ):
-        weakening += 1
+        score += 1
 
     if (
         current["liquidity"]
-        < previous["liquidity"]
+        < previous["liquidity"] * 0.95
     ):
-        weakening += 1
+        score += 1
 
-    return weakening
+    return score
 
 
-# ============================================================
-# MARKET SCORE
-# ============================================================
-
-def market_score(
-    snapshot: Dict[str, Any],
-    observations: int,
-    decay: int,
-    weakening: int
+def calculate_decay(
+    current: Dict[str, Any]
 ) -> int:
 
-    mc = snapshot[
-        "market_cap"
-    ]
+    score = 0
 
-    price = snapshot[
-        "price_change_5m"
-    ]
+    if current["price_change_5m"] <= 0:
+        score += 1
 
-    bs = snapshot[
-        "bs_ratio"
-    ]
+    if current["bs_ratio"] < 1.0:
+        score += 1
 
-    tx = snapshot[
-        "tx_5m"
-    ]
+    if current["tx_5m"] < 20:
+        score += 1
 
-    volume_mc = snapshot[
-        "volume_mc"
-    ]
+    if (
+        current["volume_mc"] >= 20
+        and current["price_change_5m"] < 0
+    ):
+        score += 1
 
-    liquidity_mc = snapshot[
-        "liquidity_mc"
-    ]
+    return score
+
+
+def calculate_market_score(
+    snapshot: Dict[str, Any],
+    history: List[Dict[str, Any]]
+) -> int:
+
+    mc = snapshot["market_cap"]
+    price = snapshot["price_change_5m"]
+    bs = snapshot["bs_ratio"]
+    tx = snapshot["tx_5m"]
+    vol_mc = snapshot["volume_mc"]
+    liq = snapshot["liquidity"]
 
     score = 0
 
     # --------------------------------------------------------
-    # Market cap
+    # MARKET CAP
     # --------------------------------------------------------
 
     if 20_000 <= mc < 50_000:
@@ -1190,7 +929,7 @@ def market_score(
         score += 7
 
     # --------------------------------------------------------
-    # Price
+    # PRICE
     # --------------------------------------------------------
 
     if price >= 20:
@@ -1206,10 +945,10 @@ def market_score(
         score += 8
 
     # --------------------------------------------------------
-    # Buy / sell
+    # BUY / SELL
     # --------------------------------------------------------
 
-    if bs >= 2.0:
+    if bs >= 2:
         score += 20
 
     elif bs >= 1.5:
@@ -1218,11 +957,11 @@ def market_score(
     elif bs >= 1.2:
         score += 13
 
-    elif bs >= 1.0:
+    elif bs >= 1:
         score += 7
 
     # --------------------------------------------------------
-    # Transactions
+    # TRANSACTIONS
     # --------------------------------------------------------
 
     if tx >= 300:
@@ -1241,2440 +980,895 @@ def market_score(
         score += 3
 
     # --------------------------------------------------------
-    # Volume / MC
+    # VOLUME / MC
     # --------------------------------------------------------
 
-    if volume_mc >= 40:
+    if vol_mc >= 40:
         score += 15
 
-    elif volume_mc >= 25:
+    elif vol_mc >= 25:
         score += 13
 
-    elif volume_mc >= 15:
+    elif vol_mc >= 15:
         score += 10
 
-    elif volume_mc >= 10:
+    elif vol_mc >= 10:
         score += 7
 
-    elif volume_mc >= 5:
+    elif vol_mc >= 5:
         score += 3
 
     # --------------------------------------------------------
-    # Liquidity / MC
+    # LIQUIDITY / MC
     # --------------------------------------------------------
 
-    if liquidity_mc >= 40:
+    liq_mc = (
+        liq / mc * 100
+        if mc > 0
+        else 0
+    )
+
+    if liq_mc >= 40:
         score += 10
 
-    elif liquidity_mc >= 25:
+    elif liq_mc >= 25:
         score += 8
 
-    elif liquidity_mc >= 15:
+    elif liq_mc >= 15:
         score += 6
 
-    elif liquidity_mc >= 10:
+    elif liq_mc >= 10:
         score += 4
 
     # --------------------------------------------------------
-    # History
+    # HISTORY
     # --------------------------------------------------------
 
-    if observations >= 3:
+    if len(history) >= 3:
         score += 5
 
-    elif observations >= 2:
+    elif len(history) >= 2:
         score += 2
 
     # --------------------------------------------------------
-    # Penalties
+    # PENALTIES
     # --------------------------------------------------------
 
-    score -= (
-        decay * 8
+    decay = calculate_decay(
+        snapshot
     )
 
-    score -= (
-        weakening * 4
-    )
+    weakening = 0
+
+    if len(history) >= 2:
+
+        weakening = calculate_weakening(
+            snapshot,
+            history[-2]
+        )
+
+    score -= decay * 8
+    score -= weakening * 4
 
     return int(
-        clamp(
-            score,
-            0,
-            100
+        clamp(score, 0, 100)
+    )
+
+
+# ============================================================
+# IMPROVEMENT ANALYSIS
+# ============================================================
+
+def analyze_evolution(
+    history: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+
+    result = {
+        "improving_steps": 0,
+        "improving_metrics": 0,
+        "current_step_improving": False,
+        "trend": "UNKNOWN",
+        "weakening": 0,
+        "decay": 0,
+    }
+
+    if not history:
+        return result
+
+    current = history[-1]
+
+    result["decay"] = calculate_decay(
+        current
+    )
+
+    if len(history) < 2:
+        result["trend"] = "NEW"
+        return result
+
+    # --------------------------------------------------------
+    # Consecutive improvement
+    # --------------------------------------------------------
+
+    improving_steps = 0
+
+    for i in range(
+        len(history) - 1,
+        0,
+        -1
+    ):
+
+        cur = history[i]
+        prev = history[i - 1]
+
+        changes = metric_improvement(
+            cur,
+            prev
+        )
+
+        metric_count = sum(
+            1 for value in changes.values()
+            if value
+        )
+
+        if (
+            metric_count
+            >= MIN_IMPROVING_METRICS
+        ):
+
+            improving_steps += 1
+
+        else:
+            break
+
+    result[
+        "improving_steps"
+    ] = improving_steps
+
+    # --------------------------------------------------------
+    # Current step
+    # --------------------------------------------------------
+
+    previous = history[-2]
+
+    changes = metric_improvement(
+        current,
+        previous
+    )
+
+    result[
+        "improving_metrics"
+    ] = sum(
+        1 for value in changes.values()
+        if value
+    )
+
+    result[
+        "current_step_improving"
+    ] = (
+        result["improving_metrics"]
+        >= MIN_IMPROVING_METRICS
+    )
+
+    result["weakening"] = (
+        calculate_weakening(
+            current,
+            previous
         )
     )
 
+    # --------------------------------------------------------
+    # Trend
+    # --------------------------------------------------------
+
+    if (
+        result["improving_steps"]
+        >= MIN_IMPROVING_STEPS
+    ):
+
+        result["trend"] = "ACCELERATING"
+
+    elif result[
+        "current_step_improving"
+    ]:
+
+        result["trend"] = "IMPROVING"
+
+    elif result["weakening"] >= 3:
+
+        result["trend"] = "WEAKENING"
+
+    else:
+
+        result["trend"] = "MIXED"
+
+    return result
+
 
 # ============================================================
-# EARLY MARKET FILTER
+# SIGNAL DECISION
 # ============================================================
 
-def early_market_candidate(
+def qualifies_market(
     snapshot: Dict[str, Any]
 ) -> bool:
 
     return (
-        EARLY_MIN_MC
+        MIN_MC
         <= snapshot["market_cap"]
-        <= EARLY_MAX_MC
-        and snapshot["liquidity"]
-        >= EARLY_MIN_LIQUIDITY
-        and snapshot["price_change_5m"]
-        >= EARLY_MIN_PRICE
-        and snapshot["bs_ratio"]
-        >= EARLY_MIN_BS
-        and snapshot["tx_5m"]
-        >= EARLY_MIN_TX
-        and snapshot["volume_mc"]
-        >= EARLY_MIN_VOLUME_MC
+        <= MAX_SIGNAL_MC
+        and
+        snapshot["liquidity"]
+        >= MIN_LIQUIDITY
     )
 
 
-# ============================================================
-# LORE URL EXTRACTION
-# ============================================================
-
-def extract_urls(
-    text: str
-) -> List[str]:
-
-    if not text:
-        return []
-
-    pattern = (
-        r"https?://"
-        r"[^\s\"'<>]+"
-    )
-
-    found = re.findall(
-        pattern,
-        text
-    )
-
-    clean = []
-
-    for url in found:
-
-        url = url.rstrip(
-            ".,);]}>"
-        )
-
-        if url not in clean:
-            clean.append(
-                url
-            )
-
-    return clean
-
-
-def classify_url(
-    url: str
-) -> str:
-
-    lower = url.lower()
-
-    if "github.com" in lower:
-        return "github"
-
-    if (
-        "whitepaper" in lower
-        or "docs." in lower
-        or "/docs" in lower
-        or ".pdf" in lower
-        or "documentation" in lower
-    ):
-        return "docs"
-
-    if (
-        "x.com" in lower
-        or "twitter.com" in lower
-    ):
-        return "x"
-
-    if (
-        "medium.com" in lower
-        or "mirror.xyz" in lower
-    ):
-        return "blog"
-
-    return "website"
-
-
-def collect_project_urls(
-    snapshot: Dict[str, Any]
-) -> Dict[str, List[str]]:
-
-    result = {
-        "website": [],
-        "github": [],
-        "docs": [],
-        "x": [],
-        "blog": [],
-    }
-
-    for item in snapshot.get(
-        "websites",
-        []
-    ):
-
-        if not isinstance(
-            item,
-            dict
-        ):
-            continue
-
-        url = normalize_url(
-            clean_text(
-                item.get(
-                    "url"
-                )
-            )
-        )
-
-        if not url:
-            continue
-
-        category = classify_url(
-            url
-        )
-
-        result.setdefault(
-            category,
-            []
-        ).append(
-            url
-        )
-
-    for item in snapshot.get(
-        "socials",
-        []
-    ):
-
-        if not isinstance(
-            item,
-            dict
-        ):
-            continue
-
-        platform = clean_text(
-            item.get(
-                "platform"
-            )
-        ).lower()
-
-        url = normalize_url(
-            clean_text(
-                item.get(
-                    "url"
-                )
-            )
-        )
-
-        if not url:
-            continue
-
-        if platform in (
-            "x",
-            "twitter"
-        ):
-            result[
-                "x"
-            ].append(
-                url
-            )
-
-    return result
-
-
-# ============================================================
-# WEBSITE RESEARCH
-# ============================================================
-
-def extract_title(
-    html: str
-) -> str:
-
-    match = re.search(
-        r"<title[^>]*>"
-        r"(.*?)"
-        r"</title>",
-        html,
-        flags=re.I | re.S
-    )
-
-    if not match:
-        return ""
-
-    return clean_text(
-        re.sub(
-            r"<[^>]+>",
-            " ",
-            match.group(1)
-        )
-    )
-
-
-def html_to_text(
-    html: str
-) -> str:
-
-    if not html:
-        return ""
-
-    html = re.sub(
-        r"<script[^>]*>.*?</script>",
-        " ",
-        html,
-        flags=re.I | re.S
-    )
-
-    html = re.sub(
-        r"<style[^>]*>.*?</style>",
-        " ",
-        html,
-        flags=re.I | re.S
-    )
-
-    html = re.sub(
-        r"<[^>]+>",
-        " ",
-        html
-    )
-
-    html = re.sub(
-        r"&nbsp;",
-        " ",
-        html,
-        flags=re.I
-    )
-
-    html = re.sub(
-        r"&amp;",
-        "&",
-        html,
-        flags=re.I
-    )
-
-    return clean_text(
-        html
-    )
-
-
-def extract_links_from_html(
-    html: str,
-    base_url: str
-) -> List[str]:
-
-    links = []
-
-    pattern = re.compile(
-        r'<a[^>]+href=["\']'
-        r'([^"\']+)'
-        r'["\']',
-        flags=re.I
-    )
-
-    for match in pattern.finditer(
-        html
-    ):
-
-        href = match.group(1).strip()
-
-        if href.startswith(
-            "#"
-        ):
-            continue
-
-        try:
-
-            full = urllib.parse.urljoin(
-                base_url,
-                href
-            )
-
-        except Exception:
-            continue
-
-        if full.startswith(
-            ("http://", "https://")
-        ):
-            links.append(
-                full
-            )
-
-    return list(
-        dict.fromkeys(
-            links
-        )
-    )
-
-
-def research_website(
-    url: str
-) -> Dict[str, Any]:
-
-    html = http_get_text(
-        url
-    )
-
-    if not html:
-        return {
-            "url": url,
-            "reachable": False,
-            "title": "",
-            "text": "",
-            "links": [],
-        }
-
-    text = html_to_text(
-        html
-    )
-
-    links = extract_links_from_html(
-        html,
-        url
-    )
-
-    return {
-        "url": url,
-        "reachable": True,
-        "title": extract_title(
-            html
-        ),
-        "text": truncate(
-            text,
-            30_000
-        ),
-        "links": links[:150],
-    }
-
-
-# ============================================================
-# GITHUB
-# ============================================================
-
-def parse_github_url(
-    url: str
-) -> Optional[Tuple[str, str]]:
-
-    try:
-
-        parsed = urllib.parse.urlparse(
-            url
-        )
-
-        if parsed.netloc.lower() not in (
-            "github.com",
-            "www.github.com"
-        ):
-            return None
-
-        parts = [
-            p
-            for p in parsed.path.split("/")
-            if p
-        ]
-
-        if len(parts) < 2:
-            return None
-
-        owner = parts[0]
-        repo = parts[1]
-
-        repo = repo.replace(
-            ".git",
-            ""
-        )
-
-        return owner, repo
-
-    except Exception:
-        return None
-
-
-def research_github(
-    url: str
-) -> Dict[str, Any]:
-
-    parsed = parse_github_url(
-        url
-    )
-
-    if not parsed:
-        return {
-            "reachable": False,
-            "url": url,
-        }
-
-    owner, repo = parsed
-
-    api_url = (
-        "https://api.github.com/repos/"
-        f"{owner}/{repo}"
-    )
-
-    data = http_get_json(
-        api_url,
-        headers={
-            "Accept":
-            "application/vnd.github+json"
-        }
-    )
-
-    if not isinstance(
-        data,
-        dict
-    ):
-        return {
-            "reachable": False,
-            "url": url,
-            "owner": owner,
-            "repo": repo,
-        }
-
-    readme_url = (
-        f"https://raw.githubusercontent.com/"
-        f"{owner}/{repo}/HEAD/README.md"
-    )
-
-    readme = http_get_text(
-        readme_url
-    )
-
-    return {
-        "reachable": True,
-        "url": url,
-        "owner": owner,
-        "repo": repo,
-        "description": clean_text(
-            data.get(
-                "description"
-            )
-        ),
-        "stars": safe_int(
-            data.get(
-                "stargazers_count"
-            )
-        ),
-        "forks": safe_int(
-            data.get(
-                "forks_count"
-            )
-        ),
-        "created_at": clean_text(
-            data.get(
-                "created_at"
-            )
-        ),
-        "updated_at": clean_text(
-            data.get(
-                "updated_at"
-            )
-        ),
-        "language": clean_text(
-            data.get(
-                "language"
-            )
-        ),
-        "default_branch": clean_text(
-            data.get(
-                "default_branch"
-            )
-        ),
-        "readme": truncate(
-            html_to_text(
-                readme
-            ),
-            20_000
-        ),
-    }
-
-
-# ============================================================
-# X / TWITTER
-# ============================================================
-
-def extract_x_username(
-    url: str
-) -> str:
-
-    try:
-
-        parsed = urllib.parse.urlparse(
-            url
-        )
-
-        parts = [
-            p
-            for p in parsed.path.split("/")
-            if p
-        ]
-
-        if not parts:
-            return ""
-
-        username = parts[0]
-
-        if username.lower() in (
-            "home",
-            "search",
-            "explore",
-            "i"
-        ):
-            return ""
-
-        return username
-
-    except Exception:
-        return ""
-
-
-def research_x(
-    url: str
-) -> Dict[str, Any]:
-
-    username = extract_x_username(
-        url
-    )
-
-    result = {
-        "url": url,
-        "username": username,
-        "reachable": False,
-        "profile_verified": False,
-        "posts_found": 0,
-        "posts": [],
-    }
-
-    if not username:
-        return result
-
-    # --------------------------------------------------------
-    # Without X API:
-    #
-    # We record the official social link but DO NOT pretend
-    # that its activity has been independently verified.
-    # --------------------------------------------------------
-
-    if not X_BEARER_TOKEN:
-        return result
-
-    headers = {
-        "Authorization":
-        f"Bearer {X_BEARER_TOKEN}"
-    }
-
-    user_url = (
-        f"{X_BASE}/users/by/username/"
-        f"{urllib.parse.quote(username)}"
-        "?user.fields=created_at,description,"
-        "name,username,verified"
-    )
-
-    user_data = http_get_json(
-        user_url,
-        headers=headers
-    )
-
-    if not isinstance(
-        user_data,
-        dict
-    ):
-        return result
-
-    user = user_data.get(
-        "data"
-    )
-
-    if not isinstance(
-        user,
-        dict
-    ):
-        return result
-
-    result[
-        "reachable"
-    ] = True
-
-    result[
-        "profile_verified"
-    ] = bool(
-        user.get(
-            "verified"
-        )
-    )
-
-    result[
-        "profile"
-    ] = {
-        "name": clean_text(
-            user.get(
-                "name"
-            )
-        ),
-        "username": clean_text(
-            user.get(
-                "username"
-            )
-        ),
-        "description": clean_text(
-            user.get(
-                "description"
-            )
-        ),
-        "created_at": clean_text(
-            user.get(
-                "created_at"
-            )
-        ),
-    }
-
-    user_id = user.get(
-        "id"
-    )
-
-    if not user_id:
-        return result
-
-    posts_url = (
-        f"{X_BASE}/users/"
-        f"{user_id}/tweets"
-        "?max_results=10"
-        "&tweet.fields=created_at,text"
-    )
-
-    posts_data = http_get_json(
-        posts_url,
-        headers=headers
-    )
-
-    if not isinstance(
-        posts_data,
-        dict
-    ):
-        return result
-
-    posts = posts_data.get(
-        "data",
-        []
-    )
-
-    if not isinstance(
-        posts,
-        list
-    ):
-        posts = []
-
-    for post in posts:
-
-        if not isinstance(
-            post,
-            dict
-        ):
-            continue
-
-        result[
-            "posts"
-        ].append(
-            {
-                "text":
-                    clean_text(
-                        post.get(
-                            "text"
-                        )
-                    ),
-                "created_at":
-                    clean_text(
-                        post.get(
-                            "created_at"
-                        )
-                    ),
-            }
-        )
-
-    result[
-        "posts_found"
-    ] = len(
-        result["posts"]
-    )
-
-    return result
-
-
-# ============================================================
-# SOURCE ORIGIN
-# ============================================================
-
-def source_origin(
-    url: str,
-    official_website: str = ""
-) -> str:
-
-    domain = domain_from_url(
-        url
-    )
-
-    if not domain:
-        return "unknown"
-
-    if official_website:
-
-        official_domain = domain_from_url(
-            official_website
-        )
-
-        if (
-            official_domain
-            and domain == official_domain
-        ):
-            return "official-website"
-
-    if "github.com" in domain:
-        return "github"
-
-    if (
-        "x.com" in domain
-        or "twitter.com" in domain
-    ):
-        return "x"
-
-    return domain
-
-
-# ============================================================
-# LORE EVIDENCE
-# ============================================================
-
-def keyword_hits(
-    text: str,
-    keywords: List[str]
-) -> int:
-
-    lower = text.lower()
-
-    hits = 0
-
-    for keyword in keywords:
-
-        if keyword.lower() in lower:
-            hits += 1
-
-    return hits
-
-
-def build_evidence(
+def qualifies_early(
     snapshot: Dict[str, Any],
-    websites: List[Dict[str, Any]],
-    githubs: List[Dict[str, Any]],
-    xs: List[Dict[str, Any]],
-    discovered_links: List[str]
-) -> Dict[str, Any]:
+    evolution: Dict[str, Any],
+    history: List[Dict[str, Any]]
+) -> bool:
 
-    evidence = []
+    if not qualifies_market(snapshot):
+        return False
 
-    official_website = ""
+    if snapshot["market_cap"] > EARLY_MAX_MC:
+        return False
 
-    for site in websites:
+    if len(history) < MIN_OBSERVATIONS:
+        return False
 
-        if site.get(
-            "reachable"
-        ):
+    if snapshot["bs_ratio"] < MIN_CURRENT_BS:
+        return False
 
-            official_website = site.get(
-                "url",
-                ""
-            )
+    if snapshot["price_change_5m"] < MIN_PRICE_CHANGE:
+        return False
 
-            break
-
-    # --------------------------------------------------------
-    # Project identity
-    # --------------------------------------------------------
-
-    identity_score = 0
-
-    if official_website:
-        identity_score += 2
-
-    if snapshot.get(
-        "name"
+    if (
+        snapshot["price_change_5m"]
+        > MAX_PRICE_CHANGE
     ):
-        identity_score += 1
+        return False
 
-    if snapshot.get(
-        "symbol"
+    if snapshot["volume_mc"] < MIN_VOLUME_MC:
+        return False
+
+    if snapshot["tx_5m"] < MIN_TX:
+        return False
+
+    if (
+        evolution["improving_steps"]
+        < MIN_IMPROVING_STEPS
     ):
-        identity_score += 1
+        return False
 
-    if identity_score >= 3:
+    if (
+        evolution["improving_metrics"]
+        < MIN_IMPROVING_METRICS
+    ):
+        return False
 
-        evidence.append(
-            {
-                "type": "project_identity",
-                "source_type": "website",
-                "origin": "official-website",
-                "description":
-                    "A reachable project identity and official web presence were found."
-            }
-        )
+    if (
+        evolution["weakening"]
+        > MAX_WEAKENING_SCORE
+    ):
+        return False
 
-    # --------------------------------------------------------
-    # Technical/product narrative
-    # --------------------------------------------------------
+    if (
+        evolution["decay"]
+        > MAX_DECAY_SCORE
+    ):
+        return False
 
-    technical_keywords = [
-        "protocol",
-        "infrastructure",
-        "ai",
-        "agent",
-        "api",
-        "sdk",
-        "network",
-        "protocol",
-        "daemon",
-        "firewall",
-        "automation",
-        "machine learning",
-        "software",
-        "developer",
-        "open source",
-    ]
+    # Previous B/S must show that buying pressure
+    # wasn't created from one isolated jump.
+    previous = history[-2]
 
-    technical_hits = 0
+    if previous["bs_ratio"] < MIN_PREVIOUS_BS:
+        return False
 
-    for site in websites:
+    return True
 
-        technical_hits += keyword_hits(
-            site.get(
-                "text",
-                ""
-            ),
-            technical_keywords
-        )
 
-    for github in githubs:
+def qualifies_runner(
+    snapshot: Dict[str, Any],
+    evolution: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    market_score: int
+) -> bool:
 
-        technical_hits += keyword_hits(
-            (
-                github.get(
-                    "description",
-                    ""
-                )
-                + " "
-                + github.get(
-                    "readme",
-                    ""
-                )
-            ),
-            technical_keywords
-        )
+    if not qualifies_market(snapshot):
+        return False
 
-    if technical_hits >= 2:
+    if len(history) < 3:
+        return False
 
-        evidence.append(
-            {
-                "type":
-                    "technical_narrative",
-                "source_type":
-                    "technical-documentation",
-                "origin":
-                    "project-documentation",
-                "description":
-                    "The project's technical/product narrative appears in project documentation or repository material."
-            }
-        )
+    if market_score < 72:
+        return False
 
-    # --------------------------------------------------------
-    # GitHub implementation
-    # --------------------------------------------------------
+    if snapshot["price_change_5m"] <= 0:
+        return False
 
-    usable_githubs = [
-        item
-        for item in githubs
-        if item.get(
-            "reachable"
-        )
-    ]
+    if snapshot["bs_ratio"] < 1.2:
+        return False
 
-    for github in usable_githubs:
+    if evolution["decay"] > 2:
+        return False
 
-        if (
-            github.get(
-                "readme"
-            )
-            or github.get(
-                "description"
-            )
-        ):
+    if evolution["weakening"] > 2:
+        return False
 
-            evidence.append(
-                {
-                    "type":
-                        "implementation",
-                    "source_type":
-                        "github",
-                    "origin":
-                        "github",
-                    "description":
-                        "A reachable GitHub repository contains project/repository material."
-                }
-            )
-
-            break
-
-    # --------------------------------------------------------
-    # Developer identity
-    # --------------------------------------------------------
-
-    usable_x = [
-        item
-        for item in xs
-        if item.get(
-            "reachable"
-        )
-    ]
-
-    if usable_x:
-
-        evidence.append(
-            {
-                "type":
-                    "developer_identity",
-                "source_type":
-                    "x",
-                "origin":
-                    "x",
-                "description":
-                    "The linked X identity was reachable through the configured X API."
-            }
-        )
-
-    # --------------------------------------------------------
-    # Documentation
-    # --------------------------------------------------------
-
-    doc_links = []
-
-    for url in discovered_links:
-
-        category = classify_url(
-            url
-        )
-
-        if category == "docs":
-            doc_links.append(
-                url
-            )
-
-    if doc_links:
-
-        evidence.append(
-            {
-                "type":
-                    "documentation",
-                "source_type":
-                    "docs",
-                "origin":
-                    source_origin(
-                        doc_links[0],
-                        official_website
-                    ),
-                "description":
-                    "Documentation or whitepaper links were found."
-            }
-        )
-
-    # --------------------------------------------------------
-    # Cross-linking
-    # --------------------------------------------------------
-
-    cross_links = 0
-
-    all_website_links = []
-
-    for site in websites:
-
-        all_website_links.extend(
-            site.get(
-                "links",
-                []
-            )
-        )
-
-    website_has_github = any(
-        "github.com" in link.lower()
-        for link in all_website_links
-    )
-
-    website_has_x = any(
-        (
-            "x.com" in link.lower()
-            or "twitter.com"
-            in link.lower()
-        )
-        for link in all_website_links
-    )
-
-    if website_has_github:
-        cross_links += 1
-
-    if website_has_x:
-        cross_links += 1
-
-    if cross_links >= 1:
-
-        evidence.append(
-            {
-                "type":
-                    "cross_linked_identity",
-                "source_type":
-                    "cross-verification",
-                "origin":
-                    "project-links",
-                "description":
-                    "The official web presence links to external project identities."
-            }
-        )
-
-    # --------------------------------------------------------
-    # Token identity in GitHub
-    # --------------------------------------------------------
-
-    token_address = snapshot.get(
-        "address",
-        ""
-    ).lower()
-
-    token_name = snapshot.get(
-        "name",
-        ""
-    ).lower()
-
-    token_symbol = snapshot.get(
-        "symbol",
-        ""
-    ).lower()
-
-    repo_identity_match = False
-
-    for github in usable_githubs:
-
-        searchable = (
-            github.get(
-                "description",
-                ""
-            )
-            + " "
-            + github.get(
-                "readme",
-                ""
-            )
-        ).lower()
-
-        if (
-            token_address
-            and token_address in searchable
-        ):
-            repo_identity_match = True
-            break
-
-        if (
-            token_name
-            and len(token_name) >= 4
-            and token_name in searchable
-        ):
-            repo_identity_match = True
-            break
-
-        if (
-            token_symbol
-            and len(token_symbol) >= 4
-            and token_symbol in searchable
-        ):
-            repo_identity_match = True
-            break
-
-    if repo_identity_match:
-
-        evidence.append(
-            {
-                "type":
-                    "token_project_link",
-                "source_type":
-                    "github",
-                "origin":
-                    "github",
-                "description":
-                    "The token/project identity appears in reachable repository material."
-            }
-        )
-
-    return {
-        "evidence": evidence,
-        "official_website":
-            official_website,
-    }
+    return True
 
 
 # ============================================================
-# LORE SCORING
+# ALERT CONTROL
 # ============================================================
 
-def calculate_lore_score(
-    evidence_data: Dict[str, Any],
-    websites: List[Dict[str, Any]],
-    githubs: List[Dict[str, Any]],
-    xs: List[Dict[str, Any]],
-    snapshot: Dict[str, Any]
-) -> Dict[str, Any]:
+def alert_already_sent(
+    address: str,
+    alert_type: str
+) -> bool:
 
-    evidence = evidence_data.get(
-        "evidence",
+    state = get_token_state(
+        address
+    )
+
+    alerts = state.get(
+        "alerts",
         []
     )
 
-    evidence_types = set()
-    source_types = set()
-    origins = set()
+    return alert_type in alerts
 
-    for item in evidence:
 
-        evidence_types.add(
-            item.get(
-                "type"
-            )
-        )
+def can_alert(
+    address: str
+) -> bool:
 
-        source_types.add(
-            item.get(
-                "source_type"
-            )
-        )
-
-        origins.add(
-            item.get(
-                "origin"
-            )
-        )
-
-    score = 0
-
-    # --------------------------------------------------------
-    # 1. Project identity
-    # --------------------------------------------------------
-
-    if any(
-        item.get(
-            "type"
-        ) == "project_identity"
-        for item in evidence
-    ):
-        score += 5
-
-    # --------------------------------------------------------
-    # 2. Technical narrative
-    # --------------------------------------------------------
-
-    if any(
-        item.get(
-            "type"
-        ) == "technical_narrative"
-        for item in evidence
-    ):
-        score += 5
-
-    # --------------------------------------------------------
-    # 3. Implementation
-    # --------------------------------------------------------
-
-    if any(
-        item.get(
-            "type"
-        ) == "implementation"
-        for item in evidence
-    ):
-        score += 5
-
-    # --------------------------------------------------------
-    # 4. Developer identity
-    # --------------------------------------------------------
-
-    if any(
-        item.get(
-            "type"
-        ) == "developer_identity"
-        for item in evidence
-    ):
-        score += 4
-
-    # --------------------------------------------------------
-    # 5. Cross verification
-    # --------------------------------------------------------
-
-    if (
-        len(
-            origins
-        ) >= 2
-    ):
-        score += 3
-
-    if any(
-        item.get(
-            "type"
-        ) == "cross_linked_identity"
-        for item in evidence
-    ):
-        score += 3
-
-    score = min(
-        score,
-        25
+    state = get_token_state(
+        address
     )
 
-    # --------------------------------------------------------
-    # Confidence
-    # --------------------------------------------------------
-
-    if (
-        score >= 21
-        and len(source_types) >= 2
-        and len(origins) >= 2
-    ):
-        confidence = "HIGH"
-
-    elif (
-        score >= 15
-        and len(source_types) >= 2
-    ):
-        confidence = "MEDIUM"
-
-    elif score >= 8:
-        confidence = "LOW"
-
-    else:
-        confidence = "UNKNOWN"
-
-    # --------------------------------------------------------
-    # Momentum
-    # --------------------------------------------------------
-
-    x_activity = sum(
-        item.get(
-            "posts_found",
-            0
-        )
-        for item in xs
+    last_alert = safe_int(
+        state.get("last_alert")
     )
 
-    github_activity = sum(
-        1
-        for item in githubs
-        if item.get(
-            "reachable"
-        )
+    return (
+        now_ts() - last_alert
+        >= ALERT_COOLDOWN_SECONDS
     )
 
-    website_activity = sum(
-        1
-        for item in websites
-        if item.get(
-            "reachable"
-        )
+
+def mark_alert(
+    address: str,
+    alert_type: str
+) -> None:
+
+    state = get_token_state(
+        address
     )
 
-    if (
-        x_activity >= 3
-        and github_activity >= 1
-        and website_activity >= 1
-    ):
-        momentum = "HIGH"
+    alerts = state.setdefault(
+        "alerts",
+        []
+    )
 
-    elif (
-        x_activity >= 1
-        or (
-            github_activity >= 1
-            and website_activity >= 1
-        )
-    ):
-        momentum = "MEDIUM"
+    if alert_type not in alerts:
+        alerts.append(alert_type)
 
-    elif website_activity:
-        momentum = "LOW"
-
-    else:
-        momentum = "UNKNOWN"
-
-    return {
-        "score": score,
-        "confidence": confidence,
-        "momentum": momentum,
-        "evidence_count": len(
-            evidence_types
-        ),
-        "source_type_count": len(
-            source_types
-        ),
-        "origin_count": len(
-            origins
-        ),
-        "evidence": evidence,
-    }
+    state["last_alert"] = now_ts()
 
 
 # ============================================================
-# LORE RESEARCH
+# TELEGRAM ALERT
 # ============================================================
 
-def research_lore(
+def build_alert(
+    snapshot: Dict[str, Any],
+    evolution: Dict[str, Any],
+    market_score: int,
+    alert_type: str,
+    history: List[Dict[str, Any]]
+) -> str:
+
+    previous = (
+        history[-2]
+        if len(history) >= 2
+        else None
+    )
+
+    bs_previous = (
+        previous["bs_ratio"]
+        if previous
+        else 0
+    )
+
+    vol_previous = (
+        previous["volume_mc"]
+        if previous
+        else 0
+    )
+
+    return (
+        f"🚀 {alert_type}\n\n"
+
+        f"{snapshot['name']} "
+        f"({snapshot['symbol']})\n\n"
+
+        f"💰 MC: "
+        f"{fmt_money(snapshot['market_cap'])}\n"
+
+        f"💧 Liquidity: "
+        f"{fmt_money(snapshot['liquidity'])}\n"
+
+        f"📈 5m Price: "
+        f"{snapshot['price_change_5m']:+.2f}%\n"
+
+        f"🟢 B/S: "
+        f"{fmt_ratio(snapshot['bs_ratio'])}\n"
+
+        f"   Previous: "
+        f"{fmt_ratio(bs_previous)}\n"
+
+        f"📊 5m Vol/MC: "
+        f"{snapshot['volume_mc']:.2f}%\n"
+
+        f"   Previous: "
+        f"{vol_previous:.2f}%\n"
+
+        f"🔄 5m TX: "
+        f"{snapshot['tx_5m']}\n"
+
+        f"📈 Market Score: "
+        f"{market_score}/100\n"
+
+        f"🔥 Trend: "
+        f"{evolution['trend']}\n"
+
+        f"⬆️ Improving steps: "
+        f"{evolution['improving_steps']}\n"
+
+        f"📚 Observations: "
+        f"{len(history)}\n\n"
+
+        f"DEX: {snapshot['dex']}\n\n"
+
+        f"CA:\n"
+        f"{snapshot['address']}\n\n"
+
+        f"Chart:\n"
+        f"{snapshot['url']}"
+    )
+
+
+def send_alert_to_all(
+    text: str
+) -> None:
+
+    subscribers = list(
+        STATE.get(
+            "subscribers",
+            []
+        )
+    )
+
+    for chat_id in subscribers:
+
+        telegram_send(
+            chat_id,
+            text
+        )
+
+
+# ============================================================
+# TOKEN PROCESSING
+# ============================================================
+
+def process_snapshot(
     snapshot: Dict[str, Any]
-) -> Dict[str, Any]:
+) -> None:
 
     address = snapshot[
         "address"
     ]
 
-    if address in LORE_CACHE:
-
-        cached = LORE_CACHE[
-            address
-        ]
-
-        # Cache for 30 minutes
-        if (
-            now_ts()
-            - cached.get(
-                "timestamp",
-                0
-            )
-            < 1800
-        ):
-            return cached
-
-    urls = collect_project_urls(
+    state = add_observation(
         snapshot
     )
 
-    website_results = []
-
-    for url in urls[
-        "website"
-    ][:3]:
-
-        result = research_website(
-            url
-        )
-
-        website_results.append(
-            result
-        )
-
-    # --------------------------------------------------------
-    # Discover additional URLs from official website
-    # --------------------------------------------------------
-
-    discovered_links = []
-
-    for site in website_results:
-
-        for link in site.get(
-            "links",
-            []
-        ):
-
-            category = classify_url(
-                link
-            )
-
-            if category in (
-                "github",
-                "docs",
-                "x",
-                "blog"
-            ):
-                discovered_links.append(
-                    link
-                )
-
-    # --------------------------------------------------------
-    # Merge DEX + website discoveries
-    # --------------------------------------------------------
-
-    github_urls = []
-
-    for url in urls[
-        "github"
-    ]:
-
-        github_urls.append(
-            url
-        )
-
-    for url in discovered_links:
-
-        if classify_url(
-            url
-        ) == "github":
-
-            github_urls.append(
-                url
-            )
-
-    github_urls = list(
-        dict.fromkeys(
-            github_urls
-        )
-    )
-
-    docs_urls = []
-
-    for url in discovered_links:
-
-        if classify_url(
-            url
-        ) == "docs":
-
-            docs_urls.append(
-                url
-            )
-
-    x_urls = list(
-        dict.fromkeys(
-            urls["x"]
-            + [
-                link
-                for link in discovered_links
-                if classify_url(
-                    link
-                ) == "x"
-            ]
-        )
-    )
-
-    # --------------------------------------------------------
-    # Research GitHub
-    # --------------------------------------------------------
-
-    github_results = []
-
-    for url in github_urls[:3]:
-
-        github_results.append(
-            research_github(
-                url
-            )
-        )
-
-    # --------------------------------------------------------
-    # Research X
-    # --------------------------------------------------------
-
-    x_results = []
-
-    for url in x_urls[:2]:
-
-        x_results.append(
-            research_x(
-                url
-            )
-        )
-
-    # --------------------------------------------------------
-    # Evidence
-    # --------------------------------------------------------
-
-    evidence_data = build_evidence(
-        snapshot,
-        website_results,
-        github_results,
-        x_results,
-        discovered_links + docs_urls
-    )
-
-    lore_score = calculate_lore_score(
-        evidence_data,
-        website_results,
-        github_results,
-        x_results,
-        snapshot
-    )
-
-    result = {
-        "timestamp": now_ts(),
-        "address": address,
-        "websites": website_results,
-        "githubs": github_results,
-        "xs": x_results,
-        "docs_urls": docs_urls,
-        "discovered_links":
-            discovered_links,
-        "official_website":
-            evidence_data.get(
-                "official_website",
-                ""
-            ),
-        "evidence":
-            lore_score.get(
-                "evidence",
-                []
-            ),
-        "score":
-            lore_score[
-                "score"
-            ],
-        "confidence":
-            lore_score[
-                "confidence"
-            ],
-        "momentum":
-            lore_score[
-                "momentum"
-            ],
-        "evidence_count":
-            lore_score[
-                "evidence_count"
-            ],
-        "source_type_count":
-            lore_score[
-                "source_type_count"
-            ],
-        "origin_count":
-            lore_score[
-                "origin_count"
-            ],
-    }
-
-    LORE_CACHE[
-        address
-    ] = result
-
-    return result
-
-
-# ============================================================
-# LORE DECISION
-# ============================================================
-
-def lore_pass(
-    lore: Dict[str, Any]
-) -> bool:
-
-    return (
-        lore.get(
-            "score",
-            0
-        )
-        >= NORMAL_MIN_LORE_SCORE
-        and lore.get(
-            "evidence_count",
-            0
-        )
-        >= NORMAL_MIN_EVIDENCE
-        and lore.get(
-            "source_type_count",
-            0
-        )
-        >= NORMAL_MIN_SOURCE_TYPES
-    )
-
-
-def early_lore_pass(
-    lore: Dict[str, Any]
-) -> bool:
-
-    return (
-        lore.get(
-            "score",
-            0
-        )
-        >= EARLY_MIN_LORE_SCORE
-        and lore.get(
-            "confidence",
-            "UNKNOWN"
-        ) == "HIGH"
-        and lore.get(
-            "momentum",
-            "UNKNOWN"
-        ) == "HIGH"
-        and lore.get(
-            "evidence_count",
-            0
-        )
-        >= EARLY_MIN_EVIDENCE
-        and lore.get(
-            "source_type_count",
-            0
-        )
-        >= EARLY_MIN_SOURCE_TYPES
-    )
-
-
-# ============================================================
-# CLASSIFICATION
-# ============================================================
-
-def classify_token(
-    snapshot: Dict[str, Any],
-    observations: int,
-    score: int,
-    decay: int,
-    weakening: int,
-    lore: Optional[Dict[str, Any]]
-) -> str:
-
-    if decay >= 3:
-        return "WATCH"
-
-    if weakening >= 3:
-        return "WATCH"
-
-    # --------------------------------------------------------
-    # Early narrative runner
-    # --------------------------------------------------------
-
-    if (
-        early_market_candidate(
-            snapshot
-        )
-        and lore
-        and early_lore_pass(
-            lore
-        )
-    ):
-        return "EARLY NARRATIVE RUNNER"
-
-    # --------------------------------------------------------
-    # Ideal normal runner
-    # --------------------------------------------------------
-
-    if (
-        score >= IDEAL_SCORE
-        and snapshot[
-            "price_change_5m"
-        ] > 0
-        and snapshot[
-            "bs_ratio"
-        ] >= IDEAL_BS
-        and observations >= 3
-        and lore
-        and lore_pass(
-            lore
-        )
-    ):
-        return "IDEAL RUNNER"
-
-    # --------------------------------------------------------
-    # Normal runner
-    # --------------------------------------------------------
-
-    if (
-        score >= RUNNER_SCORE
-        and snapshot[
-            "price_change_5m"
-        ] > 0
-        and snapshot[
-            "bs_ratio"
-        ] >= RUNNER_BS
-        and observations >= 2
-        and lore
-        and lore_pass(
-            lore
-        )
-    ):
-        return "RUNNER"
-
-    return "WATCH"
-
-
-# ============================================================
-# ALERT MESSAGE
-# ============================================================
-
-def build_alert(
-    snapshot: Dict[str, Any],
-    score: int,
-    decay: int,
-    weakening: int,
-    lore: Dict[str, Any],
-    classification: str
-) -> str:
-
-    name = snapshot[
-        "name"
+    history = state[
+        "history"
     ]
 
-    symbol = snapshot[
-        "symbol"
-    ]
-
-    mc = snapshot[
-        "market_cap"
-    ]
-
-    liquidity = snapshot[
-        "liquidity"
-    ]
-
-    price = snapshot[
-        "price_change_5m"
-    ]
-
-    bs = snapshot[
-        "bs_ratio"
-    ]
-
-    tx = snapshot[
-        "tx_5m"
-    ]
-
-    volume_mc = snapshot[
-        "volume_mc"
-    ]
-
-    lore_score = lore.get(
-        "score",
-        0
+    evolution = analyze_evolution(
+        history
     )
 
-    confidence = lore.get(
-        "confidence",
-        "UNKNOWN"
-    )
-
-    momentum = lore.get(
-        "momentum",
-        "UNKNOWN"
-    )
-
-    evidence_count = lore.get(
-        "evidence_count",
-        0
-    )
-
-    source_count = lore.get(
-        "source_type_count",
-        0
-    )
-
-    pair_url = snapshot.get(
-        "pair_url",
-        ""
-    )
-
-    if classification == (
-        "EARLY NARRATIVE RUNNER"
-    ):
-        header = (
-            "🔥🔥 EARLY NARRATIVE RUNNER"
-        )
-
-    elif classification == (
-        "IDEAL RUNNER"
-    ):
-        header = (
-            "🚀 IDEAL RUNNER"
-        )
-
-    else:
-        header = (
-            "🔥 RUNNER"
-        )
-
-    lines = [
-        header,
-        "",
-        f"{name} (${symbol})",
-        "",
-        f"MC: ${mc:,.0f}",
-        f"Liquidity: ${liquidity:,.0f}",
-        f"5m Price: {price:+.2f}%",
-        f"5m B/S: {bs:.2f}",
-        f"5m TX: {tx:,}",
-        f"Vol/MC: {volume_mc:.1f}%",
-        "",
-        f"MARKET SCORE: {score}/100",
-        f"Decay: {decay}",
-        f"Weakening: {weakening}",
-        "",
-        "🧠 LORE / EVIDENCE",
-        f"Lore Score: {lore_score}/25",
-        f"Confidence: {confidence}",
-        f"Momentum: {momentum}",
-        f"Evidence: {evidence_count}",
-        f"Source Types: {source_count}",
-    ]
-
-    official = lore.get(
-        "official_website",
-        ""
-    )
-
-    if official:
-        lines.extend(
-            [
-                "",
-                f"Website: {official}",
-            ]
-        )
-
-    if pair_url:
-        lines.extend(
-            [
-                "",
-                f"DEX: {pair_url}",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            f"CA: {snapshot['address']}",
-            "",
-            "Evidence:",
-        ]
-    )
-
-    evidence = lore.get(
-        "evidence",
-        []
-    )
-
-    for item in evidence[:6]:
-
-        lines.append(
-            "✓ "
-            + clean_text(
-                item.get(
-                    "description",
-                    ""
-                )
-            )
-        )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================
-# TRACKING / PROCESSING
-# ============================================================
-
-def process_token(
-    token_address: str,
-    pair: Optional[Dict[str, Any]] = None
-) -> Optional[Dict[str, Any]]:
-
-    if pair is None:
-
-        pair = select_best_pair(
-            token_address
-        )
-
-    if not pair:
-        return None
-
-    snapshot = make_snapshot(
-        token_address,
-        pair
-    )
-
-    mc = snapshot[
-        "market_cap"
-    ]
-
-    liquidity = snapshot[
-        "liquidity"
-    ]
-
-    # --------------------------------------------------------
-    # Hard market boundaries
-    # --------------------------------------------------------
-
-    if mc < MIN_MC:
-        return None
-
-    if mc > MAX_MC:
-
-        # Continue tracking already discovered
-        # tokens, but never issue a new alert.
-        if token_address not in DISCOVERED_TOKENS:
-            return None
-
-    if liquidity < MIN_LIQUIDITY:
-        return None
-
-    previous = get_previous_snapshot(
-        token_address
-    )
-
-    decay = calculate_decay(
-        snapshot,
-        previous
-    )
-
-    weakening = calculate_weakening(
-        snapshot,
-        previous
-    )
-
-    add_history(
-        token_address,
-        snapshot
-    )
-
-    observations = len(
-        TOKEN_HISTORY.get(
-            token_address,
-            []
-        )
-    )
-
-    score = market_score(
-        snapshot,
-        observations,
-        decay,
-        weakening
-    )
-
-    # --------------------------------------------------------
-    # Lore is only researched when market behavior is
-    # interesting enough to justify it.
-    # --------------------------------------------------------
-
-    should_research_lore = (
-        early_market_candidate(
-            snapshot
-        )
-        or (
-            score >= 65
-            and snapshot[
-                "price_change_5m"
-            ] > 0
-            and snapshot[
-                "bs_ratio"
-            ] >= 1.10
-        )
-        or token_address in LORE_CACHE
-    )
-
-    lore = None
-
-    if should_research_lore:
-
-        print(
-            "[LORE] Researching "
-            f"{snapshot['name']} "
-            f"({token_address})..."
-        )
-
-        lore = research_lore(
-            snapshot
-        )
-
-        print(
-            "[LORE] "
-            f"{snapshot['name']} "
-            f"score={lore['score']}/25 "
-            f"confidence={lore['confidence']} "
-            f"momentum={lore['momentum']} "
-            f"evidence={lore['evidence_count']} "
-            f"sources={lore['source_type_count']}"
-        )
-
-    classification = classify_token(
-        snapshot,
-        observations,
-        score,
-        decay,
-        weakening,
-        lore
-    )
-
-    DISCOVERED_TOKENS[
-        token_address
-    ] = {
-        "address":
-            token_address,
-        "name":
-            snapshot["name"],
-        "symbol":
-            snapshot["symbol"],
-        "first_seen":
-            DISCOVERED_TOKENS.get(
-                token_address,
-                {}
-            ).get(
-                "first_seen",
-                now_ts()
-            ),
-        "last_seen":
-            now_ts(),
-        "last_market_cap":
-            mc,
-        "last_classification":
-            classification,
-        "last_score":
-            score,
-    }
-
-    # --------------------------------------------------------
-    # Alerts
-    # --------------------------------------------------------
-
-    previous_status = LAST_ALERT_STATUS.get(
-        token_address
-    )
-
-    should_alert = (
-        classification
-        in (
-            "EARLY NARRATIVE RUNNER",
-            "IDEAL RUNNER",
-            "RUNNER",
-        )
-        and previous_status
-        != classification
-        and mc <= MAX_MC
-    )
-
-    if should_alert:
-
-        if lore is None:
-
-            lore = research_lore(
-                snapshot
-            )
-
-        message = build_alert(
+    market_score = (
+        calculate_market_score(
             snapshot,
-            score,
-            decay,
-            weakening,
-            lore,
-            classification
+            history
         )
+    )
 
-        broadcast(
-            message
+    early = qualifies_early(
+        snapshot,
+        evolution,
+        history
+    )
+
+    runner = qualifies_runner(
+        snapshot,
+        evolution,
+        history,
+        market_score
+    )
+
+    # --------------------------------------------------------
+    # Console output
+    # --------------------------------------------------------
+
+    print(
+        f"[TOKEN] "
+        f"{snapshot['symbol']} "
+        f"| MC {fmt_money(snapshot['market_cap'])} "
+        f"| LIQ {fmt_money(snapshot['liquidity'])} "
+        f"| BS {fmt_ratio(snapshot['bs_ratio'])} "
+        f"| VOL/MC {snapshot['volume_mc']:.2f}% "
+        f"| TX {snapshot['tx_5m']} "
+        f"| P {snapshot['price_change_5m']:+.2f}% "
+        f"| SCORE {market_score} "
+        f"| TREND {evolution['trend']} "
+        f"| OBS {len(history)}"
+    )
+
+    # --------------------------------------------------------
+    # EARLY MARKET EVOLUTION SIGNAL
+    # --------------------------------------------------------
+
+    if (
+        early
+        and not alert_already_sent(
+            address,
+            "EARLY"
         )
-
-        LAST_ALERT_STATUS[
-            token_address
-        ] = classification
-
-        print(
-            "[ALERT] "
-            f"{snapshot['name']} "
-            f"-> {classification}"
-        )
-
-    return {
-        "snapshot": snapshot,
-        "score": score,
-        "decay": decay,
-        "weakening": weakening,
-        "observations": observations,
-        "classification": classification,
-        "lore": lore,
-    }
-
-
-# ============================================================
-# DISCOVERY RUN
-# ============================================================
-
-def run_discovery() -> None:
-
-    global LAST_DISCOVERY
-
-    print(
-        "[DISCOVERY] Scanning..."
-    )
-
-    addresses = get_discovery_candidates()
-
-    print(
-        "[DISCOVERY] Found "
-        f"{len(addresses)} Solana candidates"
-    )
-
-    qualified = 0
-    early_candidates = 0
-    lore_candidates = 0
-
-    for address in addresses:
-
-        try:
-
-            pair = select_best_pair(
-                address
-            )
-
-            if not pair:
-                continue
-
-            snapshot = make_snapshot(
-                address,
-                pair
-            )
-
-            if (
-                snapshot["market_cap"]
-                < MIN_MC
-                or snapshot["market_cap"]
-                > MAX_MC
-            ):
-                continue
-
-            if (
-                snapshot["liquidity"]
-                < MIN_LIQUIDITY
-            ):
-                continue
-
-            qualified += 1
-
-            if early_market_candidate(
-                snapshot
-            ):
-                early_candidates += 1
-
-            result = process_token(
-                address,
-                pair=pair
-            )
-
-            if result and result.get(
-                "lore"
-            ):
-                lore_candidates += 1
-
-        except Exception as exc:
-
-            print(
-                "[DISCOVERY ERROR] "
-                f"{address}: {exc}"
-            )
-
-    LAST_DISCOVERY = now_ts()
-
-    print(
-        "[DISCOVERY] Qualified: "
-        f"{qualified}"
-    )
-
-    print(
-        "[DISCOVERY] Early market "
-        f"candidates: {early_candidates}"
-    )
-
-    print(
-        "[DISCOVERY] Lore researched: "
-        f"{lore_candidates}"
-    )
-
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-def cleanup_tracking() -> None:
-
-    current = now_ts()
-
-    remove = []
-
-    for address, data in list(
-        DISCOVERED_TOKENS.items()
+        and can_alert(address)
     ):
 
-        last_seen = safe_int(
-            data.get(
-                "last_seen"
-            )
+        print(
+            f"[SIGNAL] EARLY "
+            f"{snapshot['symbol']}"
         )
 
-        alerted = (
-            address
-            in LAST_ALERT_STATUS
+        alert = build_alert(
+            snapshot,
+            evolution,
+            market_score,
+            "EARLY MARKET EVOLUTION",
+            history
         )
 
-        ttl = (
-            ALERT_TRACKING_TTL_SECONDS
-            if alerted
-            else TRACKING_TTL_SECONDS
+        send_alert_to_all(
+            alert
         )
 
-        if (
-            current - last_seen
-            > ttl
-        ):
-            remove.append(
-                address
-            )
-
-    for address in remove:
-
-        DISCOVERED_TOKENS.pop(
+        mark_alert(
             address,
-            None
+            "EARLY"
         )
 
-        TOKEN_HISTORY.pop(
+    # --------------------------------------------------------
+    # RUNNER SIGNAL
+    # --------------------------------------------------------
+
+    elif (
+        runner
+        and not alert_already_sent(
             address,
-            None
+            "RUNNER"
+        )
+        and can_alert(address)
+    ):
+
+        print(
+            f"[SIGNAL] RUNNER "
+            f"{snapshot['symbol']}"
         )
 
-        LAST_ALERT_STATUS.pop(
+        alert = build_alert(
+            snapshot,
+            evolution,
+            market_score,
+            "RUNNER CONFIRMED",
+            history
+        )
+
+        send_alert_to_all(
+            alert
+        )
+
+        mark_alert(
             address,
-            None
-        )
-
-        LORE_CACHE.pop(
-            address,
-            None
+            "RUNNER"
         )
 
 
-def run_tracking() -> None:
+# ============================================================
+# DISCOVERY CYCLE
+# ============================================================
 
-    addresses = list(
-        DISCOVERED_TOKENS.keys()
+def discovery_cycle() -> None:
+
+    print(
+        "\n[DISCOVERY] Scanning..."
+    )
+
+    addresses = (
+        discover_token_addresses()
+    )
+
+    print(
+        f"[DISCOVERY] Found "
+        f"{len(addresses)} Solana token addresses"
     )
 
     if not addresses:
         return
 
-    print(
-        "[TRACKING] Tracking "
-        f"{len(addresses)} tokens"
+    pairs = get_token_pairs(
+        addresses
     )
 
-    for address in addresses:
+    print(
+        f"[DISCOVERY] Received "
+        f"{len(pairs)} Solana pairs"
+    )
 
-        try:
+    # Group pairs by base token.
+    grouped: Dict[
+        str,
+        List[Dict[str, Any]]
+    ] = {}
 
-            result = process_token(
+    for pair in pairs:
+
+        base = pair.get(
+            "baseToken",
+            {}
+        )
+
+        address = base.get(
+            "address"
+        )
+
+        if not address:
+            continue
+
+        grouped.setdefault(
+            address,
+            []
+        ).append(pair)
+
+    processed = 0
+
+    for address, token_pairs in (
+        grouped.items()
+    ):
+
+        pair = select_best_pair(
+            token_pairs,
+            address
+        )
+
+        if not pair:
+            continue
+
+        snapshot = build_snapshot(
+            pair
+        )
+
+        if not snapshot:
+            continue
+
+        # Broad intake:
+        # we do NOT require the token to
+        # qualify before tracking it.
+        process_snapshot(
+            snapshot
+        )
+
+        processed += 1
+
+    print(
+        f"[DISCOVERY] Processed "
+        f"{processed} tokens"
+    )
+
+    save_state()
+
+
+# ============================================================
+# TRACKING CYCLE
+# ============================================================
+
+def tracked_token_addresses() -> List[str]:
+
+    addresses = []
+
+    for address, state in STATE.get(
+        "tokens",
+        {}
+    ).items():
+
+        history = state.get(
+            "history",
+            []
+        )
+
+        if not history:
+            continue
+
+        # Track recently active tokens.
+        last_seen = safe_int(
+            state.get("last_seen")
+        )
+
+        if (
+            now_ts() - last_seen
+            <= 6 * 60 * 60
+        ):
+
+            addresses.append(
                 address
             )
 
-            if result:
+    return addresses
 
-                print(
-                    "[TRACKING] "
-                    f"{result['snapshot']['symbol']} "
-                    f"MC=${result['snapshot']['market_cap']:,.0f} "
-                    f"score={result['score']} "
-                    f"status={result['classification']}"
-                )
 
-        except Exception as exc:
+def tracking_cycle() -> None:
 
-            print(
-                "[TRACKING ERROR] "
-                f"{address}: {exc}"
-            )
+    addresses = (
+        tracked_token_addresses()
+    )
 
-    cleanup_tracking()
+    if not addresses:
+        return
+
+    # Same verified batch endpoint.
+    pairs = get_token_pairs(
+        addresses
+    )
+
+    grouped: Dict[
+        str,
+        List[Dict[str, Any]]
+    ] = {}
+
+    for pair in pairs:
+
+        base = pair.get(
+            "baseToken",
+            {}
+        )
+
+        address = base.get(
+            "address"
+        )
+
+        if address:
+            grouped.setdefault(
+                address,
+                []
+            ).append(pair)
+
+    for address in addresses:
+
+        token_pairs = grouped.get(
+            address,
+            []
+        )
+
+        if not token_pairs:
+            continue
+
+        pair = select_best_pair(
+            token_pairs,
+            address
+        )
+
+        if not pair:
+            continue
+
+        snapshot = build_snapshot(
+            pair
+        )
+
+        if not snapshot:
+            continue
+
+        process_snapshot(
+            snapshot
+        )
+
+    save_state()
 
 
 # ============================================================
-# STARTUP TESTS
+# CLEANUP
 # ============================================================
 
-def test_telegram() -> bool:
+def cleanup_old_tokens() -> None:
 
-    print(
-        "[STARTUP] Testing Telegram..."
-    )
-
-    result = telegram_api(
-        "getMe"
-    )
-
-    if not isinstance(
-        result,
-        dict
-    ):
-        return False
-
-    if not result.get(
-        "ok"
-    ):
-        return False
-
-    bot = result.get(
-        "result",
+    tokens = STATE.get(
+        "tokens",
         {}
     )
 
-    print(
-        "[TELEGRAM] Connected @"
-        f"{bot.get('username', 'unknown')}"
+    cutoff = (
+        now_ts()
+        - 12 * 60 * 60
     )
 
-    return True
+    remove = []
 
+    for address, state in tokens.items():
 
-def test_dexscreener() -> bool:
+        last_seen = safe_int(
+            state.get("last_seen")
+        )
 
-    print(
-        "[STARTUP] Testing DexScreener..."
-    )
+        if (
+            last_seen > 0
+            and last_seen < cutoff
+        ):
 
-    url = (
-        f"{DEX_BASE}"
-        f"/token-profiles/latest/v1"
-    )
+            history = state.get(
+                "history",
+                []
+            )
 
-    data = http_get_json(
-        url
-    )
+            # Keep tokens that generated
+            # an alert longer.
+            if state.get("alerts"):
+                continue
 
-    if not isinstance(
-        data,
-        list
-    ):
-        return False
+            if len(history) < 2:
+                remove.append(address)
 
-    print(
-        "[DEXSCREENER] Connected"
-    )
+    for address in remove:
 
-    return True
+        tokens.pop(
+            address,
+            None
+        )
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
-def main() -> None:
+def startup() -> None:
 
-    print(
-        "=" * 68
-    )
-
+    print("=" * 68)
     print(
         f"RUNNER BOT {BOT_VERSION}"
     )
-
-    print(
-        "=" * 68
-    )
+    print("=" * 68)
 
     print(
         f"CHAIN: {CHAIN}"
     )
 
     print(
-        f"MC RANGE: "
-        f"${MIN_MC:,}-${MAX_MC:,}"
+        f"MARKET RANGE: "
+        f"${MIN_MC:,} - "
+        f"${MAX_SIGNAL_MC:,}"
     )
 
     print(
         f"EARLY RANGE: "
-        f"${EARLY_MIN_MC:,}-${EARLY_MAX_MC:,}"
+        f"${MIN_MC:,} - "
+        f"${EARLY_MAX_MC:,}"
     )
 
     print(
@@ -3683,196 +1877,188 @@ def main() -> None:
     )
 
     print(
-        f"EARLY MIN LIQUIDITY: "
-        f"${EARLY_MIN_LIQUIDITY:,}"
+        f"CURRENT B/S: "
+        f"{MIN_CURRENT_BS}"
+    )
+
+    print(
+        f"PREVIOUS B/S: "
+        f"{MIN_PREVIOUS_BS}"
+    )
+
+    print(
+        f"5m PRICE: "
+        f"+{MIN_PRICE_CHANGE}% "
+        f"to +{MAX_PRICE_CHANGE}%"
+    )
+
+    print(
+        f"VOLUME/MC: "
+        f"{MIN_VOLUME_MC}%+"
+    )
+
+    print(
+        f"5m TX: "
+        f"{MIN_TX}+"
+    )
+
+    print(
+        f"OBSERVATIONS REQUIRED: "
+        f"{MIN_OBSERVATIONS}"
+    )
+
+    print(
+        f"IMPROVING STEPS REQUIRED: "
+        f"{MIN_IMPROVING_STEPS}"
+    )
+
+    print(
+        f"IMPROVING METRICS REQUIRED: "
+        f"{MIN_IMPROVING_METRICS}"
     )
 
     print(
         f"SCAN INTERVAL: "
-        f"{SCAN_INTERVAL_SECONDS}s"
+        f"{SCAN_INTERVAL}s"
     )
 
     print(
         f"DISCOVERY INTERVAL: "
-        f"{DISCOVERY_INTERVAL_SECONDS}s"
+        f"{DISCOVERY_INTERVAL}s"
     )
 
     print(
-        f"RUNNER SCORE: "
-        f"{RUNNER_SCORE}"
+        f"TELEGRAM TOKEN: "
+        f"{'CONFIGURED' if TELEGRAM_TOKEN else 'NOT CONFIGURED'}"
     )
 
     print(
-        f"IDEAL SCORE: "
-        f"{IDEAL_SCORE}"
+        "LORE ENGINE: DISABLED"
     )
 
     print(
-        f"EARLY LORE SCORE: "
-        f"{EARLY_MIN_LORE_SCORE}/25"
+        "X / TWITTER: NOT USED"
     )
 
     print(
-        f"X API: "
-        f"{'CONFIGURED' if X_BEARER_TOKEN else 'NOT CONFIGURED'}"
+        "GITHUB RESEARCH: NOT USED"
     )
 
     print(
-        f"LORE AI: "
-        f"{'CONFIGURED' if LORE_AI_API_KEY else 'NOT CONFIGURED'}"
+        "AI RESEARCH: NOT USED"
     )
+
+    print("=" * 68)
+
+    telegram_startup_test()
 
     print(
-        "TELEGRAM TOKEN: "
-        f"{'CONFIGURED' if TELEGRAM_BOT_TOKEN else 'MISSING'}"
+        "[STARTUP] Testing DexScreener..."
     )
 
-    print(
-        "=" * 68
+    addresses = (
+        discover_token_addresses()
     )
 
-    if not TELEGRAM_BOT_TOKEN:
-
+    if addresses:
         print(
-            "[FATAL] TELEGRAM_BOT_TOKEN missing."
+            "[DEXSCREENER] Connected"
+        )
+        print(
+            f"[DEXSCREENER] Initial "
+            f"candidates: {len(addresses)}"
         )
 
-        return
-
-    if not test_telegram():
-
+    else:
         print(
-            "[FATAL] Telegram test failed."
+            "[DEXSCREENER] No candidates "
+            "returned"
         )
-
-        return
-
-    if not test_dexscreener():
-
-        print(
-            "[FATAL] DexScreener test failed."
-        )
-
-        return
-
-    initial = get_discovery_candidates()
-
-    print(
-        "[STARTUP] Initial candidates: "
-        f"{len(initial)}"
-    )
 
     print(
         "[STARTUP] Scanner running."
     )
 
-    telegram_offset = None
 
-    last_tracking = 0.0
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-    # --------------------------------------------------------
-    # Initial discovery
-    # --------------------------------------------------------
+def main() -> None:
 
-    try:
+    load_state()
 
-        run_discovery()
+    startup()
 
-    except Exception as exc:
-
-        print(
-            "[INITIAL DISCOVERY ERROR] "
-            f"{exc}"
-        )
-
-    # --------------------------------------------------------
-    # Main loop
-    # --------------------------------------------------------
+    last_discovery = 0
+    last_cleanup = 0
 
     while True:
 
-        loop_start = time.time()
-
         try:
 
-            updates, telegram_offset = (
-                telegram_poll(
-                    telegram_offset
-                )
+            telegram_poll()
+
+            current = now_ts()
+
+            # ------------------------------------------------
+            # Full discovery
+            # ------------------------------------------------
+
+            if (
+                current - last_discovery
+                >= DISCOVERY_INTERVAL
+            ):
+
+                discovery_cycle()
+
+                last_discovery = current
+
+            else:
+
+                # ------------------------------------------------
+                # Existing-token monitoring
+                # ------------------------------------------------
+
+                tracking_cycle()
+
+            # ------------------------------------------------
+            # Cleanup
+            # ------------------------------------------------
+
+            if (
+                current - last_cleanup
+                >= 15 * 60
+            ):
+
+                cleanup_old_tokens()
+
+                save_state()
+
+                last_cleanup = current
+
+            time.sleep(
+                SCAN_INTERVAL
             )
 
-            if updates:
-
-                handle_telegram_updates(
-                    updates
-                )
-
-            # ------------------------------------------------
-            # Discovery
-            # ------------------------------------------------
-
-            if (
-                now_ts()
-                - LAST_DISCOVERY
-                >= DISCOVERY_INTERVAL_SECONDS
-            ):
-
-                run_discovery()
-
-            # ------------------------------------------------
-            # Tracking
-            # ------------------------------------------------
-
-            if (
-                time.time()
-                - last_tracking
-                >= SCAN_INTERVAL_SECONDS
-            ):
-
-                run_tracking()
-
-                last_tracking = (
-                    time.time()
-                )
-
-        except Exception as exc:
+        except KeyboardInterrupt:
 
             print(
-                "[MAIN ERROR] "
-                f"{exc}"
+                "\n[STOP] Runner Bot stopped."
             )
 
-        elapsed = (
-            time.time()
-            - loop_start
-        )
+            save_state()
 
-        sleep_for = max(
-            1,
-            SCAN_INTERVAL_SECONDS
-            - int(elapsed)
-        )
+            break
 
-        time.sleep(
-            sleep_for
-        )
+        except Exception as e:
+
+            print(
+                f"[MAIN ERROR] {e}"
+            )
+
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except KeyboardInterrupt:
-
-        print(
-            "\n[SHUTDOWN] Bot stopped."
-        )
-
-    except Exception as exc:
-
-        print(
-            "[FATAL ERROR] "
-            f"{exc}"
-        )
+    main()
