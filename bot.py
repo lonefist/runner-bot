@@ -1561,5 +1561,86 @@ def research_lore(token):
 
         print("[LORE AI]")
         print("STATUS: NOT RUN")
+
+        reason = (
+            sources.get("error")
+            or "INSUFFICIENT_CREDIBLE_EVIDENCE"
+        )
+
         print(
-           
+            f"REASON: {reason}"
+        )
+
+        return {
+            "lore_score": 0,
+            "confidence": "LOW",
+            "momentum": "LOW",
+            "status": "UNKNOWN",
+            "narrative": "",
+            "evidence": [],
+            "red_flags": [
+                "Insufficient independent evidence"
+            ],
+            "sources": sources,
+            "ai_status": "NOT RUN",
+        }
+
+    # --------------------------------------------------------
+    # LORE AI
+    # --------------------------------------------------------
+
+    ai = lore_ai_request(
+        token,
+        sources,
+    )
+
+    print("[LORE AI]")
+
+    print(
+        f"STATUS: {ai.get('status', 'UNKNOWN')}"
+    )
+
+    if ai.get("error"):
+        print(
+            f"ERROR: {ai['error']}"
+        )
+
+    # --------------------------------------------------------
+    # AI FAILED / NOT CONFIGURED
+    # --------------------------------------------------------
+
+    if ai.get("status") != "OK":
+
+        return {
+            "lore_score": 0,
+            "confidence": "LOW",
+            "momentum": "LOW",
+            "status": "UNKNOWN",
+            "narrative": "",
+            "evidence": [],
+            "red_flags": [
+                ai.get(
+                    "error",
+                    "Lore AI failed",
+                )
+            ],
+            "sources": sources,
+            "ai_status": ai.get(
+                "status",
+                "UNKNOWN",
+            ),
+        }
+
+    # --------------------------------------------------------
+    # NORMALIZE AI RESULT
+    # --------------------------------------------------------
+
+    result = normalize_lore_result(
+        ai.get("result"),
+        sources,
+    )
+
+    result["sources"] = sources
+    result["ai_status"] = "OK"
+
+    return result
