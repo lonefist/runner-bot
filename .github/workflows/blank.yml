@@ -25,12 +25,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Check Python syntax
+        run: |
+          python3 -m py_compile bot.py
 
       - name: Run Runner Bot
         run: |
