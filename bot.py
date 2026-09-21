@@ -11,12 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
-# RUNNER BOT V1.4
+# RUNNER BOT V1.4.1
 # LOW-CAP FIRST + CONTROLLED MOMENTUM + DECAY FILTER
 # + CONSECUTIVE WEAKENING + LORE / NARRATIVE VERIFICATION
+# + FULL LORE DIAGNOSTICS
 # ============================================================
 
-BOT_VERSION = "V1.4-LOW-CAP-LORE"
+BOT_VERSION = "V1.4.1-LOW-CAP-LORE-DIAGNOSTICS"
 
 DEX_BASE = "https://api.dexscreener.com"
 TELEGRAM_BASE = "https://api.telegram.org"
@@ -42,10 +43,7 @@ SCAN_INTERVAL = 20
 DISCOVERY_INTERVAL = 300
 VALIDATION_INTERVAL = 300
 
-# Normal WATCH tracking
 TRACKING_HOURS = 8
-
-# Tokens that actually alerted get longer tracking
 ALERT_TRACKING_HOURS = 48
 
 MAX_DISCOVERY_CANDIDATES = 50
@@ -87,14 +85,14 @@ LORE_MAX_WEBSITE_CHARS = 12_000
 
 LORE_AI_TIMEOUT = 45
 
-# These are intentionally environment variables.
-# DO NOT hard-code API keys in GitHub.
 LORE_AI_BASE_URL = os.getenv(
     "LORE_AI_BASE_URL",
     ""
 ).rstrip("/")
 
-LORE_AI_MODEL = os.getenv("LORE_AI_MODEL", "")
+LORE_AI_MODEL = os.getenv(
+    "LORE_AI_MODEL",
+    "")
 
 
 # ============================================================
@@ -113,18 +111,31 @@ def http_json(
     req = urllib.request.Request(
         url,
         headers=headers or {
-            "User-Agent": "RunnerBot/1.4"
+            "User-Agent": "RunnerBot/1.4.1"
         },
         method="GET"
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="ignore")
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout
+        ) as response:
+
+            raw = response.read().decode(
+                "utf-8",
+                errors="ignore"
+            )
+
             return json.loads(raw)
 
     except Exception as e:
-        print(f"[HTTP JSON ERROR] {url} -> {e}")
+
+        print(
+            f"[HTTP JSON ERROR] "
+            f"{url} -> {e}"
+        )
+
         return None
 
 
@@ -137,20 +148,32 @@ def http_text(
     req = urllib.request.Request(
         url,
         headers=headers or {
-            "User-Agent": "Mozilla/5.0 RunnerBot/1.4"
+            "User-Agent": (
+                "Mozilla/5.0 RunnerBot/1.4.1"
+            )
         },
         method="GET"
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout
+        ) as response:
+
             return response.read().decode(
                 "utf-8",
                 errors="ignore"
             )
 
     except Exception as e:
-        print(f"[HTTP TEXT ERROR] {url} -> {e}")
+
+        print(
+            f"[HTTP TEXT ERROR] "
+            f"{url} -> {e}"
+        )
+
         return None
 
 
@@ -161,15 +184,19 @@ def http_post_json(
     timeout: int = HTTP_TIMEOUT
 ) -> Optional[Any]:
 
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps(
+        payload
+    ).encode("utf-8")
 
     final_headers = {
         "Content-Type": "application/json",
-        "User-Agent": "RunnerBot/1.4"
+        "User-Agent": "RunnerBot/1.4.1"
     }
 
     if headers:
-        final_headers.update(headers)
+        final_headers.update(
+            headers
+        )
 
     req = urllib.request.Request(
         url,
@@ -179,32 +206,45 @@ def http_post_json(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout
+        ) as response:
+
             raw = response.read().decode(
                 "utf-8",
                 errors="ignore"
             )
+
             return json.loads(raw)
 
     except urllib.error.HTTPError as e:
 
         try:
-            body = e.read().decode(
+            error_body = e.read().decode(
                 "utf-8",
                 errors="ignore"
             )
         except Exception:
-            body = ""
+            error_body = ""
 
         print(
-            f"[HTTP POST ERROR] {url} "
-            f"status={e.code} body={body[:500]}"
+            f"[HTTP POST ERROR] "
+            f"{url} "
+            f"status={e.code} "
+            f"body={error_body[:500]}"
         )
 
         return None
 
     except Exception as e:
-        print(f"[HTTP POST ERROR] {url} -> {e}")
+
+        print(
+            f"[HTTP POST ERROR] "
+            f"{url} -> {e}"
+        )
+
         return None
 
 
@@ -217,16 +257,22 @@ def now_ts() -> int:
 
 
 def iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def money(value: float) -> str:
 
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+        return (
+            f"${value / 1_000_000:.2f}M"
+        )
 
     if value >= 1_000:
-        return f"${value / 1_000:.1f}K"
+        return (
+            f"${value / 1_000:.1f}K"
+        )
 
     return f"${value:.0f}"
 
@@ -235,8 +281,33 @@ def pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+def clamp(
+    value: float,
+    low: float,
+    high: float
+) -> float:
+
+    return max(
+        low,
+        min(high, value)
+    )
+
+
+def safe_float(
+    value: Any,
+    default: float = 0.0
+) -> float:
+
+    try:
+
+        if value is None:
+            return default
+
+        return float(value)
+
+    except Exception:
+
+        return default
 
 
 # ============================================================
@@ -252,26 +323,49 @@ DEFAULT_STATE = {
 }
 
 
-def load_json_file(path: str, default: Any) -> Any:
+def load_json_file(
+    path: str,
+    default: Any
+) -> Any:
 
     if not os.path.exists(path):
         return default
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
     except Exception as e:
-        print(f"[STATE ERROR] Could not load {path}: {e}")
+
+        print(
+            f"[STATE ERROR] "
+            f"Could not load {path}: {e}"
+        )
+
         return default
 
 
-def save_json_file(path: str, data: Any) -> None:
+def save_json_file(
+    path: str,
+    data: Any
+) -> None:
 
     temp = path + ".tmp"
 
     try:
-        with open(temp, "w", encoding="utf-8") as f:
+
+        with open(
+            temp,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
             json.dump(
                 data,
                 f,
@@ -279,10 +373,17 @@ def save_json_file(path: str, data: Any) -> None:
                 ensure_ascii=False
             )
 
-        os.replace(temp, path)
+        os.replace(
+            temp,
+            path
+        )
 
     except Exception as e:
-        print(f"[SAVE ERROR] {path}: {e}")
+
+        print(
+            f"[SAVE ERROR] "
+            f"{path}: {e}"
+        )
 
 
 state = load_json_file(
@@ -300,21 +401,48 @@ def ensure_state_structure() -> None:
 
     global state
 
-    if not isinstance(state, dict):
+    if not isinstance(
+        state,
+        dict
+    ):
+
         state = DEFAULT_STATE.copy()
 
-    state.setdefault("subscribers", [])
-    state.setdefault("tracking", {})
-    state.setdefault("last_discovery", 0)
-    state.setdefault("last_validation", 0)
-    state.setdefault("telegram_offset", 0)
+    state.setdefault(
+        "subscribers",
+        []
+    )
+
+    state.setdefault(
+        "tracking",
+        {}
+    )
+
+    state.setdefault(
+        "last_discovery",
+        0
+    )
+
+    state.setdefault(
+        "last_validation",
+        0
+    )
+
+    state.setdefault(
+        "telegram_offset",
+        0
+    )
 
 
 ensure_state_structure()
 
 
 def save_state() -> None:
-    save_json_file(STATE_FILE, state)
+
+    save_json_file(
+        STATE_FILE,
+        state
+    )
 
 
 def save_history() -> None:
@@ -324,10 +452,16 @@ def save_history() -> None:
     if len(history) > 20_000:
         history = history[-20_000:]
 
-    save_json_file(HISTORY_FILE, history)
+    save_json_file(
+        HISTORY_FILE,
+        history
+    )
 
 
-def log_event(event: str, data: Dict[str, Any]) -> None:
+def log_event(
+    event: str,
+    data: Dict[str, Any]
+) -> None:
 
     history.append({
         "time": iso_now(),
@@ -351,8 +485,14 @@ TELEGRAM_TOKEN = os.getenv(
 )
 
 
-def telegram_url(method: str) -> str:
-    return f"{TELEGRAM_BASE}/bot{TELEGRAM_TOKEN}/{method}"
+def telegram_url(
+    method: str
+) -> str:
+
+    return (
+        f"{TELEGRAM_BASE}/bot"
+        f"{TELEGRAM_TOKEN}/{method}"
+    )
 
 
 def telegram_call(
@@ -384,27 +524,36 @@ def telegram_send(
     )
 
     return bool(
-        result and result.get("ok")
+        result
+        and result.get("ok")
     )
 
 
-def telegram_broadcast(text: str) -> None:
+def telegram_broadcast(
+    text: str
+) -> None:
 
     subscribers = list(
-        state.get("subscribers", [])
+        state.get(
+            "subscribers",
+            []
+        )
     )
 
     for chat_id in subscribers:
 
         try:
+
             telegram_send(
                 int(chat_id),
                 text
             )
 
         except Exception as e:
+
             print(
-                f"[TELEGRAM ERROR] {chat_id}: {e}"
+                f"[TELEGRAM ERROR] "
+                f"{chat_id}: {e}"
             )
 
 
@@ -418,22 +567,21 @@ def telegram_poll() -> None:
         0
     )
 
-    url = telegram_url(
-        "getUpdates"
-    )
-
-    payload = {
-        "timeout": 1,
-        "offset": offset
-    }
-
     result = http_post_json(
-        url,
-        payload,
+        telegram_url(
+            "getUpdates"
+        ),
+        {
+            "timeout": 1,
+            "offset": offset
+        },
         timeout=5
     )
 
-    if not result or not result.get("ok"):
+    if not result:
+        return
+
+    if not result.get("ok"):
         return
 
     updates = result.get(
@@ -448,9 +596,10 @@ def telegram_poll() -> None:
         )
 
         if update_id is not None:
-            state["telegram_offset"] = (
-                update_id + 1
-            )
+
+            state[
+                "telegram_offset"
+            ] = update_id + 1
 
         message = update.get(
             "message"
@@ -482,17 +631,21 @@ def telegram_poll() -> None:
 
         if text.startswith("/start"):
 
-            if chat_id not in state["subscribers"]:
-                state["subscribers"].append(
-                    chat_id
-                )
+            if chat_id not in state[
+                "subscribers"
+            ]:
+
+                state[
+                    "subscribers"
+                ].append(chat_id)
 
             telegram_send(
                 chat_id,
                 (
-                    "🚀 Runner Bot V1.4 online.\n\n"
+                    "🚀 Runner Bot V1.4.1 online.\n\n"
                     "Market + decay + persistence + "
-                    "lore verification active."
+                    "lore verification + lore diagnostics "
+                    "active."
                 )
             )
 
@@ -500,10 +653,13 @@ def telegram_poll() -> None:
 
         elif text.startswith("/stop"):
 
-            if chat_id in state["subscribers"]:
-                state["subscribers"].remove(
-                    chat_id
-                )
+            if chat_id in state[
+                "subscribers"
+            ]:
+
+                state[
+                    "subscribers"
+                ].remove(chat_id)
 
             telegram_send(
                 chat_id,
@@ -597,12 +753,14 @@ def history_text() -> str:
 # DEXSCREENER
 # ============================================================
 
-def dex_get(path: str) -> Optional[Any]:
+def dex_get(
+    path: str
+) -> Optional[Any]:
 
     return http_json(
         DEX_BASE + path,
         headers={
-            "User-Agent": "RunnerBot/1.4"
+            "User-Agent": "RunnerBot/1.4.1"
         }
     )
 
@@ -627,23 +785,25 @@ def choose_best_pair(
         ):
             continue
 
-        if pair.get("chainId") != CHAIN:
+        if pair.get(
+            "chainId"
+        ) != CHAIN:
             continue
 
         liquidity = (
-            pair.get("liquidity", {})
+            pair.get(
+                "liquidity",
+                {}
+            )
             or {}
         )
 
-        try:
-            liq = float(
-                liquidity.get(
-                    "usd",
-                    0
-                ) or 0
+        liq = safe_float(
+            liquidity.get(
+                "usd",
+                0
             )
-        except Exception:
-            liq = 0
+        )
 
         solana_pairs.append(
             (liq, pair)
@@ -672,22 +832,9 @@ def token_pairs(
     if not data:
         return None
 
-    return choose_best_pair(data)
-
-
-def safe_float(
-    value: Any,
-    default: float = 0.0
-) -> float:
-
-    try:
-        if value is None:
-            return default
-
-        return float(value)
-
-    except Exception:
-        return default
+    return choose_best_pair(
+        data
+    )
 
 
 def extract_socials(
@@ -741,8 +888,12 @@ def extract_socials(
             ).strip()
 
             if platform:
-                result[platform] = (
-                    handle or url
+
+                result[
+                    platform
+                ] = (
+                    handle
+                    or url
                 )
 
     return result
@@ -799,7 +950,9 @@ def extract_websites(
                     )
 
     return list(
-        dict.fromkeys(result)
+        dict.fromkeys(
+            result
+        )
     )
 
 
@@ -828,6 +981,7 @@ def extract_x_handle(
             return value[1:]
 
         if "x.com/" in value:
+
             return value.split(
                 "x.com/",
                 1
@@ -837,6 +991,7 @@ def extract_x_handle(
             )[0].strip()
 
         if "twitter.com/" in value:
+
             return value.split(
                 "twitter.com/",
                 1
@@ -946,6 +1101,7 @@ def snapshot_from_pair(
     )
 
     if mc <= 0:
+
         mc = safe_float(
             pair.get(
                 "fdv",
@@ -1016,6 +1172,25 @@ def snapshot_from_pair(
         )
     ).strip()
 
+    pair_created = safe_float(
+        pair.get(
+            "pairCreatedAt",
+            0
+        )
+    )
+
+    pair_age_hours = 0
+
+    if pair_created > 0:
+
+        pair_age_hours = (
+            (
+                now_ts()
+                - pair_created / 1000
+            )
+            / 3600
+        )
+
     return {
         "timestamp": now_ts(),
         "time": iso_now(),
@@ -1038,21 +1213,7 @@ def snapshot_from_pair(
         "volume_mc": volume_mc,
         "liquidity_mc": liquidity_mc,
 
-        "pair_age_hours": (
-            (
-                now_ts()
-                - safe_float(
-                    pair.get(
-                        "pairCreatedAt",
-                        0
-                    )
-                ) / 1000
-            ) / 3600
-            if pair.get(
-                "pairCreatedAt"
-            )
-            else 0
-        ),
+        "pair_age_hours": pair_age_hours,
 
         "pair_address": pair.get(
             "pairAddress",
@@ -1086,6 +1247,7 @@ def compare_snapshots(
 ) -> Dict[str, float]:
 
     if not previous:
+
         return {
             "mc": 0,
             "liquidity": 0,
@@ -1185,6 +1347,7 @@ def score_directional_buying(
         volume_mc >= 20
         and price <= -15
     ):
+
         score -= 8
 
     return clamp(
@@ -1233,12 +1396,14 @@ def score_price_momentum(
         and volume_mc >= 15
         and bs >= 1.2
     ):
+
         score += 1
 
     if (
         price > 60
         and volume_mc >= 50
     ):
+
         score -= 2
 
     return clamp(
@@ -1276,6 +1441,7 @@ def score_volume_quality(
 
     if price > 0 and bs >= 1.5:
         score += 6
+
     elif price > 0 and bs >= 1:
         score += 3
 
@@ -1283,8 +1449,11 @@ def score_volume_quality(
         price < 0
         and volume_mc >= 20
     ):
+
         score -= 12
+
     elif price < 0:
+
         score -= 5
 
     if tx < 20:
@@ -1333,11 +1502,13 @@ def score_structure(
     if delta["liquidity"] >= (
         snap["liquidity"] * 0.05
     ):
+
         score += 2
 
     if delta["liquidity"] < (
         -snap["liquidity"] * 0.10
     ):
+
         score -= 3
 
     return clamp(
@@ -1390,6 +1561,7 @@ def score_persistence(
 
         if aligned == 2:
             score = 10
+
         elif aligned == 1:
             score = 4
 
@@ -1397,8 +1569,10 @@ def score_persistence(
 
         if aligned == 3:
             score = 15
+
         elif aligned == 2:
             score = 10
+
         elif aligned == 1:
             score = 4
 
@@ -1466,6 +1640,7 @@ def market_score(
     )
 
     if hard_warning:
+
         total = min(
             total,
             45
@@ -1493,21 +1668,23 @@ def decay_warnings(
 
     warnings = []
 
-    # This protection is specifically for low caps.
     if snap["mc"] >= DECAY_MC_CUTOFF:
         return warnings
 
     if snap["price_5m"] <= 0:
+
         warnings.append(
             "5m price <= 0"
         )
 
     if snap["bs"] < DECAY_BS_MIN:
+
         warnings.append(
             "B/S < 1.20"
         )
 
     if snap["tx_5m"] < DECAY_TX_MIN:
+
         warnings.append(
             "5m transactions < 20"
         )
@@ -1516,6 +1693,7 @@ def decay_warnings(
         snap["volume_mc"] >= DECAY_VOLUME_MC
         and snap["price_5m"] < 0
     ):
+
         warnings.append(
             "high volume + falling price"
         )
@@ -1583,23 +1761,18 @@ def observation_is_weakening(
 
     weakened = 0
 
-    # Buying pressure
     if current["bs"] < previous["bs"]:
         weakened += 1
 
-    # Price momentum
     if current["price_5m"] < previous["price_5m"]:
         weakened += 1
 
-    # Volume participation
     if current["volume_mc"] < previous["volume_mc"]:
         weakened += 1
 
-    # Transaction activity
     if current["tx_5m"] < previous["tx_5m"]:
         weakened += 1
 
-    # Liquidity
     if current["liquidity"] < previous["liquidity"]:
         weakened += 1
 
@@ -1686,6 +1859,7 @@ def classify_market(
             >= MIN_OBSERVATIONS_IDEAL
             and current["bs"] >= 1.5
         ):
+
             return "IDEAL RUNNER"
 
     if (
@@ -1693,6 +1867,7 @@ def classify_market(
         and current["bs"] >= 1.2
         and current["price_5m"] > 0
     ):
+
         return "RUNNER"
 
     return "WATCH"
@@ -1741,9 +1916,11 @@ def extract_addresses(
             )
 
             if address:
+
                 addresses.append(
                     str(address)
                 )
+
                 break
 
     return addresses
@@ -1760,6 +1937,7 @@ def discovery_priority(
         <= mc
         <= PRIMARY_MAX_MC
     ):
+
         zone = 2
 
     elif (
@@ -1767,9 +1945,11 @@ def discovery_priority(
         < mc
         <= MAX_MC
     ):
+
         zone = 1
 
     else:
+
         zone = 0
 
     return (
@@ -1801,14 +1981,18 @@ def discovery_cycle() -> None:
 
     for endpoint in DISCOVERY_ENDPOINTS:
 
-        data = dex_get(endpoint)
+        data = dex_get(
+            endpoint
+        )
 
         addresses.extend(
             extract_addresses(data)
         )
 
     addresses = list(
-        dict.fromkeys(addresses)
+        dict.fromkeys(
+            addresses
+        )
     )
 
     print(
@@ -1851,6 +2035,7 @@ def discovery_cycle() -> None:
             if len(candidates) >= (
                 MAX_DISCOVERY_CANDIDATES
             ):
+
                 break
 
         except Exception as e:
@@ -1891,13 +2076,11 @@ def discovery_cycle() -> None:
     )
 
     print(
-        f"[PRIMARY] "
-        f"{primary}"
+        f"[PRIMARY] {primary}"
     )
 
     print(
-        f"[SECONDARY] "
-        f"{secondary}"
+        f"[SECONDARY] {secondary}"
     )
 
     for snap in candidates:
@@ -1955,7 +2138,10 @@ def new_tracking_record(
 
         "consecutive_weakening": 0,
 
-        # Lore
+        # ----------------------------------------------------
+        # LORE
+        # ----------------------------------------------------
+
         "x_handle": snap.get(
             "x_handle",
             ""
@@ -1970,11 +2156,18 @@ def new_tracking_record(
         "lore_score": 0,
         "lore_confidence": "LOW",
         "lore_momentum": "LOW",
+
         "lore_summary": "",
         "lore_evidence": [],
         "lore_red_flags": [],
+
         "lore_last_researched": 0,
-        "lore_error": ""
+
+        "lore_error": "",
+
+        "lore_source_count": 0,
+
+        "lore_diagnostics": {}
     }
 
 
@@ -2024,9 +2217,8 @@ def update_record(
         snap
     )
 
-    # Keep enough observations for
-    # persistence without growing forever.
     if len(observations) > 12:
+
         del observations[:-12]
 
     record["max_mc"] = max(
@@ -2053,14 +2245,23 @@ def update_record(
         snap["liquidity"]
     )
 
-    # Refresh social / website information.
-    if snap.get("x_handle"):
-        record["x_handle"] = snap[
+    if snap.get(
+        "x_handle"
+    ):
+
+        record[
+            "x_handle"
+        ] = snap[
             "x_handle"
         ]
 
-    if snap.get("websites"):
-        record["websites"] = snap[
+    if snap.get(
+        "websites"
+    ):
+
+        record[
+            "websites"
+        ] = snap[
             "websites"
         ]
 
@@ -2086,23 +2287,28 @@ def update_record(
         )
     )
 
-    record["last_score"] = score
-    record["last_classification"] = (
-        classification
+    record[
+        "last_score"
+    ] = score
+
+    record[
+        "last_classification"
+    ] = classification
+
+    record[
+        "last_market_details"
+    ] = details
+
+    record[
+        "last_decay_warnings"
+    ] = decay_warnings(
+        snap,
+        previous
     )
 
-    record["last_market_details"] = (
-        details
-    )
-
-    record["last_decay_warnings"] = (
-        decay_warnings(
-            snap,
-            previous
-        )
-    )
-
-    record["last_updated"] = now_ts()
+    record[
+        "last_updated"
+    ] = now_ts()
 
 
 # ============================================================
@@ -2123,7 +2329,9 @@ def x_headers() -> Optional[Dict[str, str]]:
         "Authorization": (
             f"Bearer {token}"
         ),
-        "User-Agent": "RunnerBot/1.4"
+        "User-Agent": (
+            "RunnerBot/1.4.1"
+        )
     }
 
 
@@ -2138,12 +2346,14 @@ def clean_x_handle(
     handle = handle.lstrip("@")
 
     if "x.com/" in handle:
+
         handle = handle.split(
             "x.com/",
             1
         )[1]
 
     if "twitter.com/" in handle:
+
         handle = handle.split(
             "twitter.com/",
             1
@@ -2262,9 +2472,12 @@ def x_recent_posts(
         posts,
         list
     ):
+
         return []
 
-    return posts[:LORE_MAX_X_POSTS]
+    return posts[
+        :LORE_MAX_X_POSTS
+    ]
 
 
 # ============================================================
@@ -2322,6 +2535,7 @@ def fetch_website(
         url.startswith("http://")
         or url.startswith("https://")
     ):
+
         return ""
 
     raw = http_text(
@@ -2329,7 +2543,7 @@ def fetch_website(
         headers={
             "User-Agent": (
                 "Mozilla/5.0 "
-                "(compatible; RunnerBot/1.4)"
+                "(compatible; RunnerBot/1.4.1)"
             )
         },
         timeout=15
@@ -2350,6 +2564,50 @@ def fetch_website(
 # ============================================================
 # LORE EVIDENCE COLLECTION
 # ============================================================
+
+def evidence_source_count(
+    evidence: Dict[str, Any]
+) -> int:
+
+    count = 0
+
+    x = evidence.get(
+        "x",
+        {}
+    )
+
+    # X profile + X posts count as ONE source type.
+    if (
+        x.get("profile")
+        or x.get("posts")
+    ):
+
+        count += 1
+
+    # Website counts as ONE source type.
+    if evidence.get(
+        "websites"
+    ):
+
+        count += 1
+
+    # DEX description counts as ONE source type.
+    token = evidence.get(
+        "token",
+        {}
+    )
+
+    description = token.get(
+        "description",
+        ""
+    ).strip()
+
+    if description:
+
+        count += 1
+
+    return count
+
 
 def build_lore_evidence(
     snap: Dict[str, Any],
@@ -2386,8 +2644,23 @@ def build_lore_evidence(
             "posts": []
         },
 
-        "websites": []
+        "websites": [],
+
+        "diagnostics": {
+            "x_handle": "MISSING",
+            "x_account": "MISSING",
+            "x_posts": 0,
+            "website": "MISSING",
+            "website_count": 0,
+            "dex_description": "EMPTY",
+            "source_count": 0,
+            "reasons": []
+        }
     }
+
+    # --------------------------------------------------------
+    # X HANDLE
+    # --------------------------------------------------------
 
     x_handle = (
         snap.get(
@@ -2400,30 +2673,102 @@ def build_lore_evidence(
         )
     )
 
-    if x_handle:
+    x_handle = clean_x_handle(
+        x_handle
+    )
 
-        x_handle = clean_x_handle(
-            x_handle
+    if not x_handle:
+
+        evidence[
+            "diagnostics"
+        ]["reasons"].append(
+            "NO_X_HANDLE"
         )
 
-        evidence["x"]["handle"] = (
-            x_handle
+    else:
+
+        evidence[
+            "x"
+        ]["handle"] = x_handle
+
+        evidence[
+            "diagnostics"
+        ]["x_handle"] = (
+            f"@{x_handle}"
         )
 
-        profile = x_lookup_user(
-            x_handle
-        )
+        if not os.getenv(
+            "X_BEARER_TOKEN",
+            ""
+        ).strip():
 
-        if profile:
-            evidence["x"]["profile"] = (
-                profile
+            evidence[
+                "diagnostics"
+            ]["x_account"] = (
+                "API_NOT_CONFIGURED"
             )
 
-        posts = x_recent_posts(
-            x_handle
-        )
+            evidence[
+                "diagnostics"
+            ]["reasons"].append(
+                "X_API_NOT_CONFIGURED"
+            )
 
-        evidence["x"]["posts"] = posts
+        else:
+
+            profile = x_lookup_user(
+                x_handle
+            )
+
+            if profile:
+
+                evidence[
+                    "x"
+                ]["profile"] = profile
+
+                evidence[
+                    "diagnostics"
+                ]["x_account"] = "FOUND"
+
+            else:
+
+                evidence[
+                    "diagnostics"
+                ]["x_account"] = (
+                    "LOOKUP_FAILED"
+                )
+
+                evidence[
+                    "diagnostics"
+                ]["reasons"].append(
+                    "X_LOOKUP_FAILED"
+                )
+
+            posts = x_recent_posts(
+                x_handle
+            )
+
+            evidence[
+                "x"
+            ]["posts"] = posts
+
+            evidence[
+                "diagnostics"
+            ]["x_posts"] = len(
+                posts
+            )
+
+            if not posts:
+
+                evidence[
+                    "diagnostics"
+                ]["reasons"].append(
+                    "NO_X_POSTS"
+                )
+
+    # --------------------------------------------------------
+    # WEBSITES
+    # --------------------------------------------------------
 
     websites = (
         snap.get(
@@ -2436,58 +2781,117 @@ def build_lore_evidence(
         )
     )
 
-    for url in websites[:3]:
+    websites = list(
+        dict.fromkeys(
+            websites
+        )
+    )
 
-        text = fetch_website(
-            url
+    if not websites:
+
+        evidence[
+            "diagnostics"
+        ]["reasons"].append(
+            "NO_WEBSITE"
         )
 
-        if text:
+    else:
 
-            evidence["websites"].append({
-                "url": url,
-                "text": text
-            })
+        website_success = 0
 
-    return evidence
+        for url in websites[:3]:
 
+            text = fetch_website(
+                url
+            )
 
-def evidence_source_count(
-    evidence: Dict[str, Any]
-) -> int:
+            if text:
 
-    count = 0
+                evidence[
+                    "websites"
+                ].append({
+                    "url": url,
+                    "text": text
+                })
 
-    x = evidence.get(
-        "x",
-        {}
+                website_success += 1
+
+        evidence[
+            "diagnostics"
+        ]["website_count"] = (
+            website_success
+        )
+
+        if website_success > 0:
+
+            evidence[
+                "diagnostics"
+            ]["website"] = "FOUND"
+
+        else:
+
+            evidence[
+                "diagnostics"
+            ]["website"] = (
+                "FETCH_FAILED"
+            )
+
+            evidence[
+                "diagnostics"
+            ]["reasons"].append(
+                "WEBSITE_FETCH_FAILED"
+            )
+
+    # --------------------------------------------------------
+    # DEX DESCRIPTION
+    # --------------------------------------------------------
+
+    description = (
+        evidence[
+            "token"
+        ].get(
+            "description",
+            ""
+        ).strip()
     )
-
-    if (
-        x.get("profile")
-        or x.get("posts")
-    ):
-        count += 1
-
-    if evidence.get(
-        "websites"
-    ):
-        count += 1
-
-    token = evidence.get(
-        "token",
-        {}
-    )
-
-    description = token.get(
-        "description",
-        ""
-    ).strip()
 
     if description:
-        count += 1
 
-    return count
+        evidence[
+            "diagnostics"
+        ]["dex_description"] = (
+            "FOUND"
+        )
+
+    else:
+
+        evidence[
+            "diagnostics"
+        ]["reasons"].append(
+            "NO_DEX_DESCRIPTION"
+        )
+
+    # --------------------------------------------------------
+    # SOURCE COUNT
+    # --------------------------------------------------------
+
+    source_count = evidence_source_count(
+        evidence
+    )
+
+    evidence[
+        "diagnostics"
+    ]["source_count"] = source_count
+
+    if source_count < LORE_MIN_EVIDENCE:
+
+        evidence[
+            "diagnostics"
+        ]["reasons"].append(
+            "INSUFFICIENT_INDEPENDENT_SOURCES"
+        )
+
+    return evidence
 
 
 def evidence_to_text(
@@ -2550,6 +2954,7 @@ def evidence_to_text(
             )
 
             if text:
+
                 post_lines.append(
                     f"[{created}] {text}"
                 )
@@ -2605,19 +3010,36 @@ def lore_ai_available() -> bool:
 
 def lore_ai_chat(
     evidence_text: str
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[
+    Optional[Dict[str, Any]],
+    str
+]:
 
     api_key = os.getenv(
         "LORE_AI_API_KEY",
         ""
     ).strip()
 
-    if not (
-        api_key
-        and LORE_AI_BASE_URL
-        and LORE_AI_MODEL
-    ):
-        return None
+    if not api_key:
+
+        return (
+            None,
+            "LORE_AI_API_KEY_MISSING"
+        )
+
+    if not LORE_AI_BASE_URL:
+
+        return (
+            None,
+            "LORE_AI_BASE_URL_MISSING"
+        )
+
+    if not LORE_AI_MODEL:
+
+        return (
+            None,
+            "LORE_AI_MODEL_MISSING"
+        )
 
     url = (
         f"{LORE_AI_BASE_URL}"
@@ -2742,14 +3164,18 @@ return UNKNOWN rather than guessing.
                 "application/json"
             ),
             "User-Agent": (
-                "RunnerBot/1.4"
+                "RunnerBot/1.4.1"
             )
         },
         timeout=LORE_AI_TIMEOUT
     )
 
     if not result:
-        return None
+
+        return (
+            None,
+            "AI_REQUEST_FAILED"
+        )
 
     choices = result.get(
         "choices",
@@ -2757,11 +3183,14 @@ return UNKNOWN rather than guessing.
     )
 
     if not choices:
-        return None
+
+        return (
+            None,
+            "AI_EMPTY_RESPONSE"
+        )
 
     message = (
-        choices[0]
-        .get(
+        choices[0].get(
             "message",
             {}
         )
@@ -2787,9 +3216,12 @@ return UNKNOWN rather than guessing.
     ).strip()
 
     if not content:
-        return None
 
-    # Remove accidental markdown fences.
+        return (
+            None,
+            "AI_EMPTY_CONTENT"
+        )
+
     content = re.sub(
         r"^```json\s*",
         "",
@@ -2804,6 +3236,7 @@ return UNKNOWN rather than guessing.
     )
 
     try:
+
         parsed = json.loads(
             content
         )
@@ -2814,15 +3247,25 @@ return UNKNOWN rather than guessing.
             f"[LORE JSON ERROR] {e}"
         )
 
-        return None
+        return (
+            None,
+            "AI_INVALID_JSON"
+        )
 
     if not isinstance(
         parsed,
         dict
     ):
-        return None
 
-    return parsed
+        return (
+            None,
+            "AI_RESPONSE_NOT_OBJECT"
+        )
+
+    return (
+        parsed,
+        ""
+    )
 
 
 # ============================================================
@@ -2887,6 +3330,7 @@ def normalize_lore_result(
         "MEDIUM",
         "LOW"
     ]:
+
         confidence = "LOW"
 
     if momentum not in [
@@ -2894,6 +3338,7 @@ def normalize_lore_result(
         "MEDIUM",
         "LOW"
     ]:
+
         momentum = "LOW"
 
     if status not in [
@@ -2901,6 +3346,7 @@ def normalize_lore_result(
         "FAIL",
         "UNKNOWN"
     ]:
+
         status = "UNKNOWN"
 
     evidence = raw.get(
@@ -2912,6 +3358,7 @@ def normalize_lore_result(
         evidence,
         list
     ):
+
         evidence = []
 
     evidence = [
@@ -2929,6 +3376,7 @@ def normalize_lore_result(
         red_flags,
         list
     ):
+
         red_flags = []
 
     red_flags = [
@@ -2944,8 +3392,10 @@ def normalize_lore_result(
         )
     ).strip()
 
-    # Local enforcement.
-    # Never blindly trust the model's PASS.
+    # --------------------------------------------------------
+    # LOCAL ENFORCEMENT
+    # --------------------------------------------------------
+
     if (
         score < LORE_MIN_SCORE
         or len(evidence) < LORE_MIN_EVIDENCE
@@ -2957,12 +3407,14 @@ def normalize_lore_result(
     ):
 
         if status == "PASS":
+
             status = "FAIL"
 
     if (
         source_count == 0
         or not evidence
     ):
+
         status = "UNKNOWN"
 
     return {
@@ -3001,16 +3453,33 @@ def lore_cache_valid(
     )
 
 
+# ============================================================
+# LORE RESEARCH
+# ============================================================
+
 def research_lore(
     snap: Dict[str, Any],
     record: Dict[str, Any],
     force: bool = False
 ) -> Dict[str, Any]:
 
+    # --------------------------------------------------------
+    # CACHE
+    # --------------------------------------------------------
+
     if (
         not force
         and lore_cache_valid(record)
     ):
+
+        diagnostics = record.get(
+            "lore_diagnostics",
+            {}
+        )
+
+        print(
+            "\n[LORE] Using cached research"
+        )
 
         return {
             "lore_score": record.get(
@@ -3040,27 +3509,112 @@ def research_lore(
             "red_flags": record.get(
                 "lore_red_flags",
                 []
-            )
+            ),
+            "diagnostics": diagnostics
         }
 
     print(
-        f"[LORE] Researching "
-        f"{snap['symbol']}..."
+        "\n"
+        + "=" * 54
     )
 
+    print(
+        f"[LORE RESEARCH] "
+        f"{snap['symbol']}"
+    )
+
+    print(
+        "=" * 54
+    )
+
+    # --------------------------------------------------------
+    # AI CONFIGURATION
+    # --------------------------------------------------------
+
     if not lore_ai_available():
+
+        missing = []
+
+        if not os.getenv(
+            "LORE_AI_API_KEY",
+            ""
+        ).strip():
+
+            missing.append(
+                "LORE_AI_API_KEY"
+            )
+
+        if not LORE_AI_BASE_URL:
+
+            missing.append(
+                "LORE_AI_BASE_URL"
+            )
+
+        if not LORE_AI_MODEL:
+
+            missing.append(
+                "LORE_AI_MODEL"
+            )
+
+        error = (
+            "AI_NOT_CONFIGURED: "
+            + ", ".join(missing)
+        )
+
+        print(
+            "\n[LORE AI]"
+        )
+
+        print(
+            "STATUS: NOT CONFIGURED"
+        )
+
+        print(
+            f"REASON: {error}"
+        )
 
         record[
             "lore_status"
         ] = "UNKNOWN"
 
         record[
+            "lore_score"
+        ] = 0
+
+        record[
+            "lore_confidence"
+        ] = "LOW"
+
+        record[
+            "lore_momentum"
+        ] = "LOW"
+
+        record[
+            "lore_summary"
+        ] = ""
+
+        record[
+            "lore_evidence"
+        ] = []
+
+        record[
+            "lore_red_flags"
+        ] = []
+
+        record[
+            "lore_source_count"
+        ] = 0
+
+        record[
             "lore_error"
-        ] = (
-            "LORE_AI_API_KEY, "
-            "LORE_AI_BASE_URL or "
-            "LORE_AI_MODEL missing"
-        )
+        ] = error
+
+        record[
+            "lore_diagnostics"
+        ] = {
+            "ai_status": "NOT_CONFIGURED",
+            "ai_error": error
+        }
 
         record[
             "lore_last_researched"
@@ -3073,23 +3627,126 @@ def research_lore(
             "status": "UNKNOWN",
             "narrative": "",
             "evidence": [],
-            "red_flags": []
+            "red_flags": [],
+            "diagnostics": {
+                "ai_status": "NOT_CONFIGURED",
+                "ai_error": error
+            }
         }
+
+    # --------------------------------------------------------
+    # COLLECT SOURCES
+    # --------------------------------------------------------
 
     evidence = build_lore_evidence(
         snap,
         record
     )
 
-    source_count = evidence_source_count(
-        evidence
+    diagnostics = evidence.get(
+        "diagnostics",
+        {}
     )
+
+    print(
+        "\n[LORE SOURCES]"
+    )
+
+    print(
+        f"X HANDLE: "
+        f"{diagnostics.get('x_handle', 'MISSING')}"
+    )
+
+    print(
+        f"X ACCOUNT: "
+        f"{diagnostics.get('x_account', 'MISSING')}"
+    )
+
+    print(
+        f"X POSTS: "
+        f"{diagnostics.get('x_posts', 0)}"
+    )
+
+    print(
+        f"WEBSITE: "
+        f"{diagnostics.get('website', 'MISSING')}"
+    )
+
+    print(
+        f"WEBSITE COUNT: "
+        f"{diagnostics.get('website_count', 0)}"
+    )
+
+    print(
+        f"DEX DESCRIPTION: "
+        f"{diagnostics.get('dex_description', 'EMPTY')}"
+    )
+
+    source_count = diagnostics.get(
+        "source_count",
+        0
+    )
+
+    print(
+        f"SOURCE TYPES: "
+        f"{source_count}"
+    )
+
+    # --------------------------------------------------------
+    # PRINT SOURCE PROBLEMS
+    # --------------------------------------------------------
+
+    reasons = diagnostics.get(
+        "reasons",
+        []
+    )
+
+    if reasons:
+
+        print(
+            "\nSOURCE NOTES:"
+        )
+
+        for reason in reasons:
+
+            print(
+                f"• {reason}"
+            )
+
+    # --------------------------------------------------------
+    # INSUFFICIENT SOURCES
+    # --------------------------------------------------------
 
     if source_count < LORE_MIN_EVIDENCE:
 
+        reason_text = (
+            " + ".join(reasons)
+            if reasons
+            else "INSUFFICIENT_EVIDENCE"
+        )
+
         print(
-            f"[LORE] Insufficient sources "
-            f"({source_count})"
+            "\n[LORE AI]"
+        )
+
+        print(
+            "STATUS: NOT CALLED"
+        )
+
+        print(
+            f"REASON: {reason_text}"
+        )
+
+        print(
+            "\n[LORE]"
+        )
+
+        print(
+            "STATUS: UNKNOWN"
+        )
+
+        print(
+            f"REASON: {reason_text}"
         )
 
         result = {
@@ -3104,52 +3761,276 @@ def research_lore(
             ]
         }
 
-    else:
+        record[
+            "lore_error"
+        ] = reason_text
 
-        evidence_text = evidence_to_text(
-            evidence
+        record[
+            "lore_status"
+        ] = "UNKNOWN"
+
+        record[
+            "lore_score"
+        ] = 0
+
+        record[
+            "lore_confidence"
+        ] = "LOW"
+
+        record[
+            "lore_momentum"
+        ] = "LOW"
+
+        record[
+            "lore_summary"
+        ] = ""
+
+        record[
+            "lore_evidence"
+        ] = []
+
+        record[
+            "lore_red_flags"
+        ] = result[
+            "red_flags"
+        ]
+
+        record[
+            "lore_source_count"
+        ] = source_count
+
+        record[
+            "lore_diagnostics"
+        ] = diagnostics
+
+        record[
+            "lore_last_researched"
+        ] = now_ts()
+
+        return {
+            **result,
+            "diagnostics": diagnostics
+        }
+
+    # --------------------------------------------------------
+    # AI RESEARCH
+    # --------------------------------------------------------
+
+    evidence_text = evidence_to_text(
+        evidence
+    )
+
+    print(
+        "\n[LORE AI]"
+    )
+
+    print(
+        "STATUS: CONNECTED"
+    )
+
+    raw, ai_error = lore_ai_chat(
+        evidence_text
+    )
+
+    if raw is None:
+
+        print(
+            "STATUS: REQUEST FAILED"
         )
 
-        raw = lore_ai_chat(
-            evidence_text
+        print(
+            f"REASON: {ai_error}"
         )
 
-        result = normalize_lore_result(
-            raw,
-            source_count
+        result = {
+            "lore_score": 0,
+            "confidence": "LOW",
+            "momentum": "LOW",
+            "status": "UNKNOWN",
+            "narrative": "",
+            "evidence": [],
+            "red_flags": [
+                ai_error
+            ]
+        }
+
+        record[
+            "lore_error"
+        ] = ai_error
+
+        record[
+            "lore_status"
+        ] = "UNKNOWN"
+
+        record[
+            "lore_score"
+        ] = 0
+
+        record[
+            "lore_confidence"
+        ] = "LOW"
+
+        record[
+            "lore_momentum"
+        ] = "LOW"
+
+        record[
+            "lore_summary"
+        ] = ""
+
+        record[
+            "lore_evidence"
+        ] = []
+
+        record[
+            "lore_red_flags"
+        ] = [
+            ai_error
+        ]
+
+        record[
+            "lore_source_count"
+        ] = source_count
+
+        record[
+            "lore_diagnostics"
+        ] = {
+            **diagnostics,
+            "ai_status": "FAILED",
+            "ai_error": ai_error
+        }
+
+        record[
+            "lore_last_researched"
+        ] = now_ts()
+
+        return {
+            **result,
+            "diagnostics": record[
+                "lore_diagnostics"
+            ]
+        }
+
+    # --------------------------------------------------------
+    # NORMALIZE
+    # --------------------------------------------------------
+
+    result = normalize_lore_result(
+        raw,
+        source_count
+    )
+
+    print(
+        f"STATUS: "
+        f"{result['status']}"
+    )
+
+    print(
+        f"Score: "
+        f"{result['lore_score']}/25"
+    )
+
+    print(
+        f"Confidence: "
+        f"{result['confidence']}"
+    )
+
+    print(
+        f"Momentum: "
+        f"{result['momentum']}"
+    )
+
+    if result.get(
+        "narrative"
+    ):
+
+        print(
+            "\nNarrative:"
         )
+
+        print(
+            result[
+                "narrative"
+            ]
+        )
+
+    if result.get(
+        "evidence"
+    ):
+
+        print(
+            "\nEvidence:"
+        )
+
+        for item in result[
+            "evidence"
+        ][:5]:
+
+            print(
+                f"• {item}"
+            )
+
+    if result.get(
+        "red_flags"
+    ):
+
+        print(
+            "\nRed Flags:"
+        )
+
+        for item in result[
+            "red_flags"
+        ][:5]:
+
+            print(
+                f"• {item}"
+            )
+
+    # --------------------------------------------------------
+    # SAVE LORE RESULT
+    # --------------------------------------------------------
 
     record[
         "lore_status"
-    ] = result["status"]
+    ] = result[
+        "status"
+    ]
 
     record[
         "lore_score"
-    ] = result["lore_score"]
+    ] = result[
+        "lore_score"
+    ]
 
     record[
         "lore_confidence"
-    ] = result["confidence"]
+    ] = result[
+        "confidence"
+    ]
 
     record[
         "lore_momentum"
-    ] = result["momentum"]
+    ] = result[
+        "momentum"
+    ]
 
     record[
         "lore_summary"
-    ] = result["narrative"]
+    ] = result[
+        "narrative"
+    ]
 
     record[
         "lore_evidence"
-    ] = result["evidence"]
+    ] = result[
+        "evidence"
+    ]
 
     record[
         "lore_red_flags"
-    ] = result["red_flags"]
-
-    record[
-        "lore_last_researched"
-    ] = now_ts()
+    ] = result[
+        "red_flags"
+    ]
 
     record[
         "lore_source_count"
@@ -3159,15 +4040,24 @@ def research_lore(
         "lore_error"
     ] = ""
 
-    print(
-        f"[LORE] "
-        f"{result['lore_score']}/25 | "
-        f"{result['confidence']} | "
-        f"{result['momentum']} | "
-        f"{result['status']}"
-    )
+    record[
+        "lore_diagnostics"
+    ] = {
+        **diagnostics,
+        "ai_status": "CONNECTED",
+        "ai_error": ""
+    }
 
-    return result
+    record[
+        "lore_last_researched"
+    ] = now_ts()
+
+    return {
+        **result,
+        "diagnostics": record[
+            "lore_diagnostics"
+        ]
+    }
 
 
 def lore_passes(
@@ -3178,18 +4068,21 @@ def lore_passes(
         result.get(
             "status"
         ) == "PASS"
+
         and safe_float(
             result.get(
                 "lore_score",
                 0
             )
         ) >= LORE_MIN_SCORE
+
         and result.get(
             "confidence"
         ) in [
             "HIGH",
             "MEDIUM"
         ]
+
         and len(
             result.get(
                 "evidence",
@@ -3210,17 +4103,21 @@ def should_alert(
     score: int,
     lore_result: Dict[str, Any],
     previous: Optional[Dict[str, Any]]
-) -> Tuple[bool, List[str]]:
+) -> Tuple[
+    bool,
+    List[str]
+]:
 
     reasons = []
 
-    # New alert ceiling
     if snap["mc"] < MIN_MC:
+
         reasons.append(
             "MC below $20K"
         )
 
     if snap["mc"] > MAX_MC:
+
         reasons.append(
             "MC above $150K"
         )
@@ -3229,21 +4126,25 @@ def should_alert(
         "RUNNER",
         "IDEAL RUNNER"
     ]:
+
         reasons.append(
             f"classification={classification}"
         )
 
     if score < RUNNER_SCORE:
+
         reasons.append(
             f"market score < {RUNNER_SCORE}"
         )
 
     if snap["price_5m"] <= 0:
+
         reasons.append(
             "5m price <= 0"
         )
 
     if snap["bs"] < 1.2:
+
         reasons.append(
             "B/S < 1.20"
         )
@@ -3257,6 +4158,7 @@ def should_alert(
         snap["mc"] < DECAY_MC_CUTOFF
         and len(warnings) >= 2
     ):
+
         reasons.append(
             "low-cap decay filter"
         )
@@ -3273,12 +4175,35 @@ def should_alert(
     if not lore_passes(
         lore_result
     ):
-        reasons.append(
-            "lore verification failed"
+
+        lore_status = lore_result.get(
+            "status",
+            "UNKNOWN"
         )
 
-    # Don't repeatedly alert the same token.
-    if record.get("alerts"):
+        lore_error = record.get(
+            "lore_error",
+            ""
+        )
+
+        if lore_error:
+
+            reasons.append(
+                f"lore={lore_status}: "
+                f"{lore_error}"
+            )
+
+        else:
+
+            reasons.append(
+                f"lore verification failed "
+                f"({lore_status})"
+            )
+
+    if record.get(
+        "alerts"
+    ):
+
         reasons.append(
             "already alerted"
         )
@@ -3312,6 +4237,7 @@ def format_alert(
         )
 
     if not evidence_lines:
+
         evidence_lines.append(
             "• No evidence supplied"
         )
@@ -3322,6 +4248,7 @@ def format_alert(
     ).strip()
 
     if not narrative:
+
         narrative = (
             "Evidence-backed narrative "
             "identified."
@@ -3344,8 +4271,10 @@ def format_alert(
 
         f"LORE SCORE: "
         f"{lore['lore_score']}/25\n"
+
         f"LORE CONFIDENCE: "
         f"{lore['confidence']}\n"
+
         f"LORE MOMENTUM: "
         f"{lore['momentum']}\n\n"
 
@@ -3452,8 +4381,10 @@ def validate_token(
         f"{record.get('consecutive_weakening', 0)}"
     )
 
-    # Research lore only when the market has
-    # already passed cheap preliminary checks.
+    # --------------------------------------------------------
+    # LORE RESEARCH GATE
+    # --------------------------------------------------------
+
     should_research = (
         snap["mc"] >= MIN_MC
         and snap["mc"] <= MAX_MC
@@ -3475,29 +4406,40 @@ def validate_token(
             "lore_score",
             0
         ),
+
         "confidence": record.get(
             "lore_confidence",
             "LOW"
         ),
+
         "momentum": record.get(
             "lore_momentum",
             "LOW"
         ),
+
         "status": record.get(
             "lore_status",
             "UNKNOWN"
         ),
+
         "narrative": record.get(
             "lore_summary",
             ""
         ),
+
         "evidence": record.get(
             "lore_evidence",
             []
         ),
+
         "red_flags": record.get(
             "lore_red_flags",
             []
+        ),
+
+        "diagnostics": record.get(
+            "lore_diagnostics",
+            {}
         )
     }
 
@@ -3509,10 +4451,93 @@ def validate_token(
         )
 
         print(
-            f"[LORE] "
-            f"Score={lore['lore_score']}/25 "
-            f"Status={lore['status']}"
+            "\n"
+            + "-" * 54
         )
+
+        print(
+            f"[LORE RESULT] "
+            f"{snap['symbol']}"
+        )
+
+        print(
+            f"Score: "
+            f"{lore['lore_score']}/25"
+        )
+
+        print(
+            f"Confidence: "
+            f"{lore['confidence']}"
+        )
+
+        print(
+            f"Momentum: "
+            f"{lore['momentum']}"
+        )
+
+        print(
+            f"Status: "
+            f"{lore['status']}"
+        )
+
+        diagnostics = lore.get(
+            "diagnostics",
+            record.get(
+                "lore_diagnostics",
+                {}
+            )
+        )
+
+        if diagnostics:
+
+            print(
+                f"Source Types: "
+                f"{diagnostics.get('source_count', 0)}"
+            )
+
+            if diagnostics.get(
+                "ai_status"
+            ):
+
+                print(
+                    f"AI Status: "
+                    f"{diagnostics['ai_status']}"
+                )
+
+            if diagnostics.get(
+                "ai_error"
+            ):
+
+                print(
+                    f"AI Error: "
+                    f"{diagnostics['ai_error']}"
+                )
+
+        if record.get(
+            "lore_error"
+        ):
+
+            print(
+                f"Reason: "
+                f"{record['lore_error']}"
+            )
+
+        print(
+            "-" * 54
+        )
+
+    else:
+
+        # If the token didn't even reach the
+        # lore research gate, make that visible.
+        print(
+            "[LORE] Research not triggered "
+            "(market pre-check failed)"
+        )
+
+    # --------------------------------------------------------
+    # FINAL ALERT DECISION
+    # --------------------------------------------------------
 
     alert, reasons = should_alert(
         snap,
@@ -3579,10 +4604,11 @@ def validate_token(
         ]:
 
             print(
-                "[NO ALERT]"
+                "\n[NO ALERT]"
             )
 
             for reason in reasons[:8]:
+
                 print(
                     f"  - {reason}"
                 )
@@ -3779,11 +4805,12 @@ def clean_old_tracking() -> None:
         )
 
     if remove:
+
         save_state()
 
 
 # ============================================================
-# MAIN LOOP
+# STARTUP REPORT
 # ============================================================
 
 def startup_report() -> None:
@@ -3871,6 +4898,10 @@ def startup_report() -> None:
     )
 
 
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
 def main() -> None:
 
     startup_report()
@@ -3891,7 +4922,7 @@ def main() -> None:
 
             now = now_ts()
 
-            # Telegram commands
+            # Telegram
             telegram_poll()
 
             # Discovery
@@ -3941,8 +4972,11 @@ def main() -> None:
             )
 
             try:
+
                 save_state()
+
             except Exception:
+
                 pass
 
         time.sleep(
@@ -3951,4 +4985,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()
