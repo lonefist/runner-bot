@@ -1542,22 +1542,15 @@ def normalize_lore_result(result, sources):
 
 def research_lore(token):
 
-    sources = collect_lore_sources(
-        token
-    )
+    sources = collect_lore_sources(token)
 
-    print_lore_sources(
-        sources
-    )
+    print_lore_sources(sources)
 
     # --------------------------------------------------------
-    # DO NOT CALL AI WITHOUT 2 CREDIBLE SOURCE TYPES
+    # REQUIRE 2 CREDIBLE SOURCE TYPES BEFORE AI
     # --------------------------------------------------------
 
-    if (
-        sources.get("source_count", 0)
-        < LORE_MIN_EVIDENCE
-    ):
+    if sources.get("source_count", 0) < LORE_MIN_EVIDENCE:
 
         print("[LORE AI]")
         print("STATUS: NOT RUN")
@@ -1567,9 +1560,7 @@ def research_lore(token):
             or "INSUFFICIENT_CREDIBLE_EVIDENCE"
         )
 
-        print(
-            f"REASON: {reason}"
-        )
+        print(f"REASON: {reason}")
 
         return {
             "lore_score": 0,
@@ -1586,7 +1577,7 @@ def research_lore(token):
         }
 
     # --------------------------------------------------------
-    # LORE AI
+    # RUN LORE AI
     # --------------------------------------------------------
 
     ai = lore_ai_request(
