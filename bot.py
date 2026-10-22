@@ -1,4 +1,4 @@
-"""
+
 RUNNER BOT V5.0 — Solana early-cap scanner
 Target market cap: $5,000–$50,000 (hard ceiling)
 Uses DexScreener public API and Telegram Bot API.
