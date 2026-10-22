@@ -1,38 +1,25 @@
-name: Runner Bot
-
+name: Runner Bot V5.1
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-
-concurrency:
-  group: runner-bot
-  cancel-in-progress: true
-
+permissions:
+  contents: read
 jobs:
-  runner-bot:
+  run-bot:
     runs-on: ubuntu-latest
-
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      SCAN_INTERVAL_SECONDS: "15"
-      DISCOVERY_INTERVAL_SECONDS: "300"
-      PYTHONUNBUFFERED: "1"
-
+    timeout-minutes: 350
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
+      - name: Check out repository
+        uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Check Python syntax
+          python-version: "3.12"
+      - name: Install dependencies
         run: |
-          python3 -m py_compile bot.py
-
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run Runner Bot
-        run: |
-          python3 -u bot.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
