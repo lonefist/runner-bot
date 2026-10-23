@@ -1,145 +1,151 @@
-"""
-RUNNER BOT V5.1
-Solana early-cap scanner.
-
-Hard market-cap range: $5,000-$50,000.
-Flow is a buy/sell-imbalance proxy, NOT verified net wallet inflow.
-"""
-
 import os
 import json
 import time
 import logging
-from pathlib import Path
+import threading
+from datetime import datetime, timezone
 
 import requests
 
 
 # ============================================================
-# CONFIGURATION
+# RUNNER BOT V6.0
+# EARLY RUNNER DETECTION AND MULTIPLE TRACKING
 # ============================================================
 
-BOT_VERSION = "V5.1-HARD-CAP-50K"
+BOT_VERSION = "V6.0-RUNNER-TRACKER"
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
+DEX_BASE = "https://api.dexscreener.com"
+TELEGRAM_BASE = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    if TELEGRAM_BOT_TOKEN else ""
+)
+
+MIN_MCAP_USD = 20_000
+MAX_MCAP_USD = 250_000
+
+MIN_LIQUIDITY_USD = 6_000
+MAX_PAIR_AGE_HOURS = 48
 
 SCAN_INTERVAL_SECONDS = 15
 DISCOVERY_INTERVAL_SECONDS = 60
 
-HEATING_ALERTS_ENABLED = True
-RUNNER_DEBUG = True
+MIN_5M_VOLUME_USD = 500
+MIN_5M_TRANSACTIONS = 5
 
-# HARD MARKET-CAP LIMITS
-MIN_MCAP_USD = 5_000
-MAX_MCAP_USD = 50_000
+MIN_BUY_SELL_RATIO = 1.25
+MIN_FLOW_PROXY_USD = 1_500
+MIN_FLOW_MC_PCT = 0.8
 
-# LIQUIDITY
-MIN_LIQUIDITY_USD = 6_000
+ALERT_SCORE = 65
+HIGH_PRIORITY_SCORE = 80
 
-# TOKEN AGE
-MAX_PAIR_AGE_HOURS = 48
-
-# CORE FLOW FILTERS
-MIN_CORE_FLOW_USD = 1_500
-MIN_FLOW_MCAP_PCT = 8.0
-MIN_VOLUME_FLOW_RATIO = 1.25
-MIN_BUY_SELL_RATIO = 1.5
-
-# EARLY PUMP.FUN EXCEPTION
-# This exception CANNOT bypass the hard market-cap limits.
-PUMPFUN_EARLY_AGE_HOURS = 1.5
-PUMPFUN_EARLY_MIN_VOL5 = 8_000
-PUMPFUN_EARLY_MIN_FLOW = 3_000
-PUMPFUN_EARLY_MIN_FLOW_MCAP_PCT = 12.0
-
-# SIGNAL STRENGTH
-STRONG_FLOW_PCT = 15.0
-STRONG_FLOW_USD = 15_000
-
-ULTRA_FLOW_PCT = 25.0
-ULTRA_FLOW_USD = 25_000
-
-# PERSISTENCE
-NORMAL_PERSISTENCE = 3
-STRONG_PERSISTENCE = 2
-ULTRA_PERSISTENCE = 1
-
-# COOLDOWNS
-PENDING_EXPIRY_SECONDS = 300
+PERSISTENCE_OBSERVATIONS = 2
 TOKEN_COOLDOWN_SECONDS = 600
-GLOBAL_ALERT_COOLDOWN_SECONDS = 60
 
-# DISCOVERY
-MAX_DISCOVERY_TOKENS = 500
-DISCOVERY_BATCH_SIZE = 25
+STATE_FILE = "runner_state_v60.json"
+
 MAX_TRACKED_TOKENS = 1500
-MAX_HISTORY_PER_TOKEN = 20
+MAX_DISCOVERY_PAIRS = 300
 
-PREFILTER_MIN_VOL5 = 500
-PREFILTER_MIN_ABS_FLOW = 500
-
-# STATE
-STATE_FILE = Path("runner_state_v51.json")
-
-DEX_BASE = "https://api.dexscreener.com"
-
-SEARCH_TERMS = [
-    "SOL",
-    "WSOL",
-    "pump",
-    "meme",
-    "cat",
-    "dog",
-    "ai",
-    "inu",
-    "coin",
-    "frog",
-    "agent",
+MILESTONES = [
+    2, 3, 5, 10, 20, 50, 100, 200, 500
 ]
 
-SESSION = requests.Session()
-
-SESSION.headers.update({
-    "User-Agent": f"RunnerBot/{BOT_VERSION}"
-})
+SEARCH_TERMS = [
+    "SOL", "WSOL", "pump", "meme",
+    "cat", "dog", "ai", "inu",
+    "coin", "frog", "agent"
+]
 
 logging.basicConfig(
-    level=logging.DEBUG if RUNNER_DEBUG else logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 log = logging.getLogger("runner-bot")
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "RunnerBot/6.0"
+})
+
+stop_event = threading.Event()
+telegram_offset = 0
+
+state_lock = threading.Lock()
+
+state = {
+    "tokens": {},
+    "pending": {},
+    "last_alert": {},
+    "last_discovery": 0,
+    "started_at": None
+}
 
 
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
 
-def now():
+def now_ts():
     return time.time()
 
 
-def number(value, default=0.0):
+def utc_string(timestamp=None):
+    if timestamp is None:
+        timestamp = now_ts()
+
+    return datetime.fromtimestamp(
+        timestamp, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def safe_float(value, default=0.0):
     try:
-        if value is None or value == "":
+        if value is None:
             return default
 
-        return float(value)
+        result = float(value)
 
-    except (TypeError, ValueError):
+        if result != result:
+            return default
+
+        return result
+
+    except (ValueError, TypeError):
         return default
 
 
-def get_json(url, timeout=12):
+def money(value):
+    if value is None:
+        return "N/A"
+
+    return f"${value:,.0f}"
+
+
+def percentage(value):
+    if value is None:
+        return "N/A"
+
+    return f"{value:+.2f}%"
+
+
+def ratio(buys, sells):
+    if sells <= 0:
+        return float(buys) if buys > 0 else 0.0
+
+    return buys / sells
+
+
+def get_json(url, params=None, timeout=12):
     try:
-        response = SESSION.get(
+        response = session.get(
             url,
+            params=params,
             timeout=timeout
         )
 
@@ -147,1035 +153,948 @@ def get_json(url, timeout=12):
 
         return response.json()
 
-    except (requests.RequestException, ValueError) as exc:
-        log.warning(
-            "Request failed: %s | %s",
-            url,
-            exc
-        )
-
+    except Exception as exc:
+        log.warning("GET failed: %s | %s", url, exc)
         return None
-
-
-# ============================================================
-# STATE MANAGEMENT
-# ============================================================
-
-def load_state():
-
-    default_state = {
-        "known_tokens": {},
-        "pending": {},
-        "token_cooldowns": {},
-        "last_global_alert": 0,
-        "last_discovery": 0,
-        "telegram_offset": 0,
-    }
-
-    if not STATE_FILE.exists():
-        return default_state
-
-    try:
-
-        with STATE_FILE.open(
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            loaded = json.load(file)
-
-        if isinstance(loaded, dict):
-
-            for key in default_state:
-                if key in loaded:
-                    default_state[key] = loaded[key]
-
-        for key in [
-            "known_tokens",
-            "pending",
-            "token_cooldowns",
-        ]:
-
-            if not isinstance(default_state[key], dict):
-                default_state[key] = {}
-
-        return default_state
-
-    except (OSError, json.JSONDecodeError) as exc:
-
-        log.warning(
-            "Could not load state: %s",
-            exc
-        )
-
-        return default_state
-
-
-def save_state(state):
-
-    try:
-
-        temporary = STATE_FILE.with_suffix(".tmp")
-
-        with temporary.open(
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                state,
-                file,
-                indent=2
-            )
-
-        temporary.replace(STATE_FILE)
-
-    except OSError as exc:
-
-        log.error(
-            "Could not save state: %s",
-            exc
-        )
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_api(method, payload):
+def telegram_send(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("Telegram credentials are missing.")
+        return False
 
-    if not TELEGRAM_BOT_TOKEN:
-        return None
+    url = f"{TELEGRAM_BASE}/sendMessage"
 
-    url = (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/{method}"
-    )
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True
+    }
 
     try:
-
-        response = SESSION.post(
+        response = session.post(
             url,
             json=payload,
             timeout=15
+        )
+
+        if response.status_code != 200:
+            log.error(
+                "Telegram send failed: %s %s",
+                response.status_code,
+                response.text[:300]
+            )
+            return False
+
+        result = response.json()
+
+        if not result.get("ok"):
+            log.error("Telegram API rejected message: %s", result)
+            return False
+
+        log.info("Telegram alert delivered.")
+        return True
+
+    except Exception as exc:
+        log.error("Telegram error: %s", exc)
+        return False
+
+
+def telegram_get_updates():
+    global telegram_offset
+
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    url = f"{TELEGRAM_BASE}/getUpdates"
+
+    try:
+        response = session.get(
+            url,
+            params={
+                "offset": telegram_offset,
+                "timeout": 5,
+                "allowed_updates": json.dumps(["message"])
+            },
+            timeout=10
         )
 
         response.raise_for_status()
 
         result = response.json()
 
-        if result.get("ok"):
-            return result
+        if not result.get("ok"):
+            return []
 
-        log.warning(
-            "Telegram API error: %s",
-            result
+        updates = result.get("result", [])
+
+        for update in updates:
+            telegram_offset = max(
+                telegram_offset,
+                update["update_id"] + 1
+            )
+
+        return updates
+
+    except Exception as exc:
+        log.warning("Telegram polling error: %s", exc)
+        return []
+
+
+def handle_telegram_commands():
+    for update in telegram_get_updates():
+        message = update.get("message", {})
+        text = message.get("text", "").strip()
+
+        chat_id = str(
+            message.get("chat", {}).get("id", "")
         )
 
-        return None
-
-    except (requests.RequestException, ValueError) as exc:
-
-        log.warning(
-            "Telegram request failed: %s",
-            exc
-        )
-
-        return None
-
-
-def send_message(message, chat_id=None):
-
-    destination = str(
-        chat_id or TELEGRAM_CHAT_ID
-    ).strip()
-
-    if not destination:
-
-        log.warning(
-            "TELEGRAM_CHAT_ID is missing. "
-            "Message was not sent."
-        )
-
-        return False
-
-    result = telegram_api(
-        "sendMessage",
-        {
-            "chat_id": destination,
-            "text": message,
-            "disable_web_page_preview": True,
-        }
-    )
-
-    return result is not None
-
-
-def process_telegram_commands(state):
-
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    result = telegram_api(
-        "getUpdates",
-        {
-            "offset": int(
-                state.get("telegram_offset", 0)
-            ),
-            "timeout": 1,
-            "allowed_updates": ["message"],
-        }
-    )
-
-    if not result:
-        return
-
-    for update in result.get("result", []):
-
-        state["telegram_offset"] = max(
-            int(state.get("telegram_offset", 0)),
-            int(update.get("update_id", 0)) + 1
-        )
-
-        message = update.get("message") or {}
-
-        chat = message.get("chat") or {}
-
-        chat_id = str(chat.get("id", ""))
-
-        command = (
-            message.get("text") or ""
-        ).strip().lower()
-
-        if not chat_id:
+        if not text:
             continue
 
-        if command.startswith(("/start", "/help")):
-
-            send_message(
-                f"Runner Bot {BOT_VERSION} is running.\n"
+        if text.startswith("/start"):
+            telegram_send(
+                "Runner Bot V6.0 is online.\n\n"
+                "Commands:\n"
+                "/status - Scanner status\n"
+                "/help - Show commands\n\n"
                 f"Market-cap range: "
-                f"${MIN_MCAP_USD:,}-${MAX_MCAP_USD:,}\n"
-                "Commands: /start, /help, /status",
-                chat_id
+                f"{money(MIN_MCAP_USD)}–{money(MAX_MCAP_USD)}"
             )
 
-        elif command.startswith("/status"):
+        elif text.startswith("/help"):
+            telegram_send(
+                "Runner Bot V6.0\n\n"
+                "/start - Start menu\n"
+                "/status - Scanner status\n"
+                "/help - Help\n\n"
+                "Alerts use market-cap, liquidity, "
+                "momentum, volume and transaction data."
+            )
 
-            send_message(
-                f"Runner Bot {BOT_VERSION}\n"
-                f"Minimum MC: ${MIN_MCAP_USD:,}\n"
-                f"Maximum MC: ${MAX_MCAP_USD:,}\n"
+        elif text.startswith("/status"):
+            with state_lock:
+                token_count = len(state["tokens"])
+                pending_count = len(state["pending"])
+
+            telegram_send(
+                "RUNNER BOT STATUS\n\n"
+                f"Version: {BOT_VERSION}\n"
+                "Scanner: Running\n"
+                f"Tracked tokens: {token_count}\n"
+                f"Pending candidates: {pending_count}\n"
+                f"Market cap: {money(MIN_MCAP_USD)}"
+                f"–{money(MAX_MCAP_USD)}\n"
                 f"Minimum liquidity: "
-                f"${MIN_LIQUIDITY_USD:,}\n"
-                f"Minimum core flow proxy: "
-                f"${MIN_CORE_FLOW_USD:,}\n"
-                f"Scan interval: "
-                f"{SCAN_INTERVAL_SECONDS} seconds\n"
-                f"Alerts enabled: "
-                f"{HEATING_ALERTS_ENABLED}",
-                chat_id
+                f"{money(MIN_LIQUIDITY_USD)}\n"
+                f"Started: {state.get('started_at')}"
             )
 
 
 # ============================================================
-# TOKEN DISCOVERY
+# PERSISTENT STATE
 # ============================================================
 
-def discover_addresses():
+def load_state():
+    global state
 
-    addresses = set()
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as file:
+                loaded = json.load(file)
+
+            for key in state:
+                if key in loaded:
+                    state[key] = loaded[key]
+
+            log.info("State restored from %s", STATE_FILE)
+
+    except Exception as exc:
+        log.error("Could not load state: %s", exc)
+
+
+def save_state():
+    try:
+        with state_lock:
+            snapshot = json.dumps(
+                state,
+                separators=(",", ":")
+            )
+
+        temporary_file = STATE_FILE + ".tmp"
+
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            file.write(snapshot)
+
+        os.replace(temporary_file, STATE_FILE)
+
+    except Exception as exc:
+        log.error("State save failed: %s", exc)
+
+
+# ============================================================
+# DEXSCREENER DISCOVERY
+# ============================================================
+
+def discover_pairs():
+    discovered = {}
 
     endpoints = [
-        "/token-profiles/latest/v1",
-        "/token-boosts/latest/v1",
-        "/token-boosts/top/v1",
+        f"{DEX_BASE}/token-profiles/latest/v1",
+        f"{DEX_BASE}/token-boosts/latest/v1",
+        f"{DEX_BASE}/token-boosts/top/v1"
     ]
 
-    for endpoint in endpoints:
-
-        data = get_json(
-            f"{DEX_BASE}{endpoint}"
-        )
+    for url in endpoints:
+        data = get_json(url)
 
         if not isinstance(data, list):
             continue
 
         for item in data:
-
             if item.get("chainId") != "solana":
                 continue
 
             address = item.get("tokenAddress")
 
             if address:
-                addresses.add(address)
+                discovered[address] = True
 
-    # Search additional Solana pairs.
     for term in SEARCH_TERMS:
-
-        url = (
-            f"{DEX_BASE}/latest/dex/search"
-            f"?q={requests.utils.quote(term)}"
-        )
-
         data = get_json(
-            url,
-            timeout=10
+            f"{DEX_BASE}/latest/dex/search",
+            params={"q": term}
         )
 
         if not isinstance(data, dict):
             continue
 
         for pair in data.get("pairs") or []:
-
             if pair.get("chainId") != "solana":
                 continue
 
-            base = pair.get("baseToken") or {}
-
-            address = base.get("address")
+            token = pair.get("baseToken") or {}
+            address = token.get("address")
 
             if address:
-                addresses.add(address)
+                discovered[address] = True
 
-    discovered = list(addresses)
+            quote = pair.get("quoteToken") or {}
 
-    if len(discovered) > MAX_DISCOVERY_TOKENS:
-        discovered = discovered[:MAX_DISCOVERY_TOKENS]
+            if quote.get("address"):
+                discovered[quote["address"]] = True
+
+    addresses = list(discovered.keys())
 
     log.info(
-        "Discovery found %s token addresses",
-        len(discovered)
+        "Discovery found %d distinct token addresses.",
+        len(addresses)
     )
 
-    return discovered
+    return addresses[:MAX_DISCOVERY_PAIRS]
 
 
-def fetch_pairs(addresses):
+def fetch_token_pairs(address):
+    data = get_json(
+        f"{DEX_BASE}/token-pairs/v1/solana/{address}"
+    )
 
-    pairs = []
+    if not isinstance(data, list):
+        return []
 
-    for start in range(
-        0,
-        len(addresses),
-        DISCOVERY_BATCH_SIZE
-    ):
+    return [
+        pair for pair in data
+        if pair.get("chainId") == "solana"
+    ]
 
-        batch = addresses[
-            start:start + DISCOVERY_BATCH_SIZE
-        ]
 
-        if not batch:
-            continue
+def choose_best_pair(pairs):
+    if not pairs:
+        return None
 
-        url = (
-            f"{DEX_BASE}/tokens/v1/solana/"
-            f"{','.join(batch)}"
+    # Prefer the pair with the greatest reported liquidity.
+    # This does not guarantee that the pair has the best execution.
+    return max(
+        pairs,
+        key=lambda pair: safe_float(
+            (pair.get("liquidity") or {}).get("usd")
         )
-
-        data = get_json(
-            url,
-            timeout=15
-        )
-
-        if isinstance(data, list):
-
-            for pair in data:
-
-                if (
-                    isinstance(pair, dict)
-                    and pair.get("chainId") == "solana"
-                ):
-
-                    pairs.append(pair)
-
-        time.sleep(0.15)
-
-    return pairs
+    )
 
 
 # ============================================================
-# PAIR NORMALIZATION
+# TOKEN METRICS
 # ============================================================
 
-def get_market_cap(pair):
-
-    market_cap = number(
-        pair.get("marketCap")
-    )
-
-    if market_cap > 0:
-        return market_cap, "MC"
-
-    fdv = number(
-        pair.get("fdv")
-    )
-
-    if fdv > 0:
-        return fdv, "FDV proxy"
-
-    return 0, "unknown"
-
-
-def normalize_pair(pair):
-
+def extract_metrics(pair):
     base = pair.get("baseToken") or {}
+    txns = pair.get("txns") or {}
+    volume = pair.get("volume") or {}
+    changes = pair.get("priceChange") or {}
+    liquidity = pair.get("liquidity") or {}
 
-    address = base.get("address")
+    tx5 = txns.get("m5") or {}
+    tx1h = txns.get("h1") or {}
 
-    if not address:
-        return None
+    buys5 = int(safe_float(tx5.get("buys")))
+    sells5 = int(safe_float(tx5.get("sells")))
 
-    market_cap, cap_source = get_market_cap(pair)
+    buys1h = int(safe_float(tx1h.get("buys")))
+    sells1h = int(safe_float(tx1h.get("sells")))
 
-    if market_cap <= 0:
-        return None
+    vol5 = safe_float(volume.get("m5"))
+    vol1h = safe_float(volume.get("h1"))
 
-    liquidity = number(
-        (pair.get("liquidity") or {}).get("usd")
+    change5 = safe_float(changes.get("m5"))
+    change1h = safe_float(changes.get("h1"))
+    change6h = safe_float(changes.get("h6"))
+
+    mcap = safe_float(
+        pair.get("marketCap"),
+        safe_float(pair.get("fdv"))
     )
 
-    volume5 = number(
-        (pair.get("volume") or {}).get("m5")
-    )
+    fdv = safe_float(pair.get("fdv"))
+    liq = safe_float(liquidity.get("usd"))
 
-    txns = (
-        (pair.get("txns") or {}).get("m5") or {}
-    )
+    pair_created = safe_float(pair.get("pairCreatedAt"))
 
-    buys = int(number(txns.get("buys")))
-    sells = int(number(txns.get("sells")))
+    if pair_created > 0:
+        # DEX Screener normally reports milliseconds.
+        if pair_created > 10_000_000_000:
+            pair_created /= 1000
 
-    total_tx = buys + sells
-
-    # This is an estimated pressure proxy, NOT actual net inflow.
-    if total_tx > 0:
-
-        flow = volume5 * (
-            (buys - sells) / total_tx
-        )
-
-    else:
-
-        flow = 0.0
-
-    if market_cap > 0:
-
-        flow_pct = (
-            flow / market_cap
-        ) * 100
-
-    else:
-
-        flow_pct = 0.0
-
-    if sells > 0:
-
-        buy_sell_ratio = buys / sells
-
-    elif buys > 0:
-
-        buy_sell_ratio = float("inf")
-
-    else:
-
-        buy_sell_ratio = 0.0
-
-    if abs(flow) > 0:
-
-        volume_flow_ratio = (
-            volume5 / abs(flow)
-        )
-
-    else:
-
-        volume_flow_ratio = 0.0
-
-    created = number(
-        pair.get("pairCreatedAt")
-    )
-
-    if created > 0:
-
-        pair_age_hours = max(
+        age_hours = max(
             0,
-            (now() - created / 1000) / 3600
+            (now_ts() - pair_created) / 3600
         )
-
     else:
+        age_hours = None
 
-        pair_age_hours = None
+    total5 = buys5 + sells5
+
+    # This is a transaction-imbalance proxy, NOT actual net inflow.
+    flow_proxy = (
+        vol5 * (buys5 - sells5) / total5
+        if total5 > 0 else 0.0
+    )
+
+    flow_mc_pct = (
+        abs(flow_proxy) / mcap * 100
+        if mcap > 0 else 0.0
+    )
+
+    buy_sell_ratio_5m = ratio(buys5, sells5)
+    buy_sell_ratio_1h = ratio(buys1h, sells1h)
+
+    url = pair.get("url") or (
+        f"https://dexscreener.com/solana/"
+        f"{pair.get('pairAddress', '')}"
+    )
 
     return {
-        "address": address,
-        "name": base.get("name") or "Unknown",
-        "symbol": base.get("symbol") or "???",
-        "dex_id": pair.get("dexId") or "",
-        "url": pair.get("url") or (
-            f"https://dexscreener.com/solana/{address}"
-        ),
-        "mcap": market_cap,
-        "mcap_source": cap_source,
-        "liquidity": liquidity,
-        "volume5": volume5,
-        "buys": buys,
-        "sells": sells,
-        "total_tx": total_tx,
-        "flow": flow,
-        "flow_pct": flow_pct,
-        "buy_sell_ratio": buy_sell_ratio,
-        "volume_flow_ratio": volume_flow_ratio,
-        "age_hours": pair_age_hours,
+        "address": base.get("address", ""),
+        "name": base.get("name", "Unknown"),
+        "symbol": base.get("symbol", "UNKNOWN"),
+        "pair_address": pair.get("pairAddress", ""),
+        "url": url,
+
+        "mcap": mcap,
+        "fdv": fdv,
+        "price": safe_float(pair.get("priceUsd")),
+        "liquidity": liq,
+
+        "age_hours": age_hours,
+
+        "vol5": vol5,
+        "vol1h": vol1h,
+
+        "change5": change5,
+        "change1h": change1h,
+        "change6h": change6h,
+
+        "buys5": buys5,
+        "sells5": sells5,
+        "buys1h": buys1h,
+        "sells1h": sells1h,
+
+        "buy_sell_ratio_5m": buy_sell_ratio_5m,
+        "buy_sell_ratio_1h": buy_sell_ratio_1h,
+
+        "flow_proxy": flow_proxy,
+        "flow_mc_pct": flow_mc_pct,
+
+        "timestamp": now_ts()
     }
 
 
-def best_pair_per_token(pairs):
-
-    best = {}
-
-    for pair in pairs:
-
-        item = normalize_pair(pair)
-
-        if not item:
-            continue
-
-        address = item["address"]
-
-        if (
-            address not in best
-            or item["liquidity"] > best[address]["liquidity"]
-        ):
-
-            best[address] = item
-
-    return best
-
-
 # ============================================================
-# CANDIDATE FILTERS
+# RUNNER SCORE
 # ============================================================
 
-def is_pumpfun(item):
+def calculate_score(m):
+    score = 0.0
 
-    dex = str(
-        item.get("dex_id", "")
-    ).lower()
+    # Buying pressure: 0–25 points.
+    ratio5 = m["buy_sell_ratio_5m"]
 
-    url = str(
-        item.get("url", "")
-    ).lower()
+    if ratio5 >= 3:
+        score += 25
+    elif ratio5 >= 2:
+        score += 21
+    elif ratio5 >= 1.5:
+        score += 17
+    elif ratio5 >= 1.25:
+        score += 12
+    elif ratio5 >= 1:
+        score += 5
 
-    return (
-        "pump" in dex
-        or "pump.fun" in url
+    # Volume acceleration: 0–20 points.
+    vol5 = m["vol5"]
+    mcap = m["mcap"]
+
+    vol_mc_pct = (
+        vol5 / mcap * 100 if mcap > 0 else 0
     )
 
+    if vol_mc_pct >= 15:
+        score += 20
+    elif vol_mc_pct >= 8:
+        score += 16
+    elif vol_mc_pct >= 4:
+        score += 12
+    elif vol_mc_pct >= 2:
+        score += 7
+    elif vol_mc_pct >= 1:
+        score += 3
 
-def signal_strength(item):
+    # Short-term momentum: 0–20 points.
+    change5 = m["change5"]
 
-    flow = item["flow"]
-    flow_pct = item["flow_pct"]
+    if 5 <= change5 <= 25:
+        score += 20
+    elif 0 < change5 < 5:
+        score += 12
+    elif 25 < change5 <= 50:
+        score += 15
+    elif change5 > 50:
+        score += 8
+    elif change5 < 0:
+        score += 2
 
-    if (
-        flow_pct >= ULTRA_FLOW_PCT
-        or flow >= ULTRA_FLOW_USD
-    ):
+    # Liquidity quality: 0–15 points.
+    liquidity = m["liquidity"]
 
-        return "ULTRA"
+    if liquidity >= 25_000:
+        score += 15
+    elif liquidity >= 15_000:
+        score += 13
+    elif liquidity >= 10_000:
+        score += 10
+    elif liquidity >= 6_000:
+        score += 7
 
-    if (
-        flow_pct >= STRONG_FLOW_PCT
-        or flow >= STRONG_FLOW_USD
-    ):
+    # Early-stage opportunity: 0–20 points.
+    age = m["age_hours"]
 
-        return "STRONG"
+    if age is not None:
+        if age <= 1:
+            score += 20
+        elif age <= 3:
+            score += 17
+        elif age <= 12:
+            score += 12
+        elif age <= 24:
+            score += 8
+        elif age <= 48:
+            score += 4
 
-    return "NORMAL"
-
-
-def required_observations(item):
-
-    level = signal_strength(item)
-
-    if level == "ULTRA":
-        return ULTRA_PERSISTENCE
-
-    if level == "STRONG":
-        return STRONG_PERSISTENCE
-
-    return NORMAL_PERSISTENCE
+    return round(min(100, max(0, score)), 1)
 
 
-def evaluate_candidate(item):
+# ============================================================
+# ELIGIBILITY AND PERSISTENCE
+# ============================================================
 
-    # HARD CAP CHECK — must always run first.
-    if not (
-        MIN_MCAP_USD
-        <= item["mcap"]
-        <= MAX_MCAP_USD
-    ):
+def rejection_reason(m):
+    if not m["address"]:
+        return "missing token address"
 
-        return False, "Outside hard MC range"
+    if m["mcap"] < MIN_MCAP_USD:
+        return "market cap below minimum"
 
-    if item["liquidity"] < MIN_LIQUIDITY_USD:
+    if m["mcap"] > MAX_MCAP_USD:
+        return "market cap above maximum"
 
-        return False, "Liquidity below $6K"
+    if m["liquidity"] < MIN_LIQUIDITY_USD:
+        return "liquidity below minimum"
 
-    if item["age_hours"] is None:
+    if m["age_hours"] is not None:
+        if m["age_hours"] > MAX_PAIR_AGE_HOURS:
+            return "pair older than maximum age"
 
-        return False, "Pair age unavailable"
+    if m["vol5"] < MIN_5M_VOLUME_USD:
+        return "5-minute volume too low"
 
-    if item["age_hours"] > MAX_PAIR_AGE_HOURS:
+    if m["buys5"] + m["sells5"] < MIN_5M_TRANSACTIONS:
+        return "not enough 5-minute transactions"
 
-        return False, "Pair older than 48 hours"
+    if m["flow_proxy"] < MIN_FLOW_PROXY_USD:
+        return "buying-pressure proxy too low"
 
-    if item["total_tx"] < 5:
+    if m["flow_mc_pct"] < MIN_FLOW_MC_PCT:
+        return "flow-to-market-cap ratio too low"
 
-        return False, "Fewer than 5 transactions in 5m"
+    if m["buy_sell_ratio_5m"] < MIN_BUY_SELL_RATIO:
+        return "buy/sell ratio too low"
 
-    if (
-        item["volume5"] < PREFILTER_MIN_VOL5
-        and abs(item["flow"]) < PREFILTER_MIN_ABS_FLOW
-    ):
+    return None
 
-        return False, "Volume/flow prefilter failed"
 
-    # Early Pump.fun exception.
-    # It still cannot bypass the hard market-cap limits.
-    early_pump = (
-        is_pumpfun(item)
-        and item["age_hours"] <= PUMPFUN_EARLY_AGE_HOURS
-        and item["volume5"] >= PUMPFUN_EARLY_MIN_VOL5
-        and item["flow"] >= PUMPFUN_EARLY_MIN_FLOW
-        and item["flow_pct"] >= PUMPFUN_EARLY_MIN_FLOW_MCAP_PCT
+def is_on_cooldown(address):
+    last = safe_float(
+        state["last_alert"].get(address)
     )
 
-    if early_pump:
-
-        return True, "PUMPFUN EARLY"
-
-    if item["flow"] < MIN_CORE_FLOW_USD:
-
-        return False, "Flow proxy below $1.5K"
-
-    if item["flow_pct"] < MIN_FLOW_MCAP_PCT:
-
-        return False, "Flow/MC below 8%"
-
-    if item["buy_sell_ratio"] < MIN_BUY_SELL_RATIO:
-
-        return False, "Buy/sell ratio below 1.5"
-
-    if item["volume_flow_ratio"] < MIN_VOLUME_FLOW_RATIO:
-
-        return False, "Volume/flow ratio below 1.25"
-
-    return True, "CORE FLOW"
+    return now_ts() - last < TOKEN_COOLDOWN_SECONDS
 
 
-# ============================================================
-# PERSISTENCE
-# ============================================================
+def persistence_confirmed(address, score):
+    with state_lock:
+        pending = state["pending"]
 
-def observe_candidate(state, item):
+        entry = pending.get(address)
 
-    address = item["address"]
+        if not entry:
+            pending[address] = {
+                "count": 1,
+                "first_seen": now_ts(),
+                "last_seen": now_ts(),
+                "best_score": score
+            }
 
-    current = now()
+            return False
 
-    record = state["pending"].get(address)
+        if now_ts() - entry["first_seen"] > 300:
+            pending[address] = {
+                "count": 1,
+                "first_seen": now_ts(),
+                "last_seen": now_ts(),
+                "best_score": score
+            }
 
-    if (
-        not record
-        or current - number(
-            record.get("first_seen"),
-            current
-        ) > PENDING_EXPIRY_SECONDS
-    ):
+            return False
 
-        record = {
-            "first_seen": current,
-            "last_seen": current,
-            "observations": [],
-        }
-
-    record["observations"].append({
-        "time": current,
-        "mcap": item["mcap"],
-        "flow": item["flow"],
-        "flow_pct": item["flow_pct"],
-        "volume5": item["volume5"],
-    })
-
-    record["observations"] = (
-        record["observations"][-MAX_HISTORY_PER_TOKEN:]
-    )
-
-    record["last_seen"] = current
-
-    state["pending"][address] = record
-
-    count = len(record["observations"])
-
-    required = required_observations(item)
-
-    return count, required
-
-
-# ============================================================
-# ALERT FORMATTING
-# ============================================================
-
-def money(value):
-
-    if value == float("inf"):
-        return "∞"
-
-    return f"${value:,.0f}"
-
-
-def format_alert(item, reason, count, required):
-
-    ratio = item["buy_sell_ratio"]
-
-    if ratio == float("inf"):
-
-        ratio_text = "∞"
-
-    else:
-
-        ratio_text = f"{ratio:.2f}"
-
-    if item["age_hours"] is None:
-
-        age_text = "Unknown"
-
-    else:
-
-        age_text = f"{item['age_hours']:.1f} hours"
-
-    return (
-        f"🔥 RUNNER CANDIDATE — "
-        f"{item['symbol']} ({item['name']})\n"
-        f"Engine: {BOT_VERSION}\n"
-        f"Reason: {reason}\n"
-        f"Strength: {signal_strength(item)}\n\n"
-        f"Market cap: {money(item['mcap'])} "
-        f"({item['mcap_source']})\n"
-        f"Liquidity: {money(item['liquidity'])}\n"
-        f"5m volume: {money(item['volume5'])}\n"
-        f"5m buys/sells: {item['buys']}/{item['sells']}\n"
-        f"Buy/sell ratio: {ratio_text}\n"
-        f"Flow proxy: {money(item['flow'])}\n"
-        f"Flow/MC: {item['flow_pct']:.1f}%\n"
-        f"Volume/|flow|: "
-        f"{item['volume_flow_ratio']:.2f}\n"
-        f"Pair age: {age_text}\n"
-        f"Persistence: {count}/{required}\n\n"
-        f"CA: {item['address']}\n"
-        f"DEX: {item['url']}\n\n"
-        "⚠️ Flow is a buy/sell-imbalance proxy, "
-        "not verified net inflow. Check token authorities, "
-        "holder concentration, liquidity, and social catalysts."
-    )
-
-
-# ============================================================
-# STATE CLEANUP
-# ============================================================
-
-def prune_state(state):
-
-    current = now()
-
-    state["pending"] = {
-        address: record
-        for address, record in state["pending"].items()
-        if current - number(record.get("last_seen"))
-        <= PENDING_EXPIRY_SECONDS
-    }
-
-    state["token_cooldowns"] = {
-        address: expiry
-        for address, expiry in state["token_cooldowns"].items()
-        if number(expiry) > current
-    }
-
-    known = state["known_tokens"]
-
-    if len(known) > MAX_TRACKED_TOKENS:
-
-        ordered = sorted(
-            known.items(),
-            key=lambda entry: number(
-                entry[1].get("last_seen")
-            ) if isinstance(entry[1], dict) else 0,
-            reverse=True,
+        entry["count"] += 1
+        entry["last_seen"] = now_ts()
+        entry["best_score"] = max(
+            entry["best_score"], score
         )
 
-        state["known_tokens"] = dict(
-            ordered[:MAX_TRACKED_TOKENS]
-        )
+        return entry["count"] >= PERSISTENCE_OBSERVATIONS
 
 
 # ============================================================
-# SCANNER
+# INITIAL ALERT
 # ============================================================
 
-def run_scan(state):
+def build_alert(m, score):
+    age = (
+        f"{m['age_hours']:.1f}h"
+        if m["age_hours"] is not None
+        else "Unknown"
+    )
 
-    current = now()
+    ratio5 = m["buy_sell_ratio_5m"]
+    ratio1h = m["buy_sell_ratio_1h"]
 
-    # Discover new tokens at the configured interval.
-    if (
-        current - number(state.get("last_discovery"))
-        >= DISCOVERY_INTERVAL_SECONDS
-        or not state["known_tokens"]
-    ):
+    priority = (
+        "🔥 HIGH PRIORITY"
+        if score >= HIGH_PRIORITY_SCORE
+        else "🟡 RUNNER CANDIDATE"
+    )
 
-        discovered = discover_addresses()
+    return (
+        f"🚨 NEW {m['symbol']} | Score {score}/100\n\n"
+        f"🪙 Token: {m['name']} (${m['symbol']})\n"
+        f"⏱️ Age: {age}\n"
+        f"💵 Price: ${m['price']:.10g}\n"
+        f"📊 MC: {money(m['mcap'])}\n"
+        f"💎 FDV: {money(m['fdv'])}\n"
+        f"💧 Liquidity: {money(m['liquidity'])}\n\n"
+        f"📈 5m: {percentage(m['change5'])}\n"
+        f"📈 1h: {percentage(m['change1h'])}\n"
+        f"📈 6h: {percentage(m['change6h'])}\n\n"
+        f"📊 5m Volume: {money(m['vol5'])}\n"
+        f"📊 1h Volume: {money(m['vol1h'])}\n\n"
+        f"🟢 Buys (5m): {m['buys5']}\n"
+        f"🔴 Sells (5m): {m['sells5']}\n"
+        f"⚖️ B/S (5m): {ratio5:.2f}\n\n"
+        f"🟢 Buys (1h): {m['buys1h']}\n"
+        f"🔴 Sells (1h): {m['sells1h']}\n"
+        f"⚖️ B/S (1h): {ratio1h:.2f}\n\n"
+        f"📐 Flow proxy: {money(m['flow_proxy'])}\n"
+        f"⚠️ Proxy is not actual net inflow.\n\n"
+        f"{priority}\n"
+        f"🛡️ Holder concentration: Not checked\n"
+        f"🛡️ Sell simulation: Not checked\n\n"
+        f"CA:\n{m['address']}\n\n"
+        f"🔗 {m['url']}\n\n"
+        f"🕒 Alerted: {utc_string()}\n"
+        f"🤖 {BOT_VERSION}"
+    )
 
-        # Merge discoveries instead of losing them between scans.
-        for address in discovered:
 
-            state["known_tokens"].setdefault(
-                address,
-                {}
+# ============================================================
+# FOLLOW-UP MULTIPLE TRACKING
+# ============================================================
+
+def build_milestone_alert(m, entry, multiple):
+    initial_mcap = entry["initial_mcap"]
+
+    current_mcap = m["mcap"]
+
+    percentage_gain = (multiple - 1) * 100
+
+    return (
+        f"🚀 RUNNER MILESTONE: {multiple}X\n\n"
+        f"🪙 ${m['symbol']}\n"
+        f"Initial MC: {money(initial_mcap)}\n"
+        f"Current MC: {money(current_mcap)}\n"
+        f"Move from initial alert: +{percentage_gain:,.0f}%\n\n"
+        f"Initial price: ${entry['initial_price']:.10g}\n"
+        f"Current price: ${m['price']:.10g}\n"
+        f"Score now: {calculate_score(m)}/100\n"
+        f"Liquidity now: {money(m['liquidity'])}\n"
+        f"Buys/sells (5m): {m['buys5']}/{m['sells5']}\n\n"
+        f"CA:\n{m['address']}\n\n"
+        f"🔗 {m['url']}\n\n"
+        f"Note: Multiple is based on market-cap "
+        f"comparison; market cap and liquidity can change."
+    )
+
+
+def track_existing_token(m):
+    address = m["address"]
+
+    with state_lock:
+        entry = state["tokens"].get(address)
+
+    if not entry:
+        return
+
+    initial_mcap = safe_float(entry.get("initial_mcap"))
+
+    if initial_mcap <= 0:
+        return
+
+    multiple = m["mcap"] / initial_mcap
+
+    if multiple > safe_float(entry.get("peak_multiple"), 1):
+        with state_lock:
+            entry["peak_multiple"] = multiple
+            entry["peak_mcap"] = m["mcap"]
+
+    sent = set(entry.get("milestones_sent", []))
+
+    for milestone in MILESTONES:
+        if multiple >= milestone and milestone not in sent:
+            message = build_milestone_alert(
+                m, entry, milestone
             )
 
-        state["last_discovery"] = current
+            if telegram_send(message):
+                with state_lock:
+                    entry["milestones_sent"] = list(
+                        set(entry.get("milestones_sent", []))
+                        | {milestone}
+                    )
 
-    addresses = list(
-        state["known_tokens"].keys()
-    )[:MAX_TRACKED_TOKENS]
+                save_state()
 
-    if not addresses:
+    with state_lock:
+        entry["last_mcap"] = m["mcap"]
+        entry["last_price"] = m["price"]
+        entry["last_seen"] = now_ts()
 
-        log.info("No token addresses tracked yet.")
 
-        save_state(state)
+# ============================================================
+# PROCESS CANDIDATES
+# ============================================================
+
+def process_token(address):
+    pairs = fetch_token_pairs(address)
+
+    pair = choose_best_pair(pairs)
+
+    if not pair:
+        return
+
+    m = extract_metrics(pair)
+
+    if not m["address"]:
+        return
+
+    # Keep monitoring tokens that have already alerted,
+    # even if they later leave the entry market-cap range.
+    with state_lock:
+        already_tracked = m["address"] in state["tokens"]
+
+    if already_tracked:
+        track_existing_token(m)
+        return
+
+    reason = rejection_reason(m)
+
+    if reason:
+        log.info(
+            "REJECT %s | MC=%s | LIQ=%s | %s",
+            m["symbol"],
+            money(m["mcap"]),
+            money(m["liquidity"]),
+            reason
+        )
 
         return
 
-    pairs = fetch_pairs(addresses)
+    score = calculate_score(m)
 
-    candidates = best_pair_per_token(pairs)
-
-    log.info(
-        "Fetched %s pairs; evaluating %s tokens",
-        len(pairs),
-        len(candidates)
-    )
-
-    for address, item in candidates.items():
-
-        state["known_tokens"].setdefault(
-            address,
-            {}
+    if score < ALERT_SCORE:
+        log.info(
+            "REJECT %s | score %.1f below %.1f",
+            m["symbol"],
+            score,
+            ALERT_SCORE
         )
 
-        state["known_tokens"][address]["last_seen"] = current
+        return
 
-        state["known_tokens"][address]["symbol"] = (
-            item["symbol"]
+    if is_on_cooldown(m["address"]):
+        return
+
+    if not persistence_confirmed(m["address"], score):
+        log.info(
+            "PENDING %s | score=%.1f",
+            m["symbol"],
+            score
         )
 
-        # Hard market-cap guard.
-        if (
-            item["mcap"] < MIN_MCAP_USD
-            or item["mcap"] > MAX_MCAP_USD
-        ):
+        return
 
-            state["pending"].pop(address, None)
+    message = build_alert(m, score)
 
-            if RUNNER_DEBUG:
+    if telegram_send(message):
+        with state_lock:
+            state["tokens"][m["address"]] = {
+                "address": m["address"],
+                "symbol": m["symbol"],
+                "initial_mcap": m["mcap"],
+                "initial_price": m["price"],
+                "initial_score": score,
+                "alert_time": now_ts(),
+                "last_seen": now_ts(),
+                "last_mcap": m["mcap"],
+                "last_price": m["price"],
+                "peak_mcap": m["mcap"],
+                "peak_multiple": 1.0,
+                "milestones_sent": []
+            }
 
-                log.debug(
-                    "Reject %s: MC %s outside hard range",
-                    item["symbol"],
-                    money(item["mcap"])
-                )
+            state["last_alert"][m["address"]] = now_ts()
 
-            continue
+        save_state()
 
-        qualified, reason = evaluate_candidate(item)
-
-        if not qualified:
-
-            state["pending"].pop(address, None)
-
-            if RUNNER_DEBUG:
-
-                log.debug(
-                    "Reject %s: %s",
-                    item["symbol"],
-                    reason
-                )
-
-            continue
-
-        count, required = observe_candidate(
-            state,
-            item
+        log.info(
+            "ALERT SENT: %s | score %.1f | MC %s",
+            m["symbol"],
+            score,
+            money(m["mcap"])
         )
-
-        if count < required:
-
-            log.debug(
-                "Pending %s: %s/%s observations",
-                item["symbol"],
-                count,
-                required
-            )
-
-            continue
-
-        # Final hard cap check before alerting.
-        if not (
-            MIN_MCAP_USD
-            <= item["mcap"]
-            <= MAX_MCAP_USD
-        ):
-
-            state["pending"].pop(address, None)
-
-            continue
-
-        if not HEATING_ALERTS_ENABLED:
-
-            log.info(
-                "Qualified but alerts disabled: %s",
-                item["symbol"]
-            )
-
-            continue
-
-        if number(
-            state["token_cooldowns"].get(address)
-        ) > current:
-
-            continue
-
-        if (
-            current - number(
-                state.get("last_global_alert")
-            ) < GLOBAL_ALERT_COOLDOWN_SECONDS
-        ):
-
-            continue
-
-        alert = format_alert(
-            item,
-            reason,
-            count,
-            required
-        )
-
-        if send_message(alert):
-
-            state["token_cooldowns"][address] = (
-                current + TOKEN_COOLDOWN_SECONDS
-            )
-
-            state["last_global_alert"] = current
-
-            state["pending"].pop(address, None)
-
-            log.info(
-                "Alert sent: %s",
-                item["symbol"]
-            )
-
-        else:
-
-            log.warning(
-                "Alert not delivered for %s. "
-                "Check Telegram settings.",
-                item["symbol"]
-            )
-
-    prune_state(state)
-
-    save_state(state)
 
 
 # ============================================================
-# MAIN
+# MAIN SCANNER
+# ============================================================
+
+def trim_state():
+    with state_lock:
+        tokens = state["tokens"]
+
+        if len(tokens) > MAX_TRACKED_TOKENS:
+            ordered = sorted(
+                tokens.items(),
+                key=lambda item: safe_float(
+                    item[1].get("last_seen")
+                )
+            )
+
+            remove_count = len(tokens) - MAX_TRACKED_TOKENS
+
+            for address, _ in ordered[:remove_count]:
+                tokens.pop(address, None)
+
+        cutoff = now_ts() - 600
+
+        pending = state["pending"]
+
+        for address in list(pending.keys()):
+            if safe_float(
+                pending[address].get("first_seen")
+            ) < cutoff:
+                pending.pop(address, None)
+
+        last_alert = state["last_alert"]
+
+        for address in list(last_alert.keys()):
+            if safe_float(last_alert[address]) < now_ts() - 86400:
+                last_alert.pop(address, None)
+
+
+def scanner_loop():
+    addresses = []
+    last_discovery = 0
+
+    while not stop_event.is_set():
+        started = now_ts()
+
+        try:
+            if (
+                not addresses
+                or now_ts() - last_discovery
+                >= DISCOVERY_INTERVAL_SECONDS
+            ):
+                new_addresses = discover_pairs()
+
+                if new_addresses:
+                    addresses = list(
+                        dict.fromkeys(addresses + new_addresses)
+                    )
+
+                addresses = addresses[-MAX_DISCOVERY_PAIRS:]
+
+                last_discovery = now_ts()
+
+                with state_lock:
+                    state["last_discovery"] = last_discovery
+
+            log.info(
+                "SCAN | token addresses=%d",
+                len(addresses)
+            )
+
+            for address in addresses:
+                if stop_event.is_set():
+                    break
+
+                try:
+                    process_token(address)
+
+                except Exception:
+                    log.exception(
+                        "Token processing failed: %s",
+                        address
+                    )
+
+                time.sleep(0.05)
+
+            trim_state()
+            save_state()
+
+        except Exception:
+            log.exception("Scanner loop failed")
+
+        elapsed = now_ts() - started
+
+        sleep_time = max(
+            1,
+            SCAN_INTERVAL_SECONDS - elapsed
+        )
+
+        stop_event.wait(sleep_time)
+
+
+def telegram_command_loop():
+    while not stop_event.is_set():
+        try:
+            handle_telegram_commands()
+
+        except Exception:
+            log.exception("Telegram command loop failed")
+
+        stop_event.wait(2)
+
+
+# ============================================================
+# STARTUP
 # ============================================================
 
 def main():
-
     if not TELEGRAM_BOT_TOKEN:
-
         raise SystemExit(
             "ERROR: TELEGRAM_BOT_TOKEN is missing. "
-            "Open Replit Secrets and add your Telegram bot token."
+            "Add it to GitHub repository secrets."
         )
 
     if not TELEGRAM_CHAT_ID:
-
-        log.warning(
-            "TELEGRAM_CHAT_ID is missing. "
-            "The scanner can run, but fixed-chat alerts "
-            "cannot be delivered."
+        raise SystemExit(
+            "ERROR: TELEGRAM_CHAT_ID is missing. "
+            "Add it to GitHub repository secrets."
         )
+
+    load_state()
+
+    state["started_at"] = utc_string()
+
+    log.info("Starting %s", BOT_VERSION)
 
     log.info(
-        "Starting %s | MC $%s-$%s | Scan %ss | Discovery %ss",
-        BOT_VERSION,
-        f"{MIN_MCAP_USD:,}",
-        f"{MAX_MCAP_USD:,}",
-        SCAN_INTERVAL_SECONDS,
-        DISCOVERY_INTERVAL_SECONDS
+        "Market-cap range: %s to %s",
+        money(MIN_MCAP_USD),
+        money(MAX_MCAP_USD)
     )
 
-    send_message(
-        f"✅ Runner Bot {BOT_VERSION} started.\n"
-        f"Hard market-cap range: "
-        f"${MIN_MCAP_USD:,}-${MAX_MCAP_USD:,}\n"
-        f"Minimum liquidity: ${MIN_LIQUIDITY_USD:,}\n"
-        f"Scan interval: {SCAN_INTERVAL_SECONDS} seconds."
+    log.info(
+        "Minimum liquidity: %s",
+        money(MIN_LIQUIDITY_USD)
     )
 
-    state = load_state()
+    log.info("Scan interval: %ss", SCAN_INTERVAL_SECONDS)
 
-    while True:
-
-        started = now()
-
-        try:
-
-            process_telegram_commands(state)
-
-            run_scan(state)
-
-            save_state(state)
-
-        except KeyboardInterrupt:
-
-            log.info("Bot stopped by user.")
-
-            save_state(state)
-
-            break
-
-        except Exception:
-
-            log.exception(
-                "Unexpected error. "
-                "Bot will retry after the next interval."
-            )
-
-        elapsed = now() - started
-
-        time.sleep(
-            max(
-                1,
-                SCAN_INTERVAL_SECONDS - elapsed
-            )
+    if not telegram_send(
+        f"🤖 {BOT_VERSION} started.\n\n"
+        f"Market cap: {money(MIN_MCAP_USD)}"
+        f"–{money(MAX_MCAP_USD)}\n"
+        f"Minimum liquidity: {money(MIN_LIQUIDITY_USD)}\n"
+        f"Scan interval: {SCAN_INTERVAL_SECONDS}s\n\n"
+        f"Started: {utc_string()}"
+    ):
+        raise SystemExit(
+            "ERROR: Could not send Telegram startup message. "
+            "Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
         )
+
+    command_thread = threading.Thread(
+        target=telegram_command_loop,
+        daemon=True
+    )
+
+    command_thread.start()
+
+    try:
+        scanner_loop()
+
+    except KeyboardInterrupt:
+        log.info("Shutdown requested.")
+
+    finally:
+        stop_event.set()
+        save_state()
+        log.info("Runner Bot stopped.")
 
 
 if __name__ == "__main__":
