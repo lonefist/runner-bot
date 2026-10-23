@@ -1,331 +1,430 @@
-import json
+"""
+RUNNER BOT V6.1
+STRICT REPORT-MATCHING ENGINE
+
+Purpose:
+Discover Solana tokens through DEX Screener, track their market
+metrics, and alert Telegram when every mandatory condition passes.
+
+No social-media analysis.
+No wallet analysis.
+No token-age filter.
+No synthetic net-flow calculation.
+No score override.
+
+IMPORTANT:
+This bot requires a continuously running Python process for
+15-second scanning. GitHub Actions scheduled workflows do not
+guarantee continuous 15-second execution.
+"""
+
 import os
+import json
 import time
-import urllib.parse
-import urllib.request
-import urllib.error
+import logging
+import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from collections import defaultdict
+
+import requests
+
 
 # ============================================================
-# RUNNER BOT V6.0 — REPORT-BASED MARKET EVOLUTION ENGINE
-# Built around the 11 successful runner reports supplied.
-# No lore, X/Twitter, AI research, or unrelated filters.
+# CONFIGURATION
 # ============================================================
 
-BOT_VERSION = "V6.0-REPORT-BASED"
+BOT_VERSION = "V6.1-STRICT-REPORT-MATCHING"
 
-DEX_BASE = "https://api.dexscreener.com"
-TELEGRAM_BASE = "https://api.telegram.org"
-CHAIN = "solana"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# ------------------------------------------------------------
-# CONFIGURATION: AGREED MARKET RANGES
-# ------------------------------------------------------------
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-MIN_MC = 40_000
-MAX_MC = 150_000
+SCAN_INTERVAL_SECONDS = 15
+
+STATE_FILE = os.getenv(
+    "RUNNER_STATE_FILE",
+    "runner_state_v61.json"
+)
+
+DEX_BASE_URL = "https://api.dexscreener.com"
+
+TELEGRAM_BASE_URL = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    if TELEGRAM_BOT_TOKEN
+    else ""
+)
+
+# Maximum number of tokens remembered.
+MAX_TRACKED_TOKENS = 1500
+
+# Keep recent observations for each token.
+MAX_HISTORY_PER_TOKEN = 100
+
+# Discovery batch size for DEX Screener token lookups.
+TOKEN_BATCH_SIZE = 30
+
+# Prevent repeatedly alerting the same token.
+ALERT_COOLDOWN_SECONDS = 60 * 60
+
+# Avoid Telegram messages that are too long.
+MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+
+# Logging.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("runner_bot")
+
+
+# ============================================================
+# STRICT MARKET FILTERS
+# ============================================================
+#
+# These thresholds come from the observed ranges in the
+# 11 successful reports supplied by the user.
+#
+# A candidate MUST pass EVERY condition below.
+# A score cannot override a failed condition.
+#
+# These are historical matching thresholds, not guarantees
+# that another token will become a successful runner.
+# ============================================================
+
+MIN_MARKET_CAP = 40_000
+MAX_MARKET_CAP = 150_000
 
 MIN_LIQUIDITY = 16_500
 MAX_LIQUIDITY = 40_000
 
-# Observed ranges from the 11 successful reports.
-# These describe the sample; they are not hard exclusion rules.
-REPORT_BS_MIN = 1.22
-REPORT_BS_MAX = 1.54
+MIN_BUY_SELL_RATIO = 1.22
 
-REPORT_VOLUME_MC_MIN = 46.06
-REPORT_VOLUME_MC_MAX = 318.64
+MIN_VOLUME_TO_MC_PERCENT = 46.06
 
-REPORT_TX_MIN = 406
-REPORT_TX_MAX = 4723
+MIN_5M_TRANSACTIONS = 406
 
-REPORT_PRICE_MIN = 6.08
-REPORT_PRICE_MAX = 117.0
+MIN_5M_PRICE_CHANGE_PERCENT = 6.08
 
-REPORT_SCORE_MIN = 81
-REPORT_SCORE_MAX = 93
-
-SCAN_INTERVAL = max(
-    5, int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
-)
-
-DISCOVERY_INTERVAL = max(
-    30, int(os.getenv("DISCOVERY_INTERVAL_SECONDS", "60"))
-)
-
-HTTP_TIMEOUT = 15
-MAX_HISTORY = 12
-ALERT_COOLDOWN_SECONDS = 30 * 60
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-HEATING_ALERTS_ENABLED = (
-    os.getenv("HEATING_ALERTS_ENABLED", "true").lower() == "true"
-)
-
-STATE_FILE = "runner_state.json"
-
-# Alert quality settings:
-# A token must be inside the agreed MC/liquidity range and
-# have at least 3 observations. Other report metrics contribute
-# to the score rather than becoming arbitrary hard gates.
 MIN_OBSERVATIONS = 3
-MIN_REPORT_SCORE = 65
 
-STATE: Dict[str, Any] = {
-    "subscribers": [],
+
+# ============================================================
+# DEX SCREENER DISCOVERY
+# ============================================================
+
+DISCOVERY_SEARCH_TERMS = [
+    "SOL",
+    "WSOL",
+    "USDC",
+    "USDT",
+    "pump",
+    "meme",
+    "cat",
+    "dog",
+    "ai",
+    "inu",
+    "coin",
+]
+
+DISCOVERY_REFRESH_SECONDS = 60
+
+# DEX Screener API requests use a timeout to prevent hanging.
+HTTP_TIMEOUT_SECONDS = 12
+
+
+# ============================================================
+# SESSION AND SHARED STATE
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": f"RunnerBot/{BOT_VERSION}",
+    "Accept": "application/json",
+})
+
+state_lock = threading.RLock()
+
+state = {
+    "version": BOT_VERSION,
     "tokens": {},
-    "last_update_id": 0,
+    "alerts_sent": {},
+    "telegram_offset": 0,
+    "last_discovery": 0,
+    "last_scan": 0,
+    "total_alerts": 0,
+    "started_at": datetime.now(timezone.utc).isoformat(),
 }
 
+last_discovery_pairs = {}
+
+bot_running = True
+
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
-def now_ts() -> int:
-    return int(time.time())
-
-
-def utc_now() -> str:
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+def safe_float(value, default=0.0):
     try:
-        return float(value) if value is not None else default
-    except (ValueError, TypeError):
+        if value is None:
+            return default
+
+        result = float(value)
+
+        if result != result:
+            return default
+
+        if result == float("inf") or result == float("-inf"):
+            return default
+
+        return result
+
+    except (TypeError, ValueError):
         return default
 
 
-def safe_int(value: Any, default: int = 0) -> int:
+def safe_int(value, default=0):
     try:
-        return int(value) if value is not None else default
-    except (ValueError, TypeError):
+        return int(value)
+    except (TypeError, ValueError):
         return default
 
 
-def fmt_money(value: float) -> str:
+def format_money(value):
+    value = safe_float(value)
+
     if value >= 1_000_000:
         return f"${value / 1_000_000:.2f}M"
+
     if value >= 1_000:
         return f"${value / 1_000:.1f}K"
-    return f"${value:.0f}"
+
+    return f"${value:.2f}"
 
 
-def fmt_ratio(value: float) -> str:
-    return "∞" if value >= 999 else f"{value:.2f}"
+def format_percent(value):
+    return f"{safe_float(value):.2f}%"
 
 
-def load_state() -> None:
-    global STATE
+def format_ratio(value):
+    if value == float("inf"):
+        return "Infinite"
 
-    if not os.path.exists(STATE_FILE):
-        return
+    return f"{safe_float(value):.2f}"
 
+
+def shorten_address(address, first=6, last=6):
+    if not address:
+        return "Unknown"
+
+    address = str(address)
+
+    if len(address) <= first + last + 3:
+        return address
+
+    return f"{address[:first]}...{address[-last:]}"
+
+
+def get_json(url, params=None):
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-
-        if isinstance(loaded, dict):
-            STATE.update(loaded)
-
-        STATE.setdefault("subscribers", [])
-        STATE.setdefault("tokens", {})
-        STATE.setdefault("last_update_id", 0)
-
-    except Exception as exc:
-        print(f"[STATE] Load error: {exc}")
-
-
-def save_state() -> None:
-    try:
-        temp_file = STATE_FILE + ".tmp"
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(STATE, f, indent=2)
-
-        os.replace(temp_file, STATE_FILE)
-
-    except Exception as exc:
-        print(f"[STATE] Save error: {exc}")
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def http_get_json(url: str) -> Optional[Any]:
-    try:
-        request = urllib.request.Request(
+        response = session.get(
             url,
-            headers={
-                "User-Agent": "RunnerBot/6.0",
-                "Accept": "application/json",
-            },
+            params=params,
+            timeout=HTTP_TIMEOUT_SECONDS,
         )
 
-        with urllib.request.urlopen(
-            request, timeout=HTTP_TIMEOUT
-        ) as response:
-            return json.loads(
-                response.read().decode("utf-8", errors="replace")
+        if response.status_code != 200:
+            logger.warning(
+                "HTTP %s for %s",
+                response.status_code,
+                url,
             )
+            return None
 
-    except urllib.error.HTTPError as exc:
-        print(f"[HTTP] {exc.code}: {url}")
+        return response.json()
 
-    except Exception as exc:
-        print(f"[HTTP] Request failed: {exc}")
+    except requests.RequestException as exc:
+        logger.warning("Request failed: %s", exc)
+
+    except ValueError:
+        logger.warning("Invalid JSON response from %s", url)
 
     return None
 
 
 # ============================================================
-# TELEGRAM
+# PERSISTENT STATE
 # ============================================================
 
-def telegram_api(
-    method: str,
-    params: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+def load_state():
+    global state
 
-    if not TELEGRAM_TOKEN:
-        return None
-
-    url = f"{TELEGRAM_BASE}/bot{TELEGRAM_TOKEN}/{method}"
+    if not os.path.exists(STATE_FILE):
+        logger.info("No saved state found. Starting fresh.")
+        return
 
     try:
-        data = urllib.parse.urlencode(params or {}).encode("utf-8")
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            saved = json.load(file)
 
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={"User-Agent": "RunnerBot/6.0"},
-        )
+        if not isinstance(saved, dict):
+            logger.warning("Invalid state format. Starting fresh.")
+            return
 
-        with urllib.request.urlopen(
-            request, timeout=HTTP_TIMEOUT
-        ) as response:
-            return json.loads(
-                response.read().decode("utf-8", errors="replace")
+        with state_lock:
+            state["tokens"] = saved.get("tokens", {})
+            state["alerts_sent"] = saved.get("alerts_sent", {})
+            state["telegram_offset"] = safe_int(
+                saved.get("telegram_offset", 0)
+            )
+            state["last_discovery"] = safe_float(
+                saved.get("last_discovery", 0)
+            )
+            state["last_scan"] = safe_float(
+                saved.get("last_scan", 0)
+            )
+            state["total_alerts"] = safe_int(
+                saved.get("total_alerts", 0)
+            )
+            state["started_at"] = saved.get(
+                "started_at",
+                utc_now(),
             )
 
-    except Exception as exc:
-        print(f"[TELEGRAM] {method}: {exc}")
+        logger.info(
+            "Loaded state: %s tracked tokens, %s previous alerts",
+            len(state["tokens"]),
+            len(state["alerts_sent"]),
+        )
+
+    except (OSError, ValueError, TypeError) as exc:
+        logger.error("Could not load state: %s", exc)
+
+
+def save_state():
+    try:
+        with state_lock:
+            snapshot = {
+                "version": BOT_VERSION,
+                "tokens": state["tokens"],
+                "alerts_sent": state["alerts_sent"],
+                "telegram_offset": state["telegram_offset"],
+                "last_discovery": state["last_discovery"],
+                "last_scan": state["last_scan"],
+                "total_alerts": state["total_alerts"],
+                "started_at": state["started_at"],
+            }
+
+        temporary_file = STATE_FILE + ".tmp"
+
+        with open(
+            temporary_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(snapshot, file, indent=2)
+
+        os.replace(temporary_file, STATE_FILE)
+
+    except (OSError, TypeError, ValueError) as exc:
+        logger.error("Could not save state: %s", exc)
+
+
+# ============================================================
+# TELEGRAM MESSAGING
+# ============================================================
+
+def telegram_api(method, payload=None, timeout=15):
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not configured.")
         return None
 
+    url = f"{TELEGRAM_BASE_URL}/{method}"
 
-def telegram_send(chat_id: int, message: str) -> bool:
+    try:
+        response = session.post(
+            url,
+            json=payload or {},
+            timeout=timeout,
+        )
+
+        result = response.json()
+
+        if not result.get("ok"):
+            logger.warning(
+                "Telegram API error: %s",
+                result,
+            )
+            return None
+
+        return result.get("result")
+
+    except requests.RequestException as exc:
+        logger.warning("Telegram request failed: %s", exc)
+
+    except ValueError:
+        logger.warning("Telegram returned invalid JSON.")
+
+    return None
+
+
+def send_telegram_message(
+    message,
+    chat_id=None,
+    disable_preview=True,
+):
+    target_chat = str(chat_id or TELEGRAM_CHAT_ID).strip()
+
+    if not target_chat:
+        logger.warning(
+            "No Telegram chat ID available. Message not sent."
+        )
+        return False
+
+    # Telegram limits ordinary message text to 4096 characters.
+    message = str(message)[:MAX_TELEGRAM_MESSAGE_LENGTH]
+
     result = telegram_api(
         "sendMessage",
         {
-            "chat_id": chat_id,
+            "chat_id": target_chat,
             "text": message,
-            "disable_web_page_preview": True,
-        },
-    )
-    return bool(result and result.get("ok"))
-
-
-def send_to_subscribers(message: str) -> None:
-    if not HEATING_ALERTS_ENABLED:
-        return
-
-    for chat_id in list(STATE.get("subscribers", [])):
-        telegram_send(chat_id, message)
-
-
-def telegram_poll() -> None:
-    if not TELEGRAM_TOKEN:
-        return
-
-    offset = safe_int(STATE.get("last_update_id"))
-
-    result = telegram_api(
-        "getUpdates",
-        {
-            "offset": offset + 1,
-            "timeout": 1,
-            "allowed_updates": '["message"]',
+            "disable_web_page_preview": disable_preview,
         },
     )
 
-    if not result or not result.get("ok"):
-        return
-
-    for update in result.get("result", []):
-        update_id = safe_int(update.get("update_id"))
-        STATE["last_update_id"] = update_id
-
-        message = update.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        command = message.get("text", "").strip()
-
-        if not chat_id:
-            continue
-
-        if command == "/start":
-            subscribers = STATE.setdefault("subscribers", [])
-
-            if chat_id not in subscribers:
-                subscribers.append(chat_id)
-
-            telegram_send(
-                chat_id,
-                "🚀 RUNNER BOT V6.0 ONLINE\n\n"
-                "Report-based Market Evolution Engine active.\n"
-                "Market cap: $40K–$150K\n"
-                "Liquidity: $16.5K–$40K\n"
-                "Use /status to check the scanner.",
-            )
-
-        elif command == "/status":
-            telegram_send(
-                chat_id,
-                "RUNNER BOT V6.0 STATUS\n\n"
-                f"Tracked tokens: {len(STATE.get('tokens', {}))}\n"
-                f"Subscribers: {len(STATE.get('subscribers', []))}\n"
-                f"Scan interval: {SCAN_INTERVAL}s\n"
-                f"Discovery interval: {DISCOVERY_INTERVAL}s\n"
-                f"Alerts enabled: {HEATING_ALERTS_ENABLED}",
-            )
-
-        elif command == "/clear":
-            STATE["tokens"] = {}
-            save_state()
-            telegram_send(chat_id, "Token history cleared.")
-
-    save_state()
+    return result is not None
 
 
 # ============================================================
-# DISCOVERY
+# DEX SCREENER DATA COLLECTION
 # ============================================================
 
-DISCOVERY_ENDPOINTS = [
-    "/token-profiles/latest/v1",
-    "/token-boosts/latest/v1",
-    "/token-boosts/top/v1",
-    "/community-takeovers/latest/v1",
-]
+def discover_token_addresses():
+    """
+    Discover Solana token addresses from DEX Screener's latest
+    token profiles, boosts and search endpoints.
+    """
 
-
-def discover_token_addresses() -> List[str]:
     addresses = set()
 
-    for endpoint in DISCOVERY_ENDPOINTS:
-        data = http_get_json(DEX_BASE + endpoint)
+    # Latest token profiles.
+    profiles = get_json(
+        f"{DEX_BASE_URL}/token-profiles/latest/v1"
+    )
 
-        if not isinstance(data, list):
-            continue
-
-        for item in data:
+    if isinstance(profiles, list):
+        for item in profiles:
             if not isinstance(item, dict):
                 continue
 
-            if item.get("chainId") != CHAIN:
+            if item.get("chainId") != "solana":
                 continue
 
             address = item.get("tokenAddress")
@@ -333,546 +432,970 @@ def discover_token_addresses() -> List[str]:
             if address:
                 addresses.add(address)
 
+    # Latest boosted tokens.
+    latest_boosts = get_json(
+        f"{DEX_BASE_URL}/token-boosts/latest/v1"
+    )
+
+    if isinstance(latest_boosts, list):
+        for item in latest_boosts:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("chainId") != "solana":
+                continue
+
+            address = item.get("tokenAddress")
+
+            if address:
+                addresses.add(address)
+
+    # Top boosted tokens.
+    top_boosts = get_json(
+        f"{DEX_BASE_URL}/token-boosts/top/v1"
+    )
+
+    if isinstance(top_boosts, list):
+        for item in top_boosts:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("chainId") != "solana":
+                continue
+
+            address = item.get("tokenAddress")
+
+            if address:
+                addresses.add(address)
+
+    # Search multiple terms to expand discovery.
+    for term in DISCOVERY_SEARCH_TERMS:
+        result = get_json(
+            f"{DEX_BASE_URL}/latest/dex/search",
+            params={"q": term},
+        )
+
+        if not isinstance(result, dict):
+            continue
+
+        pairs = result.get("pairs", [])
+
+        if not isinstance(pairs, list):
+            continue
+
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+
+            if pair.get("chainId") != "solana":
+                continue
+
+            base_token = pair.get("baseToken") or {}
+            quote_token = pair.get("quoteToken") or {}
+
+            base_address = base_token.get("address")
+            quote_address = quote_token.get("address")
+
+            if base_address:
+                addresses.add(base_address)
+
+            # Quote tokens are useful discovery inputs too.
+            if quote_address:
+                addresses.add(quote_address)
+
+    logger.info(
+        "Discovery collected %s unique Solana token addresses.",
+        len(addresses),
+    )
+
     return list(addresses)
 
 
-def get_token_pairs(addresses: List[str]) -> List[Dict[str, Any]]:
-    all_pairs = []
+def fetch_token_pairs(addresses):
+    """
+    Fetch token pairs in batches and keep the best-liquidity
+    Solana pair for each base token.
 
-    for start in range(0, len(addresses), 30):
-        batch = addresses[start:start + 30]
-        encoded = ",".join(batch)
+    The liquidity selection helps avoid tracking a token through
+    a very small secondary pool when a larger pool is available.
+    """
 
-        url = (
-            f"{DEX_BASE}/latest/dex/tokens/"
-            f"{urllib.parse.quote(encoded)}"
-        )
+    best_pairs = {}
 
-        data = http_get_json(url)
+    for start in range(0, len(addresses), TOKEN_BATCH_SIZE):
+        batch = addresses[
+            start:start + TOKEN_BATCH_SIZE
+        ]
 
-        if not isinstance(data, dict):
+        if not batch:
             continue
 
-        for pair in data.get("pairs", []):
-            if (
-                isinstance(pair, dict)
-                and pair.get("chainId") == CHAIN
-            ):
-                all_pairs.append(pair)
+        joined_addresses = ",".join(batch)
 
-    return all_pairs
+        result = get_json(
+            f"{DEX_BASE_URL}/latest/dex/tokens/{joined_addresses}"
+        )
 
+        if not isinstance(result, dict):
+            continue
 
-def select_best_pair(
-    pairs: List[Dict[str, Any]],
-    address: str,
-) -> Optional[Dict[str, Any]]:
+        pairs = result.get("pairs", [])
 
-    matching = [
-        pair for pair in pairs
-        if pair.get("baseToken", {}).get("address") == address
-    ]
+        if not isinstance(pairs, list):
+            continue
 
-    if not matching:
-        return None
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
 
-    return max(
-        matching,
-        key=lambda pair: safe_float(
-            pair.get("liquidity", {}).get("usd")
-        ),
-    )
+            if pair.get("chainId") != "solana":
+                continue
+
+            base_token = pair.get("baseToken") or {}
+            token_address = base_token.get("address")
+
+            if not token_address:
+                continue
+
+            liquidity = safe_float(
+                (pair.get("liquidity") or {}).get("usd")
+            )
+
+            existing = best_pairs.get(token_address)
+
+            if existing is None:
+                best_pairs[token_address] = pair
+                continue
+
+            existing_liquidity = safe_float(
+                (existing.get("liquidity") or {}).get("usd")
+            )
+
+            if liquidity > existing_liquidity:
+                best_pairs[token_address] = pair
+
+    return best_pairs
 
 
 # ============================================================
-# SNAPSHOTS
+# MARKET METRIC EXTRACTION
 # ============================================================
 
-def build_snapshot(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    base = pair.get("baseToken", {})
-    address = base.get("address")
+def extract_metrics(pair):
+    """
+    Extract real market fields supplied by DEX Screener.
 
-    if not address:
-        return None
+    Volume-to-market-cap is calculated as:
+        5-minute volume / market cap * 100
 
-    market_cap = safe_float(pair.get("marketCap"))
+    Buy/sell ratio is calculated as:
+        5-minute buys / 5-minute sells
 
-    if market_cap <= 0:
-        market_cap = safe_float(pair.get("fdv"))
+    Neither value is treated as a net-flow measurement.
+    """
 
-    volume_5m = safe_float(pair.get("volume", {}).get("m5"))
-    liquidity = safe_float(pair.get("liquidity", {}).get("usd"))
+    base = pair.get("baseToken") or {}
+    liquidity_data = pair.get("liquidity") or {}
+    volume_data = pair.get("volume") or {}
+    price_change_data = pair.get("priceChange") or {}
+    txns_data = pair.get("txns") or {}
+    txns_5m = txns_data.get("m5") or {}
 
-    txns = pair.get("txns", {}).get("m5", {})
-    buys = safe_int(txns.get("buys"))
-    sells = safe_int(txns.get("sells"))
-    total_tx = buys + sells
+    # Use marketCap when supplied.
+    # Fall back to FDV only if marketCap is missing.
+    market_cap_value = pair.get("marketCap")
 
-    bs_ratio = (
-        buys / sells if sells > 0
-        else (999.0 if buys > 0 else 0.0)
+    if market_cap_value is None:
+        market_cap_value = pair.get("fdv")
+
+    market_cap = safe_float(market_cap_value)
+
+    liquidity = safe_float(
+        liquidity_data.get("usd")
     )
 
-    volume_mc = (
-        volume_5m / market_cap * 100
-        if market_cap > 0 else 0.0
+    volume_5m = safe_float(
+        volume_data.get("m5")
     )
+
+    price_change_5m = safe_float(
+        price_change_data.get("m5")
+    )
+
+    buys_5m = safe_int(
+        txns_5m.get("buys")
+    )
+
+    sells_5m = safe_int(
+        txns_5m.get("sells")
+    )
+
+    transactions_5m = buys_5m + sells_5m
+
+    if sells_5m > 0:
+        buy_sell_ratio = buys_5m / sells_5m
+    elif buys_5m > 0:
+        buy_sell_ratio = float("inf")
+    else:
+        buy_sell_ratio = 0.0
+
+    if market_cap > 0:
+        volume_to_mc_percent = (
+            volume_5m / market_cap
+        ) * 100
+    else:
+        volume_to_mc_percent = 0.0
 
     return {
-        "timestamp": now_ts(),
-        "time": utc_now(),
-        "address": address,
+        "address": base.get("address", ""),
+        "name": base.get("name", "Unknown"),
         "symbol": base.get("symbol", "UNKNOWN"),
-        "name": base.get("name", "UNKNOWN"),
         "market_cap": market_cap,
         "liquidity": liquidity,
         "volume_5m": volume_5m,
-        "volume_mc": volume_mc,
-        "buys_5m": buys,
-        "sells_5m": sells,
-        "bs_ratio": bs_ratio,
-        "tx_5m": total_tx,
-        "price_change_5m": safe_float(
-            pair.get("priceChange", {}).get("m5")
-        ),
-        "price_usd": safe_float(pair.get("priceUsd")),
+        "price_change_5m": price_change_5m,
+        "buys_5m": buys_5m,
+        "sells_5m": sells_5m,
+        "transactions_5m": transactions_5m,
+        "buy_sell_ratio": buy_sell_ratio,
+        "volume_to_mc_percent": volume_to_mc_percent,
         "pair_address": pair.get("pairAddress", ""),
-        "dex": pair.get("dexId", ""),
+        "dex_id": pair.get("dexId", "Unknown"),
         "url": pair.get("url", ""),
+        "price_usd": safe_float(pair.get("priceUsd")),
+        "observed_at": utc_now(),
     }
 
 
 # ============================================================
-# HISTORY
+# OBSERVATION AND HISTORY TRACKING
 # ============================================================
 
-def get_token_state(address: str) -> Dict[str, Any]:
-    tokens = STATE.setdefault("tokens", {})
+def update_token_history(metrics):
+    """
+    Track each token across scans.
 
-    if address not in tokens:
-        tokens[address] = {
-            "first_seen": now_ts(),
-            "last_seen": now_ts(),
-            "history": [],
-            "last_alert": 0,
-            "alerted_types": [],
-        }
+    Observation count increases when a token has a usable
+    market-cap and liquidity reading.
 
-    return tokens[address]
+    History is saved so it can survive process restarts when
+    the environment preserves the state file.
+    """
 
+    address = metrics["address"]
 
-def add_observation(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    state = get_token_state(snapshot["address"])
-    history = state.setdefault("history", [])
-
-    # Avoid storing duplicate observations within the same second.
-    if history and history[-1].get("timestamp") == snapshot["timestamp"]:
-        return state
-
-    history.append(snapshot)
-    del history[:-MAX_HISTORY]
-
-    state["last_seen"] = now_ts()
-    return state
-
-
-# ============================================================
-# REPORT-BASED SCORING
-# ============================================================
-
-def range_score(
-    value: float,
-    low: float,
-    high: float,
-) -> float:
-    """Scores proximity to the successful-report range."""
-    if value <= 0 or high <= low:
-        return 0.0
-
-    if low <= value <= high:
-        return 1.0
-
-    # Values outside the sample still receive partial credit.
-    distance = low - value if value < low else value - high
-    span = high - low
-    return max(0.0, 1.0 - distance / max(span, 1.0))
-
-
-def calculate_market_score(
-    snapshot: Dict[str, Any],
-    history: List[Dict[str, Any]],
-) -> int:
-
-    mc = snapshot["market_cap"]
-    liquidity = snapshot["liquidity"]
-
-    # The four agreed financial bounds are mandatory.
-    if not (MIN_MC <= mc <= MAX_MC):
+    if not address:
         return 0
 
-    if not (MIN_LIQUIDITY <= liquidity <= MAX_LIQUIDITY):
-        return 0
+    now = time.time()
 
-    scores = [
-        range_score(
-            snapshot["bs_ratio"],
-            REPORT_BS_MIN,
-            REPORT_BS_MAX,
-        ),
-        range_score(
-            snapshot["volume_mc"],
-            REPORT_VOLUME_MC_MIN,
-            REPORT_VOLUME_MC_MAX,
-        ),
-        range_score(
-            snapshot["tx_5m"],
-            REPORT_TX_MIN,
-            REPORT_TX_MAX,
-        ),
-        range_score(
-            snapshot["price_change_5m"],
-            REPORT_PRICE_MIN,
-            REPORT_PRICE_MAX,
-        ),
-    ]
+    with state_lock:
+        token_data = state["tokens"].get(address)
 
-    # More recent observations help establish persistence.
-    history_score = min(len(history) / MIN_OBSERVATIONS, 1.0)
+        if not isinstance(token_data, dict):
+            token_data = {
+                "first_seen": utc_now(),
+                "observations": 0,
+                "history": [],
+                "last_metrics": {},
+            }
 
-    # MC and liquidity eligibility are mandatory; other
-    # report metrics contribute proportionally to the score.
-    weighted = (
-        scores[0] * 25
-        + scores[1] * 30
-        + scores[2] * 20
-        + scores[3] * 15
-        + history_score * 10
-    )
+        token_data["observations"] = safe_int(
+            token_data.get("observations", 0)
+        ) + 1
 
-    return int(max(0, min(100, round(weighted))))
+        token_data["last_seen"] = utc_now()
+        token_data["last_metrics"] = metrics
+
+        history = token_data.get("history", [])
+
+        history.append({
+            "timestamp": now,
+            "market_cap": metrics["market_cap"],
+            "liquidity": metrics["liquidity"],
+            "volume_5m": metrics["volume_5m"],
+            "volume_to_mc_percent": (
+                metrics["volume_to_mc_percent"]
+            ),
+            "price_change_5m": metrics["price_change_5m"],
+            "buy_sell_ratio": (
+                metrics["buy_sell_ratio"]
+                if metrics["buy_sell_ratio"] != float("inf")
+                else 999999
+            ),
+            "transactions_5m": metrics["transactions_5m"],
+            "buys_5m": metrics["buys_5m"],
+            "sells_5m": metrics["sells_5m"],
+        })
+
+        token_data["history"] = history[
+            -MAX_HISTORY_PER_TOKEN:
+        ]
+
+        state["tokens"][address] = token_data
+
+        # Limit stored token count.
+        if len(state["tokens"]) > MAX_TRACKED_TOKENS:
+            ordered = sorted(
+                state["tokens"].items(),
+                key=lambda item: item[1].get(
+                    "last_seen", ""
+                ),
+            )
+
+            excess = (
+                len(state["tokens"]) - MAX_TRACKED_TOKENS
+            )
+
+            for old_address, _ in ordered[:excess]:
+                state["tokens"].pop(old_address, None)
+
+        observations = token_data["observations"]
+
+    return observations
 
 
-def analyze_evolution(
-    history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+# ============================================================
+# STRICT QUALIFICATION ENGINE
+# ============================================================
 
-    result = {
-        "trend": "NEW",
-        "improving_steps": 0,
-        "improving_metrics": 0,
-    }
+def evaluate_candidate(metrics, observations):
+    """
+    All mandatory gates must pass.
 
-    if len(history) < 2:
-        return result
+    No score can override a failed market condition.
+    """
 
-    current = history[-1]
-    previous = history[-2]
+    failures = []
 
-    metric_keys = [
-        ("bs_ratio", True),
-        ("volume_mc", True),
-        ("tx_5m", True),
-        ("price_change_5m", True),
-        ("liquidity", True),
-        ("market_cap", True),
-    ]
+    market_cap = metrics["market_cap"]
+    liquidity = metrics["liquidity"]
+    buy_sell_ratio = metrics["buy_sell_ratio"]
+    volume_to_mc = metrics["volume_to_mc_percent"]
+    transactions = metrics["transactions_5m"]
+    price_change = metrics["price_change_5m"]
 
-    improved = 0
-
-    for key, higher_is_better in metric_keys:
-        if higher_is_better and current[key] > previous[key]:
-            improved += 1
-
-    result["improving_metrics"] = improved
-
-    # Count consecutive observation pairs with at least two
-    # metrics improving. Trend is informational, not a hard gate.
-    steps = 0
-
-    for index in range(len(history) - 1, 0, -1):
-        cur = history[index]
-        prev = history[index - 1]
-
-        count = sum(
-            1 for key, _ in metric_keys
-            if cur[key] > prev[key]
+    # Gate 1: Market cap.
+    if not (
+        MIN_MARKET_CAP
+        <= market_cap
+        <= MAX_MARKET_CAP
+    ):
+        failures.append(
+            f"MC outside ${MIN_MARKET_CAP:,}–"
+            f"${MAX_MARKET_CAP:,}"
         )
 
-        if count >= 2:
-            steps += 1
-        else:
-            break
-
-    result["improving_steps"] = steps
-
-    if steps >= 2:
-        result["trend"] = "ACCELERATING"
-    elif improved >= 2:
-        result["trend"] = "IMPROVING"
-    else:
-        result["trend"] = "MIXED"
-
-    return result
-
-
-# ============================================================
-# SIGNAL DECISION
-# ============================================================
-
-def qualifies_market(snapshot: Dict[str, Any]) -> bool:
-    return (
-        MIN_MC <= snapshot["market_cap"] <= MAX_MC
-        and MIN_LIQUIDITY
-        <= snapshot["liquidity"]
+    # Gate 2: Liquidity.
+    if not (
+        MIN_LIQUIDITY
+        <= liquidity
         <= MAX_LIQUIDITY
+    ):
+        failures.append(
+            f"Liquidity outside ${MIN_LIQUIDITY:,}–"
+            f"${MAX_LIQUIDITY:,}"
+        )
+
+    # Gate 3: Buy/sell ratio.
+    if buy_sell_ratio < MIN_BUY_SELL_RATIO:
+        failures.append(
+            f"B/S below {MIN_BUY_SELL_RATIO:.2f}"
+        )
+
+    # Gate 4: Five-minute volume / market cap.
+    if volume_to_mc < MIN_VOLUME_TO_MC_PERCENT:
+        failures.append(
+            f"Vol/MC below {MIN_VOLUME_TO_MC_PERCENT:.2f}%"
+        )
+
+    # Gate 5: Five-minute transaction count.
+    if transactions < MIN_5M_TRANSACTIONS:
+        failures.append(
+            f"5m transactions below {MIN_5M_TRANSACTIONS}"
+        )
+
+    # Gate 6: Five-minute price change.
+    if price_change < MIN_5M_PRICE_CHANGE_PERCENT:
+        failures.append(
+            f"5m price change below "
+            f"+{MIN_5M_PRICE_CHANGE_PERCENT:.2f}%"
+        )
+
+    # Gate 7: Minimum number of observations.
+    if observations < MIN_OBSERVATIONS:
+        failures.append(
+            f"Only {observations}/{MIN_OBSERVATIONS} observations"
+        )
+
+    return {
+        "qualified": len(failures) == 0,
+        "failures": failures,
+    }
+
+
+# ============================================================
+# OPTIONAL RANKING SCORE
+# ============================================================
+#
+# This score is ONLY used to describe already-qualified tokens.
+# It cannot make an unqualified token eligible for an alert.
+# ============================================================
+
+def calculate_ranking_score(metrics):
+    score = 0
+
+    market_cap = metrics["market_cap"]
+    liquidity = metrics["liquidity"]
+    buy_sell_ratio = metrics["buy_sell_ratio"]
+    volume_to_mc = metrics["volume_to_mc_percent"]
+    transactions = metrics["transactions_5m"]
+    price_change = metrics["price_change_5m"]
+
+    # Buy/sell strength.
+    if buy_sell_ratio >= 1.50:
+        score += 20
+    elif buy_sell_ratio >= 1.35:
+        score += 15
+    elif buy_sell_ratio >= 1.22:
+        score += 10
+
+    # Relative volume.
+    if volume_to_mc >= 100:
+        score += 25
+    elif volume_to_mc >= 80:
+        score += 20
+    elif volume_to_mc >= 60:
+        score += 15
+    else:
+        score += 10
+
+    # Transaction activity.
+    if transactions >= 1500:
+        score += 20
+    elif transactions >= 1000:
+        score += 15
+    elif transactions >= 600:
+        score += 12
+    else:
+        score += 8
+
+    # Price movement.
+    if price_change >= 50:
+        score += 20
+    elif price_change >= 25:
+        score += 15
+    elif price_change >= 10:
+        score += 10
+    else:
+        score += 5
+
+    # Liquidity relative to the permitted band.
+    if liquidity >= 20_000:
+        score += 5
+
+    # Market cap remains bounded by the mandatory gates.
+    if 50_000 <= market_cap <= 100_000:
+        score += 5
+
+    return min(score, 100)
+
+
+# ============================================================
+# RUNNER ALERT
+# ============================================================
+
+def build_runner_alert(metrics, observations, score):
+    name = metrics["name"]
+    symbol = metrics["symbol"]
+    address = metrics["address"]
+
+    market_cap = metrics["market_cap"]
+    liquidity = metrics["liquidity"]
+    volume_5m = metrics["volume_5m"]
+    volume_to_mc = metrics["volume_to_mc_percent"]
+    price_change = metrics["price_change_5m"]
+    buy_sell_ratio = metrics["buy_sell_ratio"]
+    transactions = metrics["transactions_5m"]
+
+    pair_url = metrics["url"]
+
+    if not pair_url and metrics["pair_address"]:
+        pair_url = (
+            "https://dexscreener.com/solana/"
+            + metrics["pair_address"]
+        )
+
+    message = (
+        "🚨 RUNNER CANDIDATE — V6.1\n"
+        "\n"
+        f"Token: {name} (${symbol})\n"
+        f"Market Cap: {format_money(market_cap)}\n"
+        f"Liquidity: {format_money(liquidity)}\n"
+        f"5m Price Change: {format_percent(price_change)}\n"
+        f"5m Volume: {format_money(volume_5m)}\n"
+        f"5m Vol/MC: {format_percent(volume_to_mc)}\n"
+        f"5m Buys: {metrics['buys_5m']}\n"
+        f"5m Sells: {metrics['sells_5m']}\n"
+        f"5m Buy/Sell Ratio: {format_ratio(buy_sell_ratio)}\n"
+        f"5m Transactions: {transactions}\n"
+        f"Observations: {observations}\n"
+        f"Ranking Score: {score}/100\n"
+        "\n"
+        f"CA:\n{address}\n"
+        "\n"
+        f"DEX: {metrics['dex_id']}\n"
     )
 
+    if pair_url:
+        message += f"\nChart: {pair_url}\n"
 
-def should_alert(
-    snapshot: Dict[str, Any],
-    history: List[Dict[str, Any]],
-    score: int,
-) -> bool:
+    message += (
+        "\n"
+        "Qualification: All V6.1 hard gates passed.\n"
+        "\n"
+        "⚠️ A qualifying signal is not a guarantee of a runner. "
+        "Verify the contract, liquidity, holders and execution "
+        "risk before trading."
+    )
 
-    if not qualifies_market(snapshot):
-        return False
-
-    if len(history) < MIN_OBSERVATIONS:
-        return False
-
-    if score < MIN_REPORT_SCORE:
-        return False
-
-    # No separate trend, age, social, wallet, or narrative gate.
-    return True
+    return message
 
 
-# ============================================================
-# ALERTS
-# ============================================================
-
-def build_alert(
-    snapshot: Dict[str, Any],
-    history: List[Dict[str, Any]],
-    evolution: Dict[str, Any],
-    score: int,
-) -> str:
-
-    previous = history[-2] if len(history) >= 2 else None
-
-    prev_bs = previous["bs_ratio"] if previous else 0.0
-    prev_volume_mc = previous["volume_mc"] if previous else 0.0
+def token_is_in_cooldown(address):
+    last_alert = safe_float(
+        state["alerts_sent"].get(address, 0)
+    )
 
     return (
-        "🚀 RUNNER CANDIDATE — V6.0\n\n"
-        f"{snapshot['name']} ({snapshot['symbol']})\n\n"
-        f"💰 MC: {fmt_money(snapshot['market_cap'])}\n"
-        f"💧 Liquidity: {fmt_money(snapshot['liquidity'])}\n"
-        f"📈 5m Price: {snapshot['price_change_5m']:+.2f}%\n"
-        f"🟢 Buy/Sell: {fmt_ratio(snapshot['bs_ratio'])}\n"
-        f"   Previous B/S: {fmt_ratio(prev_bs)}\n"
-        f"📊 5m Vol/MC: {snapshot['volume_mc']:.2f}%\n"
-        f"   Previous Vol/MC: {prev_volume_mc:.2f}%\n"
-        f"🔄 5m Transactions: {snapshot['tx_5m']}\n"
-        f"📈 Report-Based Score: {score}/100\n"
-        f"🔥 Evolution: {evolution['trend']}\n"
-        f"⬆️ Improving steps: {evolution['improving_steps']}\n"
-        f"📚 Observations: {len(history)}\n\n"
-        f"DEX: {snapshot['dex']}\n\n"
-        f"CA:\n{snapshot['address']}\n\n"
-        f"Chart:\n{snapshot['url']}\n\n"
-        "⚠️ Market signals are not guarantees of future performance."
+        time.time() - last_alert
+        < ALERT_COOLDOWN_SECONDS
     )
 
 
-def process_snapshot(snapshot: Dict[str, Any]) -> None:
-    state = add_observation(snapshot)
-    history = state["history"]
+def send_runner_alert(metrics, observations):
+    address = metrics["address"]
 
-    evolution = analyze_evolution(history)
-    score = calculate_market_score(snapshot, history)
+    if not address:
+        return False
 
-    print(
-        f"[TOKEN] {snapshot['symbol']} "
-        f"| MC {fmt_money(snapshot['market_cap'])} "
-        f"| LIQ {fmt_money(snapshot['liquidity'])} "
-        f"| B/S {fmt_ratio(snapshot['bs_ratio'])} "
-        f"| VOL/MC {snapshot['volume_mc']:.2f}% "
-        f"| TX {snapshot['tx_5m']} "
-        f"| PRICE {snapshot['price_change_5m']:+.2f}% "
-        f"| SCORE {score} "
-        f"| TREND {evolution['trend']} "
-        f"| OBS {len(history)}"
-    )
+    with state_lock:
+        if token_is_in_cooldown(address):
+            logger.info(
+                "Qualified token still in alert cooldown: %s",
+                metrics["symbol"],
+            )
+            return False
 
-    if not should_alert(snapshot, history, score):
-        return
+    score = calculate_ranking_score(metrics)
 
-    if not HEATING_ALERTS_ENABLED:
-        return
-
-    if now_ts() - safe_int(state.get("last_alert")) < ALERT_COOLDOWN_SECONDS:
-        return
-
-    message = build_alert(
-        snapshot,
-        history,
-        evolution,
+    message = build_runner_alert(
+        metrics,
+        observations,
         score,
     )
 
-    send_to_subscribers(message)
+    sent = send_telegram_message(message)
 
-    state["last_alert"] = now_ts()
-    save_state()
+    if sent:
+        with state_lock:
+            state["alerts_sent"][address] = time.time()
+            state["total_alerts"] += 1
 
-    print(f"[SIGNAL] {snapshot['symbol']} score={score}")
+        save_state()
+
+        logger.info(
+            "RUNNER ALERT SENT: %s (%s), score=%s",
+            metrics["symbol"],
+            address,
+            score,
+        )
+
+        return True
+
+    logger.warning(
+        "Qualified token, but Telegram alert failed: %s",
+        metrics["symbol"],
+    )
+
+    return False
 
 
 # ============================================================
-# DISCOVERY AND TRACKING
+# SCANNING ENGINE
 # ============================================================
 
-def process_pairs(pairs: List[Dict[str, Any]]) -> None:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+def scan_market():
+    global last_discovery_pairs
 
-    for pair in pairs:
-        address = pair.get("baseToken", {}).get("address")
+    now = time.time()
 
-        if address:
-            grouped.setdefault(address, []).append(pair)
+    # Refresh discovery periodically.
+    discovery_due = (
+        now - safe_float(state.get("last_discovery", 0))
+        >= DISCOVERY_REFRESH_SECONDS
+        or not last_discovery_pairs
+    )
 
-    for address, token_pairs in grouped.items():
-        pair = select_best_pair(token_pairs, address)
+    if discovery_due:
+        logger.info("Refreshing DEX Screener discovery.")
 
-        if not pair:
-            continue
+        addresses = discover_token_addresses()
 
-        snapshot = build_snapshot(pair)
+        if addresses:
+            discovered_pairs = fetch_token_pairs(addresses)
 
-        if snapshot:
-            process_snapshot(snapshot)
+            if discovered_pairs:
+                last_discovery_pairs = discovered_pairs
 
+        state["last_discovery"] = now
 
-def discovery_cycle() -> None:
-    print("[DISCOVERY] Searching latest Solana token listings...")
+        logger.info(
+            "Discovery currently holds %s token pairs.",
+            len(last_discovery_pairs),
+        )
 
-    addresses = discover_token_addresses()
-    print(f"[DISCOVERY] Found {len(addresses)} token addresses")
-
-    if not addresses:
+    if not last_discovery_pairs:
+        logger.warning("No token pairs available to scan.")
         return
 
-    pairs = get_token_pairs(addresses)
-    print(f"[DISCOVERY] Retrieved {len(pairs)} pairs")
+    # Refresh metrics for discovered token addresses.
+    addresses = list(last_discovery_pairs.keys())
 
-    process_pairs(pairs)
-    save_state()
+    refreshed_pairs = fetch_token_pairs(addresses)
 
+    if refreshed_pairs:
+        last_discovery_pairs.update(refreshed_pairs)
 
-def tracked_token_addresses() -> List[str]:
-    result = []
+    pair_count = 0
+    qualified_count = 0
+    alert_count = 0
 
-    for address, state in STATE.get("tokens", {}).items():
-        last_seen = safe_int(state.get("last_seen"))
-
-        if last_seen and now_ts() - last_seen <= 6 * 60 * 60:
-            result.append(address)
-
-    return result
-
-
-def tracking_cycle() -> None:
-    addresses = tracked_token_addresses()
-
-    if not addresses:
-        return
-
-    pairs = get_token_pairs(addresses)
-    process_pairs(pairs)
-    save_state()
-
-
-def cleanup_old_tokens() -> None:
-    tokens = STATE.get("tokens", {})
-    cutoff = now_ts() - 12 * 60 * 60
-
-    for address in list(tokens.keys()):
-        state = tokens[address]
-
-        if safe_int(state.get("last_seen")) >= cutoff:
-            continue
-
-        # Preserve alert history, and otherwise discard stale entries.
-        if not state.get("last_alert"):
-            tokens.pop(address, None)
-
-
-# ============================================================
-# STARTUP AND WORKFLOW
-# ============================================================
-
-def startup() -> None:
-    print("=" * 60)
-    print(f"RUNNER BOT {BOT_VERSION}")
-    print("=" * 60)
-    print(f"Chain: {CHAIN}")
-    print(f"Market cap: ${MIN_MC:,}–${MAX_MC:,}")
-    print(f"Liquidity: ${MIN_LIQUIDITY:,}–${MAX_LIQUIDITY:,}")
-    print(f"Scan interval: {SCAN_INTERVAL}s")
-    print(f"Discovery interval: {DISCOVERY_INTERVAL}s")
-    print(f"Telegram: {'CONFIGURED' if TELEGRAM_TOKEN else 'NOT CONFIGURED'}")
-    print(f"Alerts enabled: {HEATING_ALERTS_ENABLED}")
-    print("Narrative/X/AI filters: disabled")
-    print("=" * 60)
-
-    if TELEGRAM_TOKEN:
-        result = telegram_api("getMe")
-
-        if result and result.get("ok"):
-            username = result.get("result", {}).get("username", "unknown")
-            print(f"[TELEGRAM] Connected as @{username}")
-        else:
-            print("[TELEGRAM] Connection test failed")
-    else:
-        print("[TELEGRAM] Add TELEGRAM_BOT_TOKEN in Replit Secrets")
-
-    print("[STARTUP] Scanner ready")
-
-
-def main() -> None:
-    load_state()
-    startup()
-
-    last_discovery = 0
-    last_cleanup = 0
-
-    while True:
+    for address, pair in list(last_discovery_pairs.items()):
         try:
-            telegram_poll()
-            current = now_ts()
+            if not isinstance(pair, dict):
+                continue
 
-            if current - last_discovery >= DISCOVERY_INTERVAL:
-                discovery_cycle()
-                last_discovery = current
-            else:
-                tracking_cycle()
+            metrics = extract_metrics(pair)
 
-            if current - last_cleanup >= 15 * 60:
-                cleanup_old_tokens()
-                save_state()
-                last_cleanup = current
+            if not metrics["address"]:
+                continue
 
-            time.sleep(SCAN_INTERVAL)
+            # Count observations only when MC and liquidity
+            # are available and positive.
+            if (
+                metrics["market_cap"] <= 0
+                or metrics["liquidity"] <= 0
+            ):
+                continue
 
-        except KeyboardInterrupt:
-            print("[STOP] Saving state...")
+            observations = update_token_history(metrics)
+
+            pair_count += 1
+
+            result = evaluate_candidate(
+                metrics,
+                observations,
+            )
+
+            if not result["qualified"]:
+                logger.debug(
+                    "REJECTED %s (%s): %s",
+                    metrics["symbol"],
+                    address,
+                    "; ".join(result["failures"]),
+                )
+                continue
+
+            qualified_count += 1
+
+            logger.info(
+                "QUALIFIED %s | MC=%s | LIQ=%s | "
+                "B/S=%s | Vol/MC=%s | TX=%s | "
+                "Change=%s | Obs=%s",
+                metrics["symbol"],
+                format_money(metrics["market_cap"]),
+                format_money(metrics["liquidity"]),
+                format_ratio(metrics["buy_sell_ratio"]),
+                format_percent(metrics["volume_to_mc_percent"]),
+                metrics["transactions_5m"],
+                format_percent(metrics["price_change_5m"]),
+                observations,
+            )
+
+            if send_runner_alert(metrics, observations):
+                alert_count += 1
+
+        except Exception:
+            logger.exception(
+                "Error processing token %s",
+                address,
+            )
+
+    state["last_scan"] = time.time()
+
+    save_state()
+
+    logger.info(
+        "SCAN COMPLETE | Pairs=%s | Qualified=%s | "
+        "Alerts sent=%s",
+        pair_count,
+        qualified_count,
+        alert_count,
+    )
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+def build_status_message():
+    with state_lock:
+        token_count = len(state["tokens"])
+        alert_count = safe_int(state["total_alerts"])
+        discovered_count = len(last_discovery_pairs)
+
+    return (
+        f"🤖 Runner Bot {BOT_VERSION}\n"
+        "\n"
+        f"Status: Running\n"
+        f"Scan interval: {SCAN_INTERVAL_SECONDS}s\n"
+        f"Tracked tokens: {token_count}\n"
+        f"Currently discovered pairs: {discovered_count}\n"
+        f"Total alerts sent: {alert_count}\n"
+        "\n"
+        "STRICT QUALIFICATION FILTERS\n"
+        f"Market cap: ${MIN_MARKET_CAP:,}–${MAX_MARKET_CAP:,}\n"
+        f"Liquidity: ${MIN_LIQUIDITY:,}–${MAX_LIQUIDITY:,}\n"
+        f"Buy/sell ratio: >= {MIN_BUY_SELL_RATIO:.2f}\n"
+        f"5m Vol/MC: >= {MIN_VOLUME_TO_MC_PERCENT:.2f}%\n"
+        f"5m transactions: >= {MIN_5M_TRANSACTIONS}\n"
+        f"5m price change: >= +{MIN_5M_PRICE_CHANGE_PERCENT:.2f}%\n"
+        f"Observations: >= {MIN_OBSERVATIONS}\n"
+        "\n"
+        "All filters are mandatory. Score cannot override them."
+    )
+
+
+def clear_tracking(chat_id):
+    """
+    Clear tracked observations and alert cooldown history.
+
+    This resets bot history, not token data on DEX Screener.
+    """
+
+    with state_lock:
+        state["tokens"] = {}
+        state["alerts_sent"] = {}
+        state["total_alerts"] = 0
+
+    save_state()
+
+    send_telegram_message(
+        "🧹 Runner Bot tracking history cleared.\n"
+        "The bot will rebuild observations from new scans.",
+        chat_id=chat_id,
+    )
+
+
+def handle_telegram_command(message):
+    if not isinstance(message, dict):
+        return
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+
+    text_value = str(message.get("text", "")).strip()
+
+    if not text_value.startswith("/"):
+        return
+
+    command = text_value.split()[0].split("@")[0].lower()
+
+    if command == "/start":
+        response = (
+            f"✅ Runner Bot {BOT_VERSION} is online.\n"
+            "\n"
+            "I scan Solana tokens using DEX Screener and "
+            "only alert when all mandatory V6.1 market "
+            "conditions pass.\n"
+            "\n"
+            "Commands:\n"
+            "/start — Start information\n"
+            "/status — Bot status and filters\n"
+            "/clear — Clear tracking history"
+        )
+
+        send_telegram_message(
+            response,
+            chat_id=chat_id,
+        )
+
+    elif command == "/status":
+        send_telegram_message(
+            build_status_message(),
+            chat_id=chat_id,
+        )
+
+    elif command == "/clear":
+        clear_tracking(chat_id)
+
+    else:
+        send_telegram_message(
+            "Unknown command.\n"
+            "Available commands: /start, /status, /clear",
+            chat_id=chat_id,
+        )
+
+
+def telegram_polling_loop():
+    """
+    Long-poll Telegram for commands.
+
+    If TELEGRAM_CHAT_ID is configured, commands are accepted
+    only from that configured chat ID.
+    """
+
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error(
+            "Telegram polling disabled: missing bot token."
+        )
+        return
+
+    logger.info("Telegram command polling started.")
+
+    while bot_running:
+        try:
+            with state_lock:
+                offset = safe_int(
+                    state.get("telegram_offset", 0)
+                )
+
+            updates = telegram_api(
+                "getUpdates",
+                {
+                    "offset": offset,
+                    "timeout": 20,
+                    "allowed_updates": ["message"],
+                },
+                timeout=25,
+            )
+
+            if not isinstance(updates, list):
+                time.sleep(3)
+                continue
+
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+
+                update_id = safe_int(
+                    update.get("update_id", 0)
+                )
+
+                with state_lock:
+                    state["telegram_offset"] = update_id + 1
+
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                incoming_chat_id = str(chat.get("id", ""))
+
+                # If a target chat ID is configured, reject
+                # commands from other chats.
+                if (
+                    TELEGRAM_CHAT_ID
+                    and incoming_chat_id != TELEGRAM_CHAT_ID
+                ):
+                    logger.warning(
+                        "Ignoring command from an unconfigured chat."
+                    )
+                    continue
+
+                handle_telegram_command(message)
+
             save_state()
-            break
 
-        except Exception as exc:
-            print(f"[MAIN ERROR] {exc}")
+        except Exception:
+            logger.exception("Telegram polling loop error.")
             time.sleep(5)
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def validate_configuration():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN is missing. "
+            "Market scanning may run, but Telegram messages "
+            "cannot be delivered."
+        )
+
+    if not TELEGRAM_CHAT_ID:
+        logger.warning(
+            "TELEGRAM_CHAT_ID is missing. "
+            "Set it if you want runner alerts delivered to "
+            "a specific Telegram chat."
+        )
+
+
+def main():
+    global bot_running
+
+    logger.info("=" * 60)
+    logger.info("Starting Runner Bot %s", BOT_VERSION)
+    logger.info("Scan interval: %s seconds", SCAN_INTERVAL_SECONDS)
+    logger.info("Strict matching enabled.")
+    logger.info("=" * 60)
+
+    validate_configuration()
+    load_state()
+
+    # Start Telegram command handling separately so market
+    # scanning does not block while waiting for Telegram.
+    telegram_thread = threading.Thread(
+        target=telegram_polling_loop,
+        daemon=True,
+        name="telegram-polling",
+    )
+
+    telegram_thread.start()
+
+    # Send startup message when a destination is configured.
+    if TELEGRAM_CHAT_ID and TELEGRAM_BOT_TOKEN:
+        send_telegram_message(
+            f"🟢 Runner Bot {BOT_VERSION} started.\n"
+            f"Scanning every {SCAN_INTERVAL_SECONDS} seconds.\n"
+            "All V6.1 hard filters are mandatory."
+        )
+
+    try:
+        while bot_running:
+            cycle_started = time.time()
+
+            try:
+                scan_market()
+
+            except Exception:
+                logger.exception("Market scan failed.")
+
+            elapsed = time.time() - cycle_started
+
+            sleep_seconds = max(
+                1,
+                SCAN_INTERVAL_SECONDS - elapsed,
+            )
+
+            time.sleep(sleep_seconds)
+
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested.")
+
+    finally:
+        bot_running = False
+        save_state()
+        logger.info("Runner Bot stopped.")
 
 
 if __name__ == "__main__":
