@@ -1,24 +1,38 @@
-name: Runner Bot V5.1
+name: Runner Bot V6.0
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: runner-bot-v60
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests
-      - name: Run Runner Bot
+          python -m pip install "requests>=2.31.0,<3.0.0"
+
+      - name: Verify Python syntax
+        run: python -m py_compile bot.py
+
+      - name: Run Runner Bot V6.0
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
