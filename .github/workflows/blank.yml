@@ -1,35 +1,44 @@
-name: Runner Bot V6.1
+name: Runner Bot V6.2
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 */6 * * *"
+
 permissions:
   contents: read
+  actions: read
+
 concurrency:
   group: runner-bot
   cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Show repository files
-        run: |
-          echo "Repository root:"
-          pwd
-          echo "Files:"
-          find . -maxdepth 4 -type f \
-            -not -path './.git/*' | sort
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
+
+      - name: Restore saved bot state
+        uses: actions/download-artifact@v4
+        with:
+          name: runner-state
+          path: .
+        continue-on-error: true
+
       - name: Find bot.py
         id: find_bot
         run: |
@@ -38,14 +47,36 @@ jobs:
           elif [ -f "bot.py" ]; then
             echo "bot_path=bot.py" >> "$GITHUB_OUTPUT"
           else
-            echo "ERROR: bot.py was not found."
-            echo "Check the repository file listing above."
+            echo "ERROR: bot.py not found."
+            find . -maxdepth 4 -type f
             exit 1
           fi
-      - name: Run bot
+
+      - name: Run bot for six hours
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUNNER_STATE_FILE: runner_state_v61.json
+          REGISTERED_CHAT_FILE: runner_chat.json
         run: |
-          python -u "${{ steps.find_bot.outputs.bot_path }}"
+          python -u "${{ steps.find_bot.outputs.bot_path }}" &
+          BOT_PID=$!
+
+          # Keep the bot running for up to 6 hours.
+          sleep 21590
+
+          # Stop it cleanly before the GitHub job timeout.
+          kill -TERM "$BOT_PID" 2>/dev/null || true
+          wait "$BOT_PID" || true
+
+      - name: Save bot state for the next run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-state
+          path: |
+            runner_state_v61.json
+            runner_chat.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
