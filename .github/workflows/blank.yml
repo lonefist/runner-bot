@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: runner-bot
   cancel-in-progress: false
@@ -15,6 +15,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Show repository files
+        run: |
+          echo "Repository root:"
+          pwd
+          echo "Files:"
+          find . -maxdepth 4 -type f \
+            -not -path './.git/*' | sort
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -23,17 +30,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests
-      - name: Restore runner state
-        uses: actions/cache/restore@v4
-        with:
-          path: runner_state_v61.json
-          key: runner-state-${{ github.run_id }}
-          restore-keys: |
-            runner-state-
-      - name: Run bot for up to 6 hours
+      - name: Find bot.py
+        id: find_bot
+        run: |
+          if [ -f "telegram_bot/bot.py" ]; then
+            echo "bot_path=telegram_bot/bot.py" >> "$GITHUB_OUTPUT"
+          elif [ -f "bot.py" ]; then
+            echo "bot_path=bot.py" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: bot.py was not found."
+            echo "Check the repository file listing above."
+            exit 1
+          fi
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUNNER_STATE_FILE: runner_state_v61.json
         run: |
-          python telegram_bot/bot.py
+          python -u "${{ steps.find_bot.outputs.bot_path }}"
